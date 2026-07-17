@@ -75,7 +75,14 @@ def _project(tmp_path: Path) -> tuple[ProjectPaths, SessionRepository, str]:
             },
             "capabilities": {
                 "capabilities": [
-                    {"name": "ANDROID_ROOT", "available": True},
+                    {
+                        "name": "ANDROID_ROOT",
+                        "available": True,
+                        "metadata": {
+                            "root_mode": "adb_root",
+                            "root_probe_status": "verified",
+                        },
+                    },
                     {"name": "FRIDA_CLIENT", "available": True},
                     {"name": "FRIDA_SERVER", "available": True},
                 ]
@@ -144,6 +151,8 @@ def test_fixture_report_cannot_claim_physical_pass_or_empirical_eligibility(
         "eligible_for_empirical_metrics": False,
     }
     assert report["root_available"] is True
+    assert report["root_mode"] == "adb_root"
+    assert report["root_probe_status"] == "verified"
     assert report["frida_available"] is True
     assert report["root_required"] is True
     assert report["frida_required"] is True

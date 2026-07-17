@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 import pytest
@@ -57,7 +58,9 @@ class RemoteAdb:
 
     def shell(self, serial: str, arguments: tuple[str, ...], **_kwargs: object) -> CommandResult:
         del serial
-        command = arguments[2] if len(arguments) == 3 else ""
+        if arguments == ("id",):
+            return result(stdout="uid=0(root) gid=0(root)\n")
+        command = shlex.split(arguments[2])[0] if len(arguments) == 3 else ""
         existence_command = (
             f"if [ -d /proc/{self.pid} ]; then echo EXISTS; else echo MISSING; fi"
         )

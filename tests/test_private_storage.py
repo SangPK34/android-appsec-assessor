@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +9,7 @@ import pytest
 from android_assessor.errors import ScopeError, SessionError
 from android_assessor.paths import ProjectPaths
 from android_assessor.private_storage import (
+    AdbPrivateStorageBackend,
     PrivateStorageInspector,
     PrivateStorageService,
     StorageAnalysisStatus,
@@ -16,6 +17,7 @@ from android_assessor.private_storage import (
     StorageInspectionPolicy,
 )
 from android_assessor.session import SessionRepository
+from android_assessor.subprocess_utils import CommandResult
 from tests.fakes import FakeAndroidBackend, load_fixture
 
 PACKAGE = "com.example.rootedlab"
@@ -322,3 +324,83 @@ def test_storage_service_requires_active_session(tmp_path: Path) -> None:
         PrivateStorageService(repository, backend).collect(record.session_id)
 
     assert backend.operations == []
+
+
+class AdbdRootStorageAdb:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def require_authorized_device(self, serial: str) -> object:
+        assert serial == "FIXTURE_SERIAL"
+        return object()
+
+    def shell(
+        self,
+        serial: str,
+        arguments: Sequence[str],
+        **_kwargs: object,
+    ) -> CommandResult:
+        assert serial == "FIXTURE_SERIAL"
+        selected = tuple(arguments)
+        self.calls.append(selected)
+        if selected == ("pm", "path", PACKAGE):
+            return _storage_command_result("package:/data/app/fixture/base.apk\n")
+        if selected == ("id",):
+            return _storage_command_result("uid=0(root) gid=0(root)\n")
+        if selected[:2] == ("sh", "-c") and "find " in selected[-1]:
+            return _storage_command_result(
+                f"{DATA_DIRECTORY}/shared_prefs/settings.xml|regular file|120|10123|10123|600\n"
+                f"{DATA_DIRECTORY}/databases/app.db|regular file|4096|10123|10123|600\n"
+                f"{DATA_DIRECTORY}/files/note.txt|regular file|32|10123|10123|600\n"
+            )
+        if selected[:2] == ("sh", "-c") and "stat -c" in selected[-1]:
+            return _storage_command_result("directory\n")
+        raise AssertionError(f"Unexpected ADB call: {selected}")
+
+
+def _storage_command_result(stdout: str) -> CommandResult:
+    return CommandResult(
+        arguments=(),
+        exit_code=0,
+        stdout=stdout,
+        stderr="",
+        started_at="2026-07-17T00:00:00+00:00",
+        duration_ms=1,
+        timed_out=False,
+    )
+
+
+def test_adbd_root_private_storage_is_bounded_metadata_only() -> None:
+    adb = AdbdRootStorageAdb()
+    backend = AdbPrivateStorageBackend(
+        adb,  # type: ignore[arg-type]
+        max_entries=3,
+        max_depth=2,
+    )
+
+    metadata = backend.inspect_package("FIXTURE_SERIAL", PACKAGE)
+    entries = backend.list_storage("FIXTURE_SERIAL", PACKAGE)
+    result = PrivateStorageInspector(
+        StorageInspectionPolicy(max_evidence_count=3)
+    ).inspect(
+        package=PACKAGE,
+        data_directory=str(metadata["data_directory"]),
+        external_data_directory=str(metadata["external_data_directory"]),
+        entries=entries,
+        source=backend.evidence_source,
+        environment=backend.environment_type,
+        root_mode=str(metadata["root_mode"]),
+    )
+
+    assert result.root_mode == "adb_root"
+    assert len(result.artifacts) == 3
+    assert {item.type for item in result.artifacts} == {
+        StorageArtifactType.SHARED_PREFERENCES,
+        StorageArtifactType.SQLITE,
+        StorageArtifactType.INTERNAL_FILE,
+    }
+    assert all(item.hash_scope == "metadata" for item in result.artifacts)
+    assert all(item.content_collected is False for item in result.artifacts)
+    assert all(item.root_used is True for item in result.artifacts)
+    assert all(item.finding_eligible is False for item in result.observations)
+    assert all("su" not in call for call in adb.calls)

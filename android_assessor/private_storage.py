@@ -5,19 +5,30 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Any
 
+from .adb import AdbClient
 from .backends import PrivateStorageBackend
 from .device_lock import DeviceLock
 from .errors import SessionError
+from .evidence import EvidenceRepository
 from .redaction import redact_text
-from .root import validate_root_remote_path
+from .root import (
+    RootMode,
+    RootProbe,
+    app_data_root,
+    probe_root,
+    root_shell,
+    validate_root_remote_path,
+)
 from .scope import load_scope
 from .session import SessionRepository, SessionStatus
+from .storage import write_json_atomic
 from .validation import validate_package_name
 
 _SENSITIVE_NAME = re.compile(
@@ -118,6 +129,7 @@ class StorageInspectionResult:
     skipped: tuple[dict[str, str], ...]
     source: str
     environment: str
+    root_mode: str = RootMode.NON_ROOT.value
     implementation_status: str = "IMPLEMENTED_UNVERIFIED"
     physical_validation_status: str = "UNVERIFIED"
 
@@ -130,6 +142,7 @@ class StorageInspectionResult:
             "skipped": list(self.skipped),
             "source": self.source,
             "environment": self.environment,
+            "root_mode": self.root_mode,
             "implementation_status": self.implementation_status,
             "physical_validation_status": self.physical_validation_status,
         }
@@ -184,6 +197,7 @@ class PrivateStorageInspector:
         external_data_directory: str | None = None,
         source: str,
         environment: str,
+        root_mode: str = RootMode.NON_ROOT.value,
     ) -> StorageInspectionResult:
         target = validate_package_name(package)
         if (source == "fixture") != (environment == "simulated"):
@@ -334,8 +348,8 @@ class PrivateStorageInspector:
             skipped=tuple(skipped),
             source=source,
             environment=environment,
+            root_mode=RootMode(root_mode).value,
         )
-
     @staticmethod
     def _analyze(
         artifacts: Sequence[StorageArtifact],
@@ -451,6 +465,141 @@ class PrivateStorageInspector:
         return output
 
 
+class AdbPrivateStorageBackend:
+    """Production ADB backend for bounded, metadata-first app-data inventory."""
+
+    evidence_source = "adb_root"
+    environment_type = "physical"
+
+    def __init__(
+        self,
+        adb: AdbClient,
+        *,
+        max_entries: int = 50,
+        max_depth: int = 4,
+        timeout: float = 30,
+    ) -> None:
+        if not 1 <= max_entries <= 1000:
+            raise ValueError("Storage entry limit must be between 1 and 1000.")
+        if not 1 <= max_depth <= 8:
+            raise ValueError("Storage traversal depth must be between 1 and 8.")
+        if timeout <= 0 or timeout > 300:
+            raise ValueError("Storage command timeout must be between 0 and 300 seconds.")
+        self.adb = adb
+        self.max_entries = max_entries
+        self.max_depth = max_depth
+        self.timeout = timeout
+
+    def _root_probe(self, serial: str) -> RootProbe:
+        probe = probe_root(self.adb, serial)
+        if not probe.available:
+            raise SessionError(
+                "Private storage inspection skipped because Android root is unavailable: "
+                f"{probe.error or probe.probe_status}"
+            )
+        return probe
+
+    def inspect_package(self, serial: str, package: str) -> dict[str, object]:
+        target = validate_package_name(package)
+        installed = self.adb.shell(
+            serial,
+            ("pm", "path", target),
+            timeout=15,
+            check=False,
+            operation="checking the private-storage target package",
+        )
+        if installed.exit_code != 0 or not installed.stdout.strip():
+            raise SessionError("Private storage inspection skipped: package is not installed.")
+        probe = self._root_probe(serial)
+        candidates = (app_data_root(target), f"/data/data/{target}")
+        selected: str | None = None
+        for candidate in candidates:
+            result = root_shell(
+                self.adb,
+                serial,
+                f"stat -c '%F' {shlex.quote(candidate)}",
+                timeout=self.timeout,
+                check=False,
+                operation="resolving the private application data directory",
+                probe=probe,
+            )
+            if result.exit_code == 0 and "directory" in result.stdout.casefold():
+                selected = candidate
+                break
+        if selected is None:
+            raise SessionError("Private application data directory could not be resolved.")
+        return {
+            "package": target,
+            "data_directory": selected,
+            "external_data_directory": f"/storage/emulated/0/Android/data/{target}",
+            "root_available": True,
+            "root_mode": probe.mode.value,
+            "root_probe_status": probe.probe_status,
+            "root_probe_evidence": probe.probe_evidence,
+        }
+
+    def list_storage(self, serial: str, package: str) -> list[dict[str, object]]:
+        target = validate_package_name(package)
+        metadata = self.inspect_package(serial, target)
+        root = str(metadata["data_directory"])
+        probe = self._root_probe(serial)
+        format_value = "%n|%F|%s|%u|%g|%a"
+        command = (
+            f"find {shlex.quote(root)} -mindepth 1 -maxdepth {self.max_depth} "
+            f"-exec stat -c {shlex.quote(format_value)} '{{}}' + "
+            f"| head -n {self.max_entries + 1}"
+        )
+        result = root_shell(
+            self.adb,
+            serial,
+            command,
+            timeout=self.timeout,
+            check=False,
+            operation="collecting bounded private-storage metadata",
+            probe=probe,
+        )
+        if result.timed_out:
+            raise SessionError("Private storage metadata collection timed out.")
+        if result.exit_code != 0:
+            detail = redact_text((result.stderr or result.stdout).strip())[:300]
+            raise SessionError(
+                "Private storage metadata collection failed"
+                + (f": {detail}" if detail else ".")
+            )
+        entries: list[dict[str, object]] = []
+        root_prefix = root.rstrip("/") + "/"
+        for line in result.stdout.splitlines()[: self.max_entries]:
+            parts = line.split("|")
+            if len(parts) != 6:
+                continue
+            path, file_type, size, uid, gid, mode = parts
+            if not path.startswith(root_prefix):
+                continue
+            relative = path[len(root_prefix) :]
+            if not relative:
+                continue
+            normalized_type = (
+                "directory"
+                if "directory" in file_type
+                else "symlink"
+                if "symbolic link" in file_type
+                else "file"
+            )
+            entries.append(
+                {
+                    "path": relative,
+                    "canonical_path": path,
+                    "type": normalized_type,
+                    "size": size,
+                    "uid": uid,
+                    "gid": gid,
+                    "mode": mode,
+                    "symlink_target": "unresolved" if normalized_type == "symlink" else None,
+                }
+            )
+        return entries
+
+
 class PrivateStorageService:
     """Scope- and session-gated storage collection seam for a real or fake backend."""
 
@@ -462,6 +611,7 @@ class PrivateStorageService:
         self.repository = repository
         self.paths = repository.paths
         self.backend = backend
+        self.evidence = EvidenceRepository(self.paths, self.repository)
 
     def collect(
         self,
@@ -512,6 +662,19 @@ class PrivateStorageService:
                 content_requests=content_requests,
                 source=self.backend.evidence_source,
                 environment=self.backend.environment_type,
+                root_mode=str(metadata.get("root_mode", RootMode.NON_ROOT.value)),
+            )
+            current_paths = self.repository.paths_for(current.session_id)
+            output = current_paths.redacted_dir / "storage" / "private-storage.json"
+            write_json_atomic(output, result.to_dict(), root=self.paths.root)
+            self.evidence.register_file(
+                current.session_id,
+                output,
+                evidence_type="private_storage_metadata",
+                source=result.source,
+                description="Bounded, redacted private-application-storage metadata.",
+                sensitive=True,
+                redacted=True,
             )
             self.repository.append_event(
                 current.session_id,

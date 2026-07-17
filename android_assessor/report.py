@@ -81,6 +81,20 @@ def _capability_available(device: dict[str, Any] | None, name: str) -> bool:
     )
 
 
+def _capability_metadata(device: dict[str, Any] | None, name: str) -> dict[str, Any]:
+    if not device:
+        return {}
+    capabilities = device.get("capabilities")
+    values = capabilities.get("capabilities") if isinstance(capabilities, dict) else None
+    if not isinstance(values, list):
+        return {}
+    for item in values:
+        if isinstance(item, dict) and item.get("name") == name:
+            metadata = item.get("metadata")
+            return dict(metadata) if isinstance(metadata, dict) else {}
+    return {}
+
+
 def _fixture_or_physical(
     environment: dict[str, Any] | None,
     evidence: list[dict[str, Any]],
@@ -304,6 +318,11 @@ class ReportService:
         environment = _optional_json(paths.environment_json, self.paths.root)
         provenance = _fixture_or_physical(environment, evidence)
         root_available = _capability_available(device, "ANDROID_ROOT")
+        root_metadata = _capability_metadata(device, "ANDROID_ROOT")
+        root_mode = str(
+            root_metadata.get("root_mode")
+            or ("su_root" if root_available else "none")
+        )
         frida_available = _capability_available(
             device, "FRIDA_CLIENT"
         ) and _capability_available(device, "FRIDA_SERVER")
@@ -330,6 +349,10 @@ class ReportService:
             "scan": scan,
             "traffic": _optional_json(paths.traffic_dir / "state.json", self.paths.root),
             "frida": _optional_json(paths.frida_dir / "state.json", self.paths.root),
+            "private_storage": _optional_json(
+                paths.redacted_dir / "storage" / "private-storage.json",
+                self.paths.root,
+            ),
             "findings": findings,
             "evidence": evidence,
             "summary": {
@@ -339,6 +362,8 @@ class ReportService:
             },
             "root_used": any(bool(item.get("root_used")) for item in findings),
             "root_available": root_available,
+            "root_mode": root_mode,
+            "root_probe_status": root_metadata.get("root_probe_status", "unknown"),
             "root_required": any(bool(item.get("root_required")) for item in findings),
             "frida_used": any(bool(item.get("frida_used")) for item in findings),
             "frida_available": frida_available,

@@ -25,7 +25,7 @@ from .frida_events import (
 )
 from .host_process import ProcessIdentity, WindowsProcessController
 from .redaction import redact_text
-from .root import probe_root
+from .root import RootMode, probe_root, root_shell
 from .scope import load_scope
 from .session import (
     CleanupActionStatus,
@@ -98,6 +98,7 @@ class FridaObservationState:
     handshake_status: str = "UNVERIFIED"
     runtime_event_count: int = 0
     server_binary_sha256: str | None = None
+    root_mode: str = "none"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -235,12 +236,15 @@ class FridaController:
         command_log: Path | None,
     ) -> str | None:
         adb = self.context.adb_client(command_log=command_log)
-        path_result = adb.shell(
+        root = probe_root(adb, serial)
+        path_result = root_shell(
+            adb,
             serial,
-            ("su", "-c", f"readlink /proc/{pid}/exe"),
+            f"readlink /proc/{pid}/exe",
             timeout=10,
             check=False,
             operation="locating Frida Server",
+            probe=root,
         )
         executable = path_result.stdout.strip()
         if (
@@ -249,12 +253,14 @@ class FridaController:
             or not _REMOTE_EXECUTABLE_PATTERN.fullmatch(executable)
         ):
             return None
-        result = adb.shell(
+        result = root_shell(
+            adb,
             serial,
-            ("su", "-c", f"{executable} --version"),
+            f"{executable} --version",
             timeout=15,
             check=False,
             operation="reading Frida Server version",
+            probe=root,
         )
         if result.timed_out or result.exit_code != 0:
             return None
@@ -374,6 +380,7 @@ class FridaController:
             or not isinstance(state.cleanup_action_ids, dict)
             or not isinstance(state.server_started_by_framework, bool)
             or not isinstance(state.evidence_registered, bool)
+            or state.root_mode not in {mode.value for mode in RootMode}
         ):
             raise FridaError("Frida process state is invalid.")
         ProcessIdentity.from_dict(state.process_identity)
@@ -403,16 +410,19 @@ class FridaController:
         ):
             raise FridaError(probe.guidance or "A matching Frida Server is unavailable.")
         adb = self.context.adb_client(command_log=command_log)
-        if not probe_root(adb, serial).available:
+        root = probe_root(adb, serial)
+        if not root.available:
             raise FridaError("Android root is required to start Frida Server.")
         remote_dir = f"/data/local/tmp/android-security-lab/{session_id}"
         remote = f"{remote_dir}/frida-server"
-        adb.shell(
+        root_shell(
+            adb,
             serial,
-            ("mkdir", "-p", remote_dir),
+            f"mkdir -p {remote_dir}",
             timeout=15,
             check=True,
             operation="creating the managed Frida directory",
+            probe=root,
         )
         action = self.repository.record_cleanup_action(
             session_id,
@@ -424,19 +434,23 @@ class FridaController:
         if sha256_file(local_server) != probe.server_binary_sha256:
             raise FridaError("Frida Server changed after its pinned hash was verified.")
         adb.push_managed_file(serial, local_server, remote)
-        adb.shell(
+        root_shell(
+            adb,
             serial,
-            ("chmod", "700", remote),
+            f"chmod 700 {remote}",
             timeout=15,
             check=True,
             operation="making the managed Frida Server executable",
+            probe=root,
         )
-        remote_hash_result = adb.shell(
+        remote_hash_result = root_shell(
+            adb,
             serial,
-            ("sha256sum", remote),
+            f"sha256sum {remote}",
             timeout=20,
             check=False,
             operation="verifying the pushed Frida Server hash",
+            probe=root,
         )
         remote_hash_parts = remote_hash_result.stdout.strip().split(maxsplit=1)
         remote_hash = remote_hash_parts[0] if remote_hash_parts else ""
@@ -446,12 +460,14 @@ class FridaController:
             or remote_hash.casefold() != probe.server_binary_sha256
         ):
             raise FridaError("Pushed Frida Server SHA-256 verification failed.")
-        version_result = adb.shell(
+        version_result = root_shell(
+            adb,
             serial,
-            ("su", "-c", f"{remote} --version"),
+            f"{remote} --version",
             timeout=15,
             check=True,
             operation="verifying the managed Frida Server",
+            probe=root,
         )
         server_version = self._version(version_result.stdout or version_result.stderr)
         if server_version != probe.client_version:
@@ -459,12 +475,14 @@ class FridaController:
                 "Managed Frida Server version does not match the local client."
             )
         started_at = datetime.now(UTC).isoformat()
-        start_result = adb.shell(
+        start_result = root_shell(
+            adb,
             serial,
-            ("su", "-c", f"{remote} >/dev/null 2>&1 & echo $!"),
+            f"{remote} >/dev/null 2>&1 & echo $!",
             timeout=15,
             check=True,
             operation="starting the managed Frida Server",
+            probe=root,
         )
         pid = self._pid(start_result.stdout)
         if pid is None:
@@ -563,6 +581,7 @@ class FridaController:
             adb = self.context.adb_client(command_log=paths.commands_jsonl)
             try:
                 adb.require_authorized_device(record.serial)
+                root_probe = probe_root(adb, record.serial)
                 probe = self.probe(record.serial, command_log=paths.commands_jsonl)
                 if probe.client_path is None or probe.client_version is None:
                     raise FridaError("Frida client is unavailable.")
@@ -689,6 +708,7 @@ class FridaController:
                     server_binary_sha256=(
                         probe.server_binary_sha256 if server_started else None
                     ),
+                    root_mode=root_probe.mode.value,
                 )
                 write_json_atomic(
                     self._state_path(record.session_id),
@@ -698,7 +718,11 @@ class FridaController:
                 self.repository.append_event(
                     record.session_id,
                     "frida_observation_started",
-                    {"mode": mode, "server_started": server_started},
+                    {
+                        "mode": mode,
+                        "server_started": server_started,
+                        "root_mode": root_probe.mode.value,
+                    },
                 )
                 return state
             except BaseException:

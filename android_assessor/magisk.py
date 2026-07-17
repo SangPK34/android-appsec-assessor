@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from .adb import AdbClient
 from .errors import AdbError
-from .root import RootProbe
+from .root import RootProbe, root_shell
 
 _ZYGISK_QUERY = "magisk --sqlite \"SELECT value FROM settings WHERE key='zygisk';\""
 
@@ -27,25 +27,35 @@ def probe_magisk(adb: AdbClient, serial: str, root: RootProbe) -> MagiskProbe:
             error="Root is unavailable, so the Magisk CLI cannot be queried.",
         )
     try:
-        version_result = adb.shell(
+        version_result = root_shell(
+            adb,
             serial,
-            ("su", "-c", "magisk -v"),
+            "magisk -v",
             timeout=10,
             check=False,
             operation="probing Magisk",
+            probe=root,
         )
     except AdbError as exc:
         return MagiskProbe(available=False, error=str(exc)[:300])
     if version_result.timed_out or version_result.exit_code != 0:
-        return MagiskProbe(available=False, error="Magisk CLI was not available through su.")
-    version = version_result.stdout.strip().splitlines()[0][:100] or None
+        return MagiskProbe(
+            available=False,
+            error="Magisk CLI was not available through the selected root mode.",
+        )
+    version_lines = version_result.stdout.strip().splitlines()
+    if not version_lines:
+        return MagiskProbe(available=False, error="Magisk CLI returned no version output.")
+    version = version_lines[0][:100] or None
     try:
-        zygisk_result = adb.shell(
+        zygisk_result = root_shell(
+            adb,
             serial,
-            ("su", "-c", _ZYGISK_QUERY),
+            _ZYGISK_QUERY,
             timeout=10,
             check=False,
             operation="reading the Magisk Zygisk setting",
+            probe=root,
         )
     except AdbError:
         return MagiskProbe(available=True, version=version, zygisk_enabled=None)

@@ -12,7 +12,7 @@ from .adb import AdbClient, mask_serial
 from .errors import AdbError
 from .magisk import probe_magisk
 from .redaction import redact_text
-from .root import probe_root
+from .root import RootProbe, probe_root, root_shell
 from .validation import validate_package_name
 
 
@@ -48,6 +48,7 @@ class Capability:
     state: CapabilityState
     reason: str
     detail: str | None = None
+    metadata: dict[str, Any] | None = None
 
     @property
     def available(self) -> bool:
@@ -175,7 +176,12 @@ class CapabilityDetector:
             reason="No known Frida Server process was detected.",
         )
 
-    def _probe_app_data(self, serial: str, package: str | None, root_available: bool) -> Capability:
+    def _probe_app_data(
+        self,
+        serial: str,
+        package: str | None,
+        root: RootProbe,
+    ) -> Capability:
         if package is None:
             return Capability(
                 name=CapabilityName.APP_DATA_READ,
@@ -205,15 +211,17 @@ class CapabilityDetector:
                 reason="App data is readable through run-as.",
                 detail="run-as",
             )
-        if root_available:
+        if root.available:
             command = f"test -d /data/user/0/{target} || test -d /data/data/{target}"
             try:
-                root_result = self.adb.shell(
+                root_result = root_shell(
+                    self.adb,
                     serial,
-                    ("su", "-c", command),
+                    command,
                     timeout=10,
                     check=False,
                     operation="probing root-assisted app-data access",
+                    probe=root,
                 )
             except AdbError as exc:
                 return Capability(
@@ -227,7 +235,10 @@ class CapabilityDetector:
                     name=CapabilityName.APP_DATA_READ,
                     state=CapabilityState.AVAILABLE,
                     reason="App data is readable only with Android root.",
-                    detail="root_assisted; this does not establish an app vulnerability",
+                    detail=(
+                        f"root_assisted; root_mode={root.mode.value}; "
+                        "this does not establish an app vulnerability"
+                    ),
                 )
         return Capability(
             name=CapabilityName.APP_DATA_READ,
@@ -255,15 +266,25 @@ class CapabilityDetector:
             Capability(
                 CapabilityName.ANDROID_ROOT,
                 CapabilityState.AVAILABLE if root.available else CapabilityState.UNAVAILABLE,
-                "su returned uid=0." if root.available else "su did not provide uid=0.",
+                (
+                    f"{root.mode.value} returned uid=0."
+                    if root.available
+                    else root.error or "Android root was not verified."
+                ),
                 root.identity if root.available else root.error,
+                {
+                    "root_available": root.available,
+                    "root_mode": root.mode.value,
+                    "root_probe_status": root.probe_status,
+                    "root_probe_evidence": root.probe_evidence,
+                },
             ),
             Capability(
                 CapabilityName.MAGISK_AVAILABLE,
                 CapabilityState.AVAILABLE if magisk.available else CapabilityState.UNAVAILABLE,
-                "Magisk CLI is available through su."
+                "Magisk CLI is available through the selected root mode."
                 if magisk.available
-                else "Magisk CLI was not available through su.",
+                else "Magisk CLI was not available through the selected root mode.",
                 magisk.version if magisk.available else magisk.error,
             ),
         ]
@@ -296,7 +317,7 @@ class CapabilityDetector:
                     "Frida client is missing; run repair.cmd.",
                 ),
                 self._probe_frida_server(serial),
-                self._probe_app_data(serial, package, root.available),
+                self._probe_app_data(serial, package, root),
                 self._shell_probe(
                     serial,
                     CapabilityName.APK_PULL,

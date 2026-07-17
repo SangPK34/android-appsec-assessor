@@ -19,6 +19,7 @@ from .errors import (
 from .host_process import ProcessIdentity, WindowsProcessController
 from .paths import ProjectPaths
 from .redaction import redact_text
+from .root import root_shell
 from .session import (
     CleanupAction,
     CleanupActionStatus,
@@ -84,13 +85,10 @@ def _proc_start_time(value: str) -> str:
 
 
 def _remote_process_exists(adb: AdbClient, serial: str, pid: int) -> bool:
-    result = adb.shell(
+    result = root_shell(
+        adb,
         serial,
-        (
-            "su",
-            "-c",
-            f"if [ -d /proc/{pid} ]; then echo EXISTS; else echo MISSING; fi",
-        ),
+        f"if [ -d /proc/{pid} ]; then echo EXISTS; else echo MISSING; fi",
         timeout=10,
         check=False,
         operation="checking an owned Android process",
@@ -121,9 +119,10 @@ def capture_remote_process_identity(
     )
     values: dict[str, str] = {}
     for name, command in commands:
-        result = adb.shell(
+        result = root_shell(
+            adb,
             serial,
-            ("su", "-c", command),
+            command,
             timeout=10,
             check=False,
             operation="capturing owned Android process identity",
@@ -340,9 +339,10 @@ class CleanupExecutor:
             or actual.command_line != expected_command
         ):
             raise CleanupError(f"Refusing to stop reused or mismatched Android PID {pid}.")
-        self.adb.shell(
+        root_shell(
+            self.adb,
             record.serial,
-            ("su", "-c", f"kill {pid}"),
+            f"kill {pid}",
             timeout=10,
             check=True,
             operation="stopping an owned Android process",

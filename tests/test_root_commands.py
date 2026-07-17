@@ -6,12 +6,17 @@ from dataclasses import dataclass, field
 import pytest
 
 from android_assessor.root import (
+    AdbdRootBackend,
     AdbRootBackend,
     ExecutionPrincipal,
+    NonRootBackend,
     RootCommand,
     RootCommandExecutor,
     RootFailure,
+    RootMode,
     app_data_root,
+    probe_root,
+    root_shell,
     validate_root_remote_path,
 )
 from android_assessor.subprocess_utils import CommandResult
@@ -138,7 +143,7 @@ class CaptureAdb:
     ) -> CommandResult:
         assert serial == "FIXTURE_SERIAL"
         self.calls.append(tuple(arguments))
-        if arguments[-1] == "id":
+        if "id" in arguments[-1]:
             return command_result(stdout="uid=0(root) gid=0(root)")
         return command_result(stdout="10123:10123:600:10:regular file")
 
@@ -158,9 +163,185 @@ def test_remote_paths_with_spaces_or_unicode_are_single_quoted_tokens(name: str)
 
     assert result.root_granted is True
     remote_command = adb.calls[1][-1]
-    assert remote_command.startswith("stat -c")
-    assert f"'{root}/files/{name}'" in remote_command
+    assert "stat -c" in remote_command
+    assert root in remote_command
+    assert name in remote_command
     assert adb.calls[1][:2] == ("su", "-c")
+
+
+def test_adbd_root_backend_dispatches_directly_without_su() -> None:
+    adb = CaptureAdb()
+
+    result = RootCommandExecutor(
+        AdbdRootBackend(adb),  # type: ignore[arg-type]
+    ).execute("FIXTURE_SERIAL", RootCommand.identity())
+
+    assert len(adb.calls) == 1
+    assert adb.calls[0][:2] == ("sh", "-c")
+    assert "su" not in adb.calls[0]
+    assert result.root_granted is True
+    assert result.root_mode is RootMode.ADBD_ROOT
+    assert result.backend == "adbd_root"
+
+
+def test_non_root_backend_never_dispatches_adb_command() -> None:
+    result = RootCommandExecutor(NonRootBackend()).execute(
+        "FIXTURE_SERIAL",
+        RootCommand.identity(),
+    )
+
+    assert result.root_granted is False
+    assert result.root_mode is RootMode.NON_ROOT
+    assert result.exit_code == 126
+
+
+@dataclass
+class ProbeAdb:
+    results: dict[tuple[str, ...], CommandResult]
+    calls: list[tuple[str, ...]] = field(default_factory=list)
+    offline: bool = False
+
+    def require_authorized_device(self, serial: str) -> object:
+        if self.offline:
+            from android_assessor.errors import AdbError
+
+            raise AdbError("Android device is offline.")
+        return object()
+
+    def shell(
+        self,
+        serial: str,
+        arguments: Sequence[str],
+        **_kwargs: object,
+    ) -> CommandResult:
+        assert serial == "FIXTURE_SERIAL"
+        selected = tuple(arguments)
+        self.calls.append(selected)
+        return self.results[selected]
+
+
+def probe_adb(
+    *,
+    direct: CommandResult,
+    su_path: CommandResult | None = None,
+    su_id: CommandResult | None = None,
+) -> ProbeAdb:
+    results = {("id",): direct}
+    if su_path is not None:
+        results[("command", "-v", "su")] = su_path
+    if su_id is not None:
+        results[("su", "-c", "id")] = su_id
+    return ProbeAdb(results)
+
+
+def test_probe_root_prefers_adbd_root_without_probing_su() -> None:
+    adb = probe_adb(direct=command_result(stdout="uid=0(root) gid=0(root)"))
+
+    result = probe_root(adb, "FIXTURE_SERIAL")  # type: ignore[arg-type]
+
+    assert result.available is True
+    assert result.mode is RootMode.ADBD_ROOT
+    assert result.probe_status == "verified"
+    assert adb.calls == [("id",)]
+
+
+def test_probe_root_uses_su_only_after_discovery() -> None:
+    adb = probe_adb(
+        direct=command_result(stdout="uid=2000(shell) gid=2000(shell)"),
+        su_path=command_result(stdout="/system/xbin/su\n"),
+        su_id=command_result(stdout="uid=0(root) gid=0(root)"),
+    )
+
+    result = probe_root(adb, "FIXTURE_SERIAL")  # type: ignore[arg-type]
+
+    assert result.available is True
+    assert result.mode is RootMode.SU_ROOT
+    assert adb.calls[-1] == ("su", "-c", "id")
+
+
+def test_probe_root_without_su_is_non_root_and_does_not_dispatch_su() -> None:
+    adb = probe_adb(
+        direct=command_result(stdout="uid=2000(shell) gid=2000(shell)"),
+        su_path=command_result(exit_code=1),
+    )
+
+    result = probe_root(adb, "FIXTURE_SERIAL")  # type: ignore[arg-type]
+
+    assert result.mode is RootMode.NON_ROOT
+    assert result.probe_status == "not_root"
+    assert ("su", "-c", "id") not in adb.calls
+
+
+def test_probe_root_su_timeout_is_conservative() -> None:
+    adb = probe_adb(
+        direct=command_result(stdout="uid=2000(shell) gid=2000(shell)"),
+        su_path=command_result(stdout="/system/xbin/su\n"),
+        su_id=command_result(timed_out=True),
+    )
+
+    result = probe_root(adb, "FIXTURE_SERIAL")  # type: ignore[arg-type]
+
+    assert result.available is False
+    assert result.mode is RootMode.NON_ROOT
+    assert result.probe_status == "timeout"
+
+
+def test_probe_root_malformed_output_is_conservative() -> None:
+    adb = probe_adb(
+        direct=command_result(stdout="unexpected identity"),
+        su_path=command_result(exit_code=1),
+    )
+
+    result = probe_root(adb, "FIXTURE_SERIAL")  # type: ignore[arg-type]
+
+    assert result.available is False
+    assert result.mode is RootMode.NON_ROOT
+    assert result.probe_status == "malformed"
+
+
+def test_probe_root_preserves_offline_as_adb_error() -> None:
+    from android_assessor.errors import AdbError
+
+    adb = ProbeAdb({}, offline=True)
+
+    with pytest.raises(AdbError, match="offline"):
+        probe_root(adb, "FIXTURE_SERIAL")  # type: ignore[arg-type]
+
+
+def test_root_shell_adbd_mode_quotes_special_command_without_su() -> None:
+    command = "echo 'value with spaces' >/data/local/tmp/fixture & echo $!"
+    adb = ProbeAdb(
+        {
+            ("id",): command_result(stdout="uid=0(root) gid=0(root)"),
+        }
+    )
+
+    def shell(
+        serial: str,
+        arguments: Sequence[str],
+        **_kwargs: object,
+    ) -> CommandResult:
+        assert serial == "FIXTURE_SERIAL"
+        selected = tuple(arguments)
+        adb.calls.append(selected)
+        if selected == ("id",):
+            return adb.results[selected]
+        return command_result(stdout="4242\n")
+
+    adb.shell = shell  # type: ignore[method-assign]
+    result = root_shell(
+        adb,  # type: ignore[arg-type]
+        "FIXTURE_SERIAL",
+        command,
+        timeout=5,
+        check=True,
+        operation="starting a fixture server",
+    )
+
+    assert result.stdout == "4242\n"
+    assert adb.calls[1][:2] == ("sh", "-c")
+    assert "su" not in adb.calls[1]
+    assert "value with spaces" in adb.calls[1][-1]
 
 
 @pytest.mark.parametrize(

@@ -292,10 +292,14 @@ def test_fixture_provenance_cannot_be_labeled_physical() -> None:
         )
 
 
-def test_frida_server_asset_requires_pinned_output_hash(tmp_path: Path) -> None:
+@pytest.mark.parametrize("architecture", ("arm64", "x86_64"))
+def test_frida_server_asset_requires_pinned_output_hash(
+    tmp_path: Path,
+    architecture: str,
+) -> None:
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
-    server = paths.tools_dir / "frida" / "frida-server-17.0.0-android-arm64"
+    server = paths.tools_dir / "frida" / f"frida-server-17.0.0-android-{architecture}"
     server.parent.mkdir(parents=True)
     server.write_bytes(b"fixture-frida-server")
     digest = hashlib.sha256(server.read_bytes()).hexdigest()
@@ -306,7 +310,7 @@ def test_frida_server_asset_requires_pinned_output_hash(tmp_path: Path) -> None:
                 "frida_servers": {
                     "version": "17.0.0",
                     "assets": {
-                        "arm64": {
+                        architecture: {
                             "output_sha256": digest,
                             "output_minimum_bytes": server.stat().st_size,
                         }
@@ -319,13 +323,13 @@ def test_frida_server_asset_requires_pinned_output_hash(tmp_path: Path) -> None:
     context = SimpleNamespace(paths=paths)
     controller = FridaController(context)  # type: ignore[arg-type]
 
-    selected, selected_hash = controller._server_binary("17.0.0", "arm64")
+    selected, selected_hash = controller._server_binary("17.0.0", architecture)
 
     assert selected == server.resolve()
     assert selected_hash == digest
 
     server.write_bytes(b"tampered-frida-server")
-    assert controller._server_binary("17.0.0", "arm64") == (None, None)
+    assert controller._server_binary("17.0.0", architecture) == (None, None)
 
 
 def test_frida_server_asset_does_not_use_unpinned_generic_fallback(tmp_path: Path) -> None:

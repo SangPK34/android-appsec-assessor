@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import shlex
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
@@ -31,6 +31,12 @@ class ExecutionPrincipal(StrEnum):
     HOST_WINDOWS_USER = "HOST_WINDOWS_USER"
 
 
+class RootMode(StrEnum):
+    ADBD_ROOT = "adb_root"
+    SU_ROOT = "su_root"
+    NON_ROOT = "none"
+
+
 class RootFailure(StrEnum):
     NONE = "none"
     ROOT_DENIED = "root_denied"
@@ -47,6 +53,14 @@ class RootProbe:
     available: bool
     identity: str | None = None
     error: str | None = None
+    mode: RootMode = RootMode.NON_ROOT
+    probe_status: str = "unknown"
+    probe_evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["mode"] = self.mode.value
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +135,7 @@ class RootExecutionResult:
     timed_out: bool
     root_granted: bool
     backend: str
+    root_mode: RootMode
     principal: ExecutionPrincipal
     failure: RootFailure
     operation: str
@@ -129,6 +144,7 @@ class RootExecutionResult:
         payload = asdict(self)
         payload["principal"] = self.principal.value
         payload["failure"] = self.failure.value
+        payload["root_mode"] = self.root_mode.value
         if redacted:
             payload["stdout"] = redact_text(self.stdout)
             payload["stderr"] = redact_text(self.stderr)
@@ -190,8 +206,33 @@ def _classify_identity(result: CommandResult) -> tuple[bool, RootFailure]:
     return True, RootFailure.NONE
 
 
-class AdbRootBackend:
-    backend_name = "adb_su"
+class AdbdRootBackend:
+    backend_name = "adbd_root"
+    root_mode = RootMode.ADBD_ROOT
+
+    def __init__(self, adb: AdbClient) -> None:
+        self.adb = adb
+
+    def execute_root(
+        self,
+        serial: str,
+        arguments: Sequence[str],
+        *,
+        timeout: float,
+    ) -> CommandResult:
+        remote_command = quote_remote_arguments(arguments)
+        return self.adb.shell(
+            validate_serial(serial),
+            ("sh", "-c", shlex.quote(remote_command)),
+            timeout=timeout,
+            check=False,
+            operation="running a typed Android ADBD-root command",
+        )
+
+
+class SuRootBackend:
+    backend_name = "su"
+    root_mode = RootMode.SU_ROOT
 
     def __init__(self, adb: AdbClient) -> None:
         self.adb = adb
@@ -207,10 +248,38 @@ class AdbRootBackend:
         remote_command = quote_remote_arguments(arguments)
         return self.adb.shell(
             selected,
-            ("su", "-c", remote_command),
+            ("su", "-c", shlex.quote(remote_command)),
             timeout=timeout,
             check=False,
             operation="running a typed Android root command",
+        )
+
+
+# Compatibility name retained for existing callers and fixtures.  The backend
+# uses su only when the detector has selected SU_ROOT.
+AdbRootBackend = SuRootBackend
+
+
+class NonRootBackend:
+    backend_name = "none"
+    root_mode = RootMode.NON_ROOT
+
+    def execute_root(
+        self,
+        serial: str,
+        arguments: Sequence[str],
+        *,
+        timeout: float,
+    ) -> CommandResult:
+        del serial, timeout
+        return CommandResult(
+            arguments=tuple(arguments),
+            exit_code=126,
+            stdout="",
+            stderr="Android root is unavailable.",
+            started_at=datetime.now(UTC).isoformat(),
+            duration_ms=0,
+            timed_out=False,
         )
 
 
@@ -245,6 +314,13 @@ class RootCommandExecutor:
             timed_out=result.timed_out,
             root_granted=root_granted,
             backend=self.backend_name,
+            root_mode=RootMode(
+                getattr(
+                    self.backend,
+                    "root_mode",
+                    RootMode.SU_ROOT if root_granted else RootMode.NON_ROOT,
+                )
+            ),
             principal=(
                 ExecutionPrincipal.ANDROID_ROOT
                 if root_granted
@@ -329,19 +405,148 @@ class RootCommandExecutor:
 
 
 def probe_root(adb: AdbClient, serial: str) -> RootProbe:
-    result = RootCommandExecutor(AdbRootBackend(adb), timeout=8).execute(
+    adb.require_authorized_device(serial)
+    direct = adb.shell(
         serial,
-        RootCommand.identity(),
+        ("id",),
+        timeout=8,
+        check=False,
+        operation="probing the ADB shell identity",
     )
-    if result.root_granted:
-        return RootProbe(available=True, identity=result.stdout.strip()[:300])
-    if result.failure is RootFailure.TIMEOUT:
+    direct_granted, direct_failure = _classify_identity(direct)
+    evidence: dict[str, Any] = {
+        "shell_identity": redact_text(direct.stdout.strip())[:300],
+        "shell_exit_code": direct.exit_code,
+        "shell_timed_out": direct.timed_out,
+    }
+    if direct_granted:
+        return RootProbe(
+            available=True,
+            identity=direct.stdout.strip()[:300],
+            mode=RootMode.ADBD_ROOT,
+            probe_status="verified",
+            probe_evidence={**evidence, "strategy": "adb_shell_id"},
+        )
+    if direct.timed_out:
+        return RootProbe(
+            available=False,
+            error="ADB shell identity probe timed out.",
+            probe_status="timeout",
+            probe_evidence={**evidence, "strategy": "adb_shell_id"},
+        )
+
+    su_path = adb.shell(
+        serial,
+        ("command", "-v", "su"),
+        timeout=8,
+        check=False,
+        operation="checking for the su executable",
+    )
+    su_present = bool(su_path.stdout.strip())
+    evidence["su_path"] = redact_text(su_path.stdout.strip())[:300]
+    evidence["su_present"] = su_present
+    if su_path.timed_out:
+        return RootProbe(
+            available=False,
+            error="Android su discovery timed out.",
+            mode=RootMode.NON_ROOT,
+            probe_status="timeout",
+            probe_evidence={**evidence, "strategy": "command_v_su"},
+        )
+    if su_path.exit_code != 0 or not su_present:
+        status = (
+            "malformed"
+            if direct_failure is RootFailure.MALFORMED_IDENTITY
+            else "not_root"
+        )
+        error = (
+            "Android shell returned a malformed identity and su is unavailable."
+            if status == "malformed"
+            else "Android shell is not root and su is unavailable."
+        )
+        return RootProbe(
+            available=False,
+            error=error,
+            mode=RootMode.NON_ROOT,
+            probe_status=status,
+            probe_evidence={**evidence, "strategy": "command_v_su"},
+        )
+    su_result = adb.shell(
+        serial,
+        ("su", "-c", "id"),
+        timeout=8,
+        check=False,
+        operation="probing the su root identity",
+    )
+    su_granted, su_failure = _classify_identity(su_result)
+    evidence.update(
+        {
+            "su_identity": redact_text(su_result.stdout.strip())[:300],
+            "su_exit_code": su_result.exit_code,
+            "su_timed_out": su_result.timed_out,
+            "strategy": "su_c_id",
+        }
+    )
+    if su_granted:
+        return RootProbe(
+            available=True,
+            identity=su_result.stdout.strip()[:300],
+            mode=RootMode.SU_ROOT,
+            probe_status="verified",
+            probe_evidence=evidence,
+        )
+    if su_failure is RootFailure.TIMEOUT:
         error = "Android su probe timed out."
-    elif result.failure is RootFailure.SU_MISSING:
-        error = "Android su executable was not found."
-    elif result.failure is RootFailure.ROOT_DENIED:
-        error = "Android root request was denied."
+        status = "timeout"
+    elif su_failure is RootFailure.ROOT_DENIED:
+        error = "Android su root request was denied."
+        status = "denied"
+    elif su_failure is RootFailure.MALFORMED_IDENTITY:
+        error = "Android su returned a malformed identity."
+        status = "malformed"
     else:
-        detail = redact_text((result.stderr or result.stdout).strip())[:300]
-        error = detail or "Android su did not return a verified uid=0 identity."
-    return RootProbe(available=False, error=error)
+        detail = redact_text((su_result.stderr or su_result.stdout).strip())[:300]
+        error = detail or (
+            "Android shell is not root and su is unavailable."
+            if not su_present
+            else "Android su did not return a verified uid=0 identity."
+        )
+        status = "not_root"
+    return RootProbe(
+        available=False,
+        error=error,
+        mode=RootMode.NON_ROOT,
+        probe_status=status,
+        probe_evidence=evidence,
+    )
+
+
+def root_shell(
+    adb: AdbClient,
+    serial: str,
+    command: str,
+    *,
+    timeout: float,
+    check: bool,
+    operation: str,
+    probe: RootProbe | None = None,
+) -> CommandResult:
+    if not command or "\x00" in command or "\r" in command or "\n" in command:
+        raise ValueError("Root shell command contains unsupported characters.")
+    selected_probe = probe or probe_root(adb, serial)
+    if selected_probe.mode is RootMode.ADBD_ROOT:
+        arguments = ("sh", "-c", shlex.quote(command))
+    elif selected_probe.mode is RootMode.SU_ROOT:
+        arguments = ("su", "-c", shlex.quote(command))
+    else:
+        result = NonRootBackend().execute_root(serial, ("id",), timeout=timeout)
+        if check:
+            raise AdbError(selected_probe.error or "Android root is unavailable.")
+        return result
+    return adb.shell(
+        serial,
+        arguments,
+        timeout=timeout,
+        check=check,
+        operation=operation,
+    )

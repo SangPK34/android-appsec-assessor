@@ -16,24 +16,33 @@ def command_result(
     *,
     exit_code: int = 0,
     stdout: str = "",
+    stderr: str = "",
+    timed_out: bool = False,
 ) -> CommandResult:
     return CommandResult(
         arguments=arguments,
         exit_code=exit_code,
         stdout=stdout,
-        stderr="",
+        stderr=stderr,
         started_at="2026-07-17T00:00:00+00:00",
         duration_ms=1,
-        timed_out=False,
+        timed_out=timed_out,
     )
 
 
 class FakeAdb:
     executable = Path("D:/lab/tools/platform-tools/adb.exe")
 
-    def __init__(self, *, rooted: bool, zygisk: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        rooted: bool,
+        zygisk: bool = False,
+        adbd_root: bool = False,
+    ) -> None:
         self.rooted = rooted
         self.zygisk = zygisk
+        self.adbd_root = adbd_root
 
     def require_authorized_device(self, serial: str) -> AdbDevice:
         return AdbDevice(serial, "device", model="Pixel_4_XL")
@@ -45,13 +54,28 @@ class FakeAdb:
         **_kwargs: object,
     ) -> CommandResult:
         del serial
+        if arguments == ("id",):
+            return command_result(
+                arguments,
+                stdout=(
+                    "uid=0(root) gid=0(root)"
+                    if self.adbd_root
+                    else "uid=2000(shell) gid=2000(shell)"
+                ),
+            )
+        if arguments == ("command", "-v", "su"):
+            return command_result(
+                arguments,
+                exit_code=0 if self.rooted else 1,
+                stdout="/system/xbin/su\n" if self.rooted else "",
+            )
         if arguments == ("su", "-c", "id"):
             return command_result(
                 arguments,
                 exit_code=0 if self.rooted else 1,
                 stdout="uid=0(root) gid=0(root)" if self.rooted else "",
             )
-        if arguments == ("su", "-c", "magisk -v"):
+        if arguments[0:2] == ("su", "-c") and "magisk -v" in arguments[-1]:
             return command_result(arguments, stdout="28.1")
         if arguments[0:2] == ("su", "-c") and "SELECT value" in arguments[-1]:
             return command_result(arguments, stdout=f"value={1 if self.zygisk else 0}")
@@ -95,7 +119,23 @@ def test_root_assisted_storage_is_labeled_without_claiming_vulnerability() -> No
     app_data = report.get(CapabilityName.APP_DATA_READ)
 
     assert report.get(CapabilityName.ANDROID_ROOT).available is True
+    assert report.get(CapabilityName.ANDROID_ROOT).metadata["root_mode"] == "su_root"
     assert report.get(CapabilityName.ZYGISK_AVAILABLE).available is True
     assert app_data.available is True
     assert app_data.detail is not None
     assert "does not establish an app vulnerability" in app_data.detail
+
+
+def test_adbd_root_capability_exposes_mode_status_and_evidence() -> None:
+    detector = CapabilityDetector(
+        FakeAdb(rooted=True, adbd_root=True),  # type: ignore[arg-type]
+        {},
+    )
+
+    root = detector.detect("ABC123").get(CapabilityName.ANDROID_ROOT)
+
+    assert root.available is True
+    assert root.metadata["root_available"] is True
+    assert root.metadata["root_mode"] == "adb_root"
+    assert root.metadata["root_probe_status"] == "verified"
+    assert root.metadata["root_probe_evidence"]["strategy"] == "adb_shell_id"
