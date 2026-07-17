@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -9,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from .adb import AdbClient
-from .errors import ApkInspectionError, SessionError
+from .errors import AdbError, ApkInspectionError, SessionError
 from .evidence import sha256_file
 from .paths import ProjectPaths
 from .storage import require_under_root
@@ -76,6 +77,47 @@ class PackageInspectionData:
     metadata: PackageMetadata
     pm_paths_output: str
     dumpsys_output: str
+
+
+DEFAULT_MAX_APK_FILES = 32
+DEFAULT_MAX_APK_FILE_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_TOTAL_APK_BYTES = 512 * 1024 * 1024
+DEFAULT_APK_STAT_TIMEOUT_SECONDS = 15.0
+DEFAULT_APK_PULL_TIMEOUT_SECONDS = 180.0
+
+
+def _apk_error(code: str, message: str) -> ApkInspectionError:
+    return ApkInspectionError(f"APK inspection [{code}]: {message}")
+
+
+def _positive_limit(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise _apk_error("invalid_limit", f"{name} must be a positive integer.")
+    return value
+
+
+def _positive_timeout(value: float, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise _apk_error("invalid_limit", f"{name} must be a positive number.")
+    return float(value)
+
+
+def _parse_remote_apk_size(output: str, remote_name: str) -> int:
+    value = output.strip()
+    if len(value) > 20 or not value.isascii() or not value.isdecimal():
+        raise _apk_error(
+            "invalid_remote_size",
+            f"ADB returned an invalid size for {remote_name}.",
+        )
+    size = int(value)
+    if size <= 0:
+        raise _apk_error("invalid_remote_size", f"Remote APK {remote_name} is empty.")
+    return size
 
 
 def _optional_text(value: str | None) -> str | None:
@@ -248,26 +290,95 @@ class ApkPuller:
         *,
         session_root: Path,
         destination_dir: Path,
+        max_files: int = DEFAULT_MAX_APK_FILES,
+        max_file_bytes: int = DEFAULT_MAX_APK_FILE_BYTES,
+        max_total_bytes: int = DEFAULT_MAX_TOTAL_APK_BYTES,
+        stat_timeout: float = DEFAULT_APK_STAT_TIMEOUT_SECONDS,
+        pull_timeout: float = DEFAULT_APK_PULL_TIMEOUT_SECONDS,
     ) -> tuple[ApkArtifact, ...]:
         root = require_under_root(session_root, self.paths.root)
         destination = require_under_root(destination_dir, root)
+        file_limit = _positive_limit(max_files, "max_files")
+        per_file_limit = _positive_limit(max_file_bytes, "max_file_bytes")
+        total_limit = _positive_limit(max_total_bytes, "max_total_bytes")
+        remote_stat_timeout = _positive_timeout(stat_timeout, "stat_timeout")
+        remote_pull_timeout = _positive_timeout(pull_timeout, "pull_timeout")
+        if len(remote_paths) > file_limit:
+            raise _apk_error(
+                "file_count_limit",
+                f"Package exposes {len(remote_paths)} APK files; limit is {file_limit}.",
+            )
+
+        normalized_paths: list[str] = []
+        for raw_remote in remote_paths:
+            try:
+                normalized_paths.append(validate_android_apk_path(raw_remote))
+            except SessionError as exc:
+                raise _apk_error("invalid_remote_path", str(exc)) from exc
+
+        remote_apks: list[tuple[str, int]] = []
+        aggregate_size = 0
+        for remote in normalized_paths:
+            remote_name = PurePosixPath(remote).name
+            try:
+                result = self.adb.shell(
+                    serial,
+                    ("stat", "-c", "%s", "--", remote),
+                    timeout=remote_stat_timeout,
+                    check=True,
+                    operation="reading remote APK size",
+                )
+            except AdbError as exc:
+                raise _apk_error(
+                    "remote_stat_failed",
+                    f"Could not determine the size of {remote_name}: {exc}",
+                ) from exc
+            size = _parse_remote_apk_size(result.stdout, remote_name)
+            if size > per_file_limit:
+                raise _apk_error(
+                    "file_size_limit",
+                    f"Remote APK {remote_name} is {size} bytes; limit is {per_file_limit}.",
+                )
+            aggregate_size += size
+            if aggregate_size > total_limit:
+                raise _apk_error(
+                    "total_size_limit",
+                    f"Remote APK set is {aggregate_size} bytes; limit is {total_limit}.",
+                )
+            remote_apks.append((remote, size))
+
         destination.mkdir(parents=True, exist_ok=True)
         artifacts: list[ApkArtifact] = []
-        for index, raw_remote in enumerate(remote_paths):
-            remote = validate_android_apk_path(raw_remote)
+        for index, (remote, expected_size) in enumerate(remote_apks):
             remote_name = PurePosixPath(remote).name
             role = "base" if remote_name.casefold() == "base.apk" else "split"
             split_name = "base" if role == "base" else PurePosixPath(remote_name).stem
             final = destination / f"{index:03d}-{remote_name}"
             partial = destination / f".{final.name}.{uuid4().hex}.part"
             try:
-                self.adb.pull_file(serial, remote, partial)
+                self.adb.pull_file(serial, remote, partial, timeout=remote_pull_timeout)
                 if not partial.is_file() or partial.stat().st_size <= 0:
-                    raise ApkInspectionError(f"ADB did not produce APK file {remote_name}.")
+                    raise _apk_error(
+                        "pull_missing",
+                        f"ADB did not produce APK file {remote_name}.",
+                    )
+                pulled_size = partial.stat().st_size
+                if pulled_size != expected_size:
+                    raise _apk_error(
+                        "pull_size_mismatch",
+                        f"Pulled APK {remote_name} is {pulled_size} bytes; "
+                        f"expected {expected_size}.",
+                    )
                 partial.replace(final)
+            except AdbError as exc:
+                raise _apk_error(
+                    "pull_failed",
+                    f"ADB could not pull APK {remote_name}: {exc}",
+                ) from exc
             except OSError as exc:
-                raise ApkInspectionError(
-                    f"Could not store pulled APK {remote_name}: {exc}"
+                raise _apk_error(
+                    "local_storage_failed",
+                    f"Could not store pulled APK {remote_name}: {exc}",
                 ) from exc
             finally:
                 partial.unlink(missing_ok=True)
@@ -277,7 +388,7 @@ class ApkPuller:
                     split_name=split_name,
                     remote_path=remote,
                     relative_path=final.relative_to(root).as_posix(),
-                    size_bytes=final.stat().st_size,
+                    size_bytes=expected_size,
                     sha256=sha256_file(final),
                 )
             )

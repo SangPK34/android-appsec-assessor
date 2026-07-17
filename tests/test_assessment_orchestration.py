@@ -435,6 +435,184 @@ def test_crypto_analyzer_output_is_consumed_by_rule_engine(tmp_path: Path) -> No
     assert findings["ASL-RUNTIME-WEBVIEW"].status is FindingStatus.PASS
 
 
+@pytest.mark.parametrize(
+    ("inventory_status", "candidates", "expected_status"),
+    (
+        ("completed", [], FindingStatus.PASS),
+        ("partial", [], FindingStatus.INCONCLUSIVE),
+        (
+            "completed",
+            [
+                {
+                    "kind": "contextual_secret",
+                    "confidence": "medium",
+                    "source_id": "base:0",
+                    "location": "assets/config.properties:line:4",
+                    "key_name": "client_secret",
+                    "value_sha256": "a" * 64,
+                    "value_length": 32,
+                }
+            ],
+            FindingStatus.POTENTIAL,
+        ),
+    ),
+)
+def test_static_secret_inventory_is_consumed_without_confirming_presence_only(
+    tmp_path: Path,
+    inventory_status: str,
+    candidates: list[dict[str, object]],
+    expected_status: FindingStatus,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    session_paths = repository.paths_for(session_id)
+    app = read_json_object(session_paths.app_json, root=paths.root)
+    app["static_analysis"] = {
+        "schema_version": 1,
+        "status": inventory_status,
+        "secret_candidates": candidates,
+        "limitations": ["entry_budget"] if inventory_status == "partial" else [],
+    }
+    write_json_atomic(session_paths.app_json, app, root=paths.root)
+    inventory_path = session_paths.redacted_dir / "static" / "inventory.json"
+    write_json_atomic(
+        inventory_path,
+        app["static_analysis"],
+        root=paths.root,
+    )
+    evidence = EvidenceRepository(paths, repository).register_file(
+        session_id,
+        inventory_path,
+        evidence_type="static_apk_inventory",
+        source="bounded_apk_static_analysis",
+        description="Redacted static inventory fixture.",
+        sensitive=False,
+        redacted=True,
+    )
+
+    finding = next(
+        item
+        for item in RuleEngine(paths, repository).evaluate(session_id)
+        if item.rule_id == "ASL-STATIC-HARDCODED-SECRET"
+    )
+
+    assert finding.status is expected_status
+    assert finding.status is not FindingStatus.CONFIRMED
+    assert finding.evidence_ids == (evidence.evidence_id,)
+    serialized = json.dumps(finding.to_dict()).casefold()
+    assert "raw_value" not in serialized
+    assert "client-secret-material" not in serialized
+
+
+def test_phase_one_manifest_rules_are_wired_with_specific_evidence(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    session_paths = repository.paths_for(session_id)
+    app = read_json_object(session_paths.app_json, root=paths.root)
+    app["manifest"] = {
+        "debuggable": False,
+        "test_only": False,
+        "allow_backup": False,
+        "uses_cleartext_traffic": False,
+        "network_security_config": None,
+        "application_permission": None,
+        "custom_permissions": [
+            {
+                "name": "com.example.app.CALL_INTERNAL",
+                "protection_level": "normal",
+            }
+        ],
+        "components": [
+            {
+                "component_type": "service",
+                "name": "com.example.app.SyncService",
+                "effective_exported": True,
+                "enabled": True,
+                "permission": None,
+                "intent_filters": [],
+            },
+            {
+                "component_type": "activity",
+                "name": "com.example.app.LinkActivity",
+                "effective_exported": True,
+                "enabled": True,
+                "permission": None,
+                "intent_filters": [],
+            },
+        ],
+        "deep_links": [
+            {
+                "component": "com.example.app.LinkActivity",
+                "component_effective_exported": True,
+                "scheme": "example",
+                "host": None,
+                "path": None,
+            }
+        ],
+        "deep_links_truncated": False,
+        "file_provider_paths": [
+            {
+                "provider": "com.example.app.ShareProvider",
+                "authorities": "com.example.app.files",
+                "grant_uri_permissions": True,
+                "resource_reference": "@xml/share_paths",
+                "resource_path": "res/xml/share_paths.xml",
+                "resolution_status": "resolved",
+                "entries": [
+                    {"kind": "root-path", "name": "root", "path": "."}
+                ],
+            }
+        ],
+    }
+    write_json_atomic(session_paths.app_json, app, root=paths.root)
+    manifest_path = session_paths.redacted_dir / "manifest" / "manifest.txt"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text("redacted manifest fixture", encoding="utf-8")
+    resource_path = session_paths.redacted_dir / "manifest" / "share-paths.txt"
+    resource_path.write_text("redacted FileProvider path fixture", encoding="utf-8")
+    evidence = EvidenceRepository(paths, repository)
+    manifest_evidence = evidence.register_file(
+        session_id,
+        manifest_path,
+        evidence_type="manifest_tree",
+        source="aapt2_dump_xmltree",
+        description="Redacted manifest fixture.",
+        sensitive=True,
+        redacted=True,
+    )
+    resource_evidence = evidence.register_file(
+        session_id,
+        resource_path,
+        evidence_type="manifest_resource_xml",
+        source="aapt2_dump_xmltree",
+        description="Redacted manifest resource fixture.",
+        sensitive=True,
+        redacted=True,
+    )
+
+    findings = {
+        item.rule_id: item for item in RuleEngine(paths, repository).evaluate(session_id)
+    }
+
+    for rule_id in (
+        "ASL-MANIFEST-EXPORTED-SERVICE",
+        "ASL-MANIFEST-CUSTOM-PERMISSION",
+        "ASL-MANIFEST-FILEPROVIDER-PATHS",
+        "ASL-MANIFEST-DEEP-LINK-EXPOSURE",
+    ):
+        assert findings[rule_id].status is FindingStatus.POTENTIAL
+        assert findings[rule_id].status is not FindingStatus.CONFIRMED
+        assert findings[rule_id].details["method"] == "normalized_manifest_policy"
+        assert findings[rule_id].details["missing_evidence"]
+    assert findings["ASL-MANIFEST-EXPORTED-SERVICE"].evidence_ids == (
+        manifest_evidence.evidence_id,
+    )
+    assert findings["ASL-MANIFEST-FILEPROVIDER-PATHS"].evidence_ids == (
+        manifest_evidence.evidence_id,
+        resource_evidence.evidence_id,
+    )
+
+
 def test_emulator_environment_is_not_reported_as_physical_device() -> None:
     assert _environment_type(
         "emulator-5554",
@@ -587,10 +765,19 @@ def test_runtime_stop_request_is_idempotent_marker(tmp_path: Path) -> None:
 
 
 def test_exported_component_aggregate_is_suppressed_when_specific_rules_run() -> None:
-    rule_ids = {
-        "ASL-MVP-004",
-        "ASL-MANIFEST-EXPORTED-ACTIVITY",
-        "ASL-MANIFEST-EXPORTED-RECEIVER",
+    conclusive = {
+        "ASL-MVP-004": "potential",
+        "ASL-MANIFEST-EXPORTED-ACTIVITY": "pass",
+        "ASL-MANIFEST-EXPORTED-SERVICE": "pass",
+        "ASL-MANIFEST-EXPORTED-RECEIVER": "potential",
+        "ASL-MANIFEST-EXPORTED-PROVIDER": "pass",
     }
-    assert _is_aggregate_alias({"rule_id": "ASL-MVP-004"}, rule_ids) is True
-    assert _is_aggregate_alias({"rule_id": "ASL-MVP-004"}, {"ASL-MVP-004"}) is False
+    assert _is_aggregate_alias({"rule_id": "ASL-MVP-004"}, conclusive) is True
+    assert _is_aggregate_alias(
+        {"rule_id": "ASL-MVP-004"},
+        {**conclusive, "ASL-MANIFEST-EXPORTED-SERVICE": "inconclusive"},
+    ) is False
+    assert _is_aggregate_alias(
+        {"rule_id": "ASL-MVP-004"},
+        {"ASL-MVP-004": "potential"},
+    ) is False

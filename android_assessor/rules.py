@@ -147,6 +147,7 @@ class RuleEngine:
         traffic = context["traffic_events"]
         logcat = context["logcat"]
         frida = context["frida_events"]
+        static_analysis = context["static_analysis"]
         attributed_traffic = [
             item
             for item in traffic
@@ -197,13 +198,106 @@ class RuleEngine:
             details = {
                 **selected.details,
                 "rationale": selected.rationale,
+                "reason": selected.rationale,
+                "method": "normalized_manifest_policy",
+                "preconditions": [
+                    "the installed APK set was collected from the selected package",
+                    "available AndroidManifest.xml files were parsed by the bounded "
+                    "AAPT2 inspector",
+                ],
+                "missing_evidence": (
+                    ["runtime reachability or security impact"]
+                    if selected.finding_status is FindingStatus.POTENTIAL
+                    else ["complete normalized manifest or referenced resource metadata"]
+                    if selected.finding_status is FindingStatus.INCONCLUSIVE
+                    else []
+                ),
+                "analysis_confidence": selected.confidence,
                 "observation_only": definition.observation_only,
             }
+            evidence_ids = evidence("manifest_tree")
+            if definition.rule_id == "ASL-MANIFEST-FILEPROVIDER-PATHS":
+                evidence_ids = tuple(
+                    dict.fromkeys(
+                        (
+                            *evidence_ids,
+                            *evidence("manifest_resource_xml"),
+                            *evidence("manifest_resource_table"),
+                        )
+                    )
+                )
             return (
                 selected.finding_status,
                 "static",
                 details,
-                evidence("manifest_tree"),
+                evidence_ids,
+                False,
+                False,
+            )
+
+        if definition.evaluator == "static_secret_candidate":
+            if static_analysis is None:
+                return (
+                    FindingStatus.SKIPPED,
+                    "static",
+                    {
+                        "method": "bounded_apk_static_inventory",
+                        "preconditions": ["static APK analysis completed"],
+                        "missing_evidence": ["static APK inventory"],
+                        "reason": "Static APK inventory is unavailable.",
+                    },
+                    (),
+                    False,
+                    False,
+                )
+            raw_candidates = static_analysis.get("secret_candidates", [])
+            candidates = (
+                [
+                    item
+                    for item in raw_candidates
+                    if isinstance(item, dict)
+                    and item.get("confidence") in {"high", "medium"}
+                ]
+                if isinstance(raw_candidates, list)
+                else []
+            )
+            inventory_status = str(static_analysis.get("status", "partial"))
+            if candidates:
+                status = FindingStatus.POTENTIAL
+                reason = (
+                    "Contextual secret material is present in packaged application "
+                    "content; runtime use and credential validity were not assumed."
+                )
+                missing = [
+                    "runtime use or reachable trust boundary",
+                    "credential validity and server-side scope",
+                ]
+            elif inventory_status == "completed":
+                status = FindingStatus.PASS
+                reason = "No contextual secret candidate matched the bounded inventory."
+                missing = []
+            else:
+                status = FindingStatus.INCONCLUSIVE
+                reason = "The bounded static inventory did not complete all planned input."
+                missing = ["complete bounded APK input coverage"]
+            return (
+                status,
+                "static",
+                {
+                    "method": "bounded_apk_static_inventory",
+                    "preconditions": [
+                        "APK artifacts were collected from the selected package",
+                        "archive and DEX limits were enforced",
+                    ],
+                    "missing_evidence": missing,
+                    "reason": reason,
+                    "candidate_count": len(candidates),
+                    "candidates": candidates,
+                    "inventory_status": inventory_status,
+                    "limitations": list(static_analysis.get("limitations", []))[:20],
+                    "redaction": "Candidate values are represented only by length and SHA-256.",
+                },
+                evidence("static_apk_inventory"),
                 False,
                 False,
             )
@@ -253,21 +347,57 @@ class RuleEngine:
                 }
             )
             log_markers = list(logcat.get("sensitive_marker_types", [])) if logcat else []
-            if query_keys or log_markers:
+            canary_flows = [
+                item
+                for item in attributed_traffic
+                if item.get("event") == "request"
+                and item.get("attribution") == "validation_canary"
+            ]
+            log_canary = bool(logcat and logcat.get("canary_observed") is True)
+            if canary_flows or log_canary:
                 status = FindingStatus.CONFIRMED
-            elif attributed_traffic or (
-                logcat and logcat.get("status") == "completed"
-            ):
-                status = FindingStatus.PASS
+                reason = (
+                    "The exact session canary reached an attributed URL or "
+                    "target-process log sink."
+                )
+                missing_evidence: list[str] = []
+            elif query_keys or log_markers:
+                status = FindingStatus.POTENTIAL
+                reason = (
+                    "A sensitive-name heuristic was observed, but no exact session "
+                    "canary established data attribution."
+                )
+                missing_evidence = [
+                    "exact session canary in an attributed target sink"
+                ]
             else:
                 status = FindingStatus.INCONCLUSIVE
+                reason = (
+                    "No exact canary or attributed sensitive-sink evidence was observed "
+                    "during the bounded capture window."
+                )
+                missing_evidence = [
+                    "activated target flow carrying the exact session canary"
+                ]
             ids = tuple(
                 dict.fromkeys((*evidence("traffic_events"), *evidence("target_logcat")))
             )
             return (
                 status,
                 "dynamic",
-                {"query_keys": query_keys, "log_marker_types": log_markers},
+                {
+                    "query_keys": query_keys,
+                    "log_marker_types": log_markers,
+                    "exact_canary_flow_count": len(canary_flows),
+                    "exact_log_canary_observed": log_canary,
+                    "reason": reason,
+                    "method": "exact_session_canary_sink_attribution",
+                    "preconditions": [
+                        "target traffic or target-process log capture was active",
+                        "a session-scoped canary was used for controlled attribution",
+                    ],
+                    "missing_evidence": missing_evidence,
+                },
                 ids,
                 False,
                 False,
@@ -469,6 +599,11 @@ class RuleEngine:
         paths = self.sessions.paths_for(session_id)
         app = read_json_object(paths.app_json, root=self.paths.root)
         manifest = app.get("manifest") if isinstance(app.get("manifest"), dict) else None
+        static_analysis = (
+            app.get("static_analysis")
+            if isinstance(app.get("static_analysis"), dict)
+            else None
+        )
         if manifest is not None:
             manifest = dict(manifest)
             metadata = app.get("metadata") if isinstance(app.get("metadata"), dict) else {}
@@ -544,6 +679,7 @@ class RuleEngine:
 
         context = {
             "manifest": manifest,
+            "static_analysis": static_analysis,
             "traffic_events": traffic_events,
             "logcat": logcat,
             "frida_events": frida_events,

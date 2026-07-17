@@ -1,0 +1,1025 @@
+from __future__ import annotations
+
+import io
+import json
+import struct
+from dataclasses import replace
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
+
+import pytest
+
+import android_assessor.static_apk_analysis as static_analysis
+from android_assessor.static_apk_analysis import (
+    ApiPolicyEntry,
+    DexFormatError,
+    StaticApkInput,
+    StaticApkPolicy,
+    analyze_apks,
+    parse_dex_inventory,
+)
+
+
+def _uleb128(value: int) -> bytes:
+    output = bytearray()
+    while True:
+        item = value & 0x7F
+        value >>= 7
+        output.append(item | (0x80 if value else 0))
+        if not value:
+            return bytes(output)
+
+
+def _shorty(descriptor: str) -> str:
+    return "L" if descriptor.startswith(("L", "[")) else descriptor[0]
+
+
+def _mutf8(value: str) -> tuple[int, bytes]:
+    utf16 = value.encode("utf-16-le", errors="surrogatepass")
+    code_units = [
+        struct.unpack_from("<H", utf16, offset)[0]
+        for offset in range(0, len(utf16), 2)
+    ]
+    output = bytearray()
+    for item in code_units:
+        if 0x01 <= item <= 0x7F:
+            output.append(item)
+        elif item <= 0x7FF:
+            output.extend((0xC0 | (item >> 6), 0x80 | (item & 0x3F)))
+        else:
+            output.extend(
+                (
+                    0xE0 | (item >> 12),
+                    0x80 | ((item >> 6) & 0x3F),
+                    0x80 | (item & 0x3F),
+                )
+            )
+    return len(code_units), bytes(output)
+
+
+def build_dex(
+    *,
+    extra_strings: tuple[str, ...] = (),
+    methods: tuple[tuple[str, str, tuple[str, ...], str], ...] = (),
+) -> bytes:
+    strings: list[str] = []
+
+    def add_string(value: str) -> int:
+        if value not in strings:
+            strings.append(value)
+        return strings.index(value)
+
+    for value in extra_strings:
+        add_string(value)
+    types: list[str] = []
+
+    def add_type(value: str) -> int:
+        add_string(value)
+        if value not in types:
+            types.append(value)
+        return types.index(value)
+
+    prototypes: list[tuple[tuple[str, ...], str]] = []
+    for class_descriptor, method_name, parameters, return_type in methods:
+        add_type(class_descriptor)
+        add_string(method_name)
+        add_type(return_type)
+        for parameter in parameters:
+            add_type(parameter)
+        prototype = (parameters, return_type)
+        if prototype not in prototypes:
+            prototypes.append(prototype)
+        add_string(_shorty(return_type) + "".join(_shorty(item) for item in parameters))
+
+    cursor = 0x70
+    string_ids_offset = cursor if strings else 0
+    cursor += len(strings) * 4
+    type_ids_offset = cursor if types else 0
+    cursor += len(types) * 4
+    proto_ids_offset = cursor if prototypes else 0
+    cursor += len(prototypes) * 12
+    method_ids_offset = cursor if methods else 0
+    cursor += len(methods) * 8
+    cursor = (cursor + 3) & ~3
+
+    parameter_offsets: dict[tuple[str, ...], int] = {}
+    type_list_data = bytearray()
+    for parameters, _return_type in prototypes:
+        if not parameters or parameters in parameter_offsets:
+            continue
+        while (cursor + len(type_list_data)) % 4:
+            type_list_data.append(0)
+        parameter_offsets[parameters] = cursor + len(type_list_data)
+        type_list_data.extend(struct.pack("<I", len(parameters)))
+        for parameter in parameters:
+            type_list_data.extend(struct.pack("<H", types.index(parameter)))
+    cursor += len(type_list_data)
+
+    string_offsets: list[int] = []
+    string_data = bytearray()
+    for value in strings:
+        utf16_length, encoded = _mutf8(value)
+        string_offsets.append(cursor + len(string_data))
+        string_data.extend(_uleb128(utf16_length))
+        string_data.extend(encoded)
+        string_data.append(0)
+    file_size = cursor + len(string_data)
+    value = bytearray(file_size)
+    value[:8] = b"dex\n035\x00"
+    struct.pack_into("<I", value, 0x20, file_size)
+    struct.pack_into("<I", value, 0x24, 0x70)
+    struct.pack_into("<I", value, 0x28, 0x12345678)
+    struct.pack_into("<II", value, 0x38, len(strings), string_ids_offset)
+    struct.pack_into("<II", value, 0x40, len(types), type_ids_offset)
+    struct.pack_into("<II", value, 0x48, len(prototypes), proto_ids_offset)
+    struct.pack_into("<II", value, 0x58, len(methods), method_ids_offset)
+    data_offset = 0x70 if not (type_list_data or string_data) else (
+        method_ids_offset + len(methods) * 8 if methods else cursor - len(type_list_data)
+    )
+    struct.pack_into("<II", value, 0x68, file_size - data_offset, data_offset)
+
+    for index, offset in enumerate(string_offsets):
+        struct.pack_into("<I", value, string_ids_offset + index * 4, offset)
+    for index, descriptor in enumerate(types):
+        struct.pack_into("<I", value, type_ids_offset + index * 4, strings.index(descriptor))
+    for index, (parameters, return_type) in enumerate(prototypes):
+        base = proto_ids_offset + index * 12
+        shorty = _shorty(return_type) + "".join(_shorty(item) for item in parameters)
+        struct.pack_into(
+            "<III",
+            value,
+            base,
+            strings.index(shorty),
+            types.index(return_type),
+            parameter_offsets.get(parameters, 0),
+        )
+    for index, (class_descriptor, method_name, parameters, return_type) in enumerate(
+        methods
+    ):
+        struct.pack_into(
+            "<HHI",
+            value,
+            method_ids_offset + index * 8,
+            types.index(class_descriptor),
+            prototypes.index((parameters, return_type)),
+            strings.index(method_name),
+        )
+    value[cursor - len(type_list_data) : cursor] = type_list_data
+    value[cursor:] = string_data
+    return bytes(value)
+
+
+def write_apk(
+    path: Path,
+    dex: bytes,
+    *,
+    entries: dict[str, bytes] | None = None,
+    compression: int = ZIP_STORED,
+) -> None:
+    with ZipFile(path, "w", compression=compression) as archive:
+        archive.writestr("classes.dex", dex)
+        for name, content in (entries or {}).items():
+            archive.writestr(name, content)
+
+
+def mutate_zip_entry(
+    path: Path,
+    name: str,
+    *,
+    set_flags: int = 0,
+    corrupt_data: bool = False,
+) -> None:
+    value = bytearray(path.read_bytes())
+    eocd = value.rfind(b"PK\x05\x06")
+    assert eocd >= 0
+    entry_count = struct.unpack_from("<H", value, eocd + 10)[0]
+    central = struct.unpack_from("<I", value, eocd + 16)[0]
+    for _index in range(entry_count):
+        assert value[central : central + 4] == b"PK\x01\x02"
+        filename_size, extra_size, comment_size = struct.unpack_from(
+            "<HHH",
+            value,
+            central + 28,
+        )
+        filename = bytes(
+            value[central + 46 : central + 46 + filename_size]
+        ).decode("utf-8")
+        if filename == name:
+            local = struct.unpack_from("<I", value, central + 42)[0]
+            assert value[local : local + 4] == b"PK\x03\x04"
+            if set_flags:
+                central_flags = struct.unpack_from("<H", value, central + 8)[0]
+                local_flags = struct.unpack_from("<H", value, local + 6)[0]
+                struct.pack_into("<H", value, central + 8, central_flags | set_flags)
+                struct.pack_into("<H", value, local + 6, local_flags | set_flags)
+            if corrupt_data:
+                local_name_size, local_extra_size = struct.unpack_from(
+                    "<HH",
+                    value,
+                    local + 26,
+                )
+                data_offset = local + 30 + local_name_size + local_extra_size
+                value[data_offset] ^= 0x01
+            path.write_bytes(value)
+            return
+        central += 46 + filename_size + extra_size + comment_size
+    raise AssertionError(f"ZIP entry not found: {name}")
+
+
+def test_parses_exact_dex_method_references() -> None:
+    dex = build_dex(
+        extra_strings=("emoji-😀",),
+        methods=(
+            (
+                "Ldalvik/system/DexClassLoader;",
+                "loadClass",
+                ("Ljava/lang/String;",),
+                "Ljava/lang/Class;",
+            ),
+        )
+    )
+
+    inventory = parse_dex_inventory(dex)
+
+    assert inventory.method_references[0].class_descriptor == (
+        "Ldalvik/system/DexClassLoader;"
+    )
+    assert inventory.method_references[0].method_name == "loadClass"
+    assert inventory.method_references[0].prototype == (
+        "(Ljava/lang/String;)Ljava/lang/Class;"
+    )
+    assert "emoji-😀" in inventory.strings
+
+
+@pytest.mark.parametrize("mutation", ["magic", "file_size", "string_table", "method_ref"])
+def test_rejects_malformed_dex_structures(mutation: str) -> None:
+    value = bytearray(
+        build_dex(
+            methods=(("Ljava/lang/Thread;", "stop", (), "V"),),
+        )
+    )
+    if mutation == "magic":
+        value[:8] = b"not-dex!"
+    elif mutation == "file_size":
+        struct.pack_into("<I", value, 0x20, len(value) + 1)
+    elif mutation == "string_table":
+        struct.pack_into("<I", value, 0x3C, len(value) - 1)
+    else:
+        method_offset = struct.unpack_from("<I", value, 0x5C)[0]
+        struct.pack_into("<H", value, method_offset, 65535)
+
+    with pytest.raises(DexFormatError):
+        parse_dex_inventory(bytes(value))
+
+
+def test_inventory_redacts_secrets_endpoints_and_matches_exact_apis(
+    tmp_path: Path,
+) -> None:
+    raw_secret = "REALPRODKEY_9x8y7z6w5v4u"
+    query_secret = "query-token-9x8y7z6w"
+    dex = build_dex(
+        extra_strings=(
+            f"api_key={raw_secret}",
+            (
+                "https://user:private-password@api.example.test/v1/items"
+                f"?access_token={query_secret}&safe=yes"
+            ),
+        ),
+        methods=(
+            (
+                "Ldalvik/system/DexClassLoader;",
+                "<init>",
+                (
+                    "Ljava/lang/String;",
+                    "Ljava/lang/String;",
+                    "Ljava/lang/String;",
+                    "Ljava/lang/ClassLoader;",
+                ),
+                "V",
+            ),
+            ("Landroid/webkit/WebSettings;", "setSavePassword", ("Z",), "V"),
+        ),
+    )
+    apk = tmp_path / "base.apk"
+    write_apk(
+        apk,
+        dex,
+        entries={
+            "assets/plugin.jar": b"nested archive is inventory only",
+            "assets/settings.json": f'{{"client_secret":"{raw_secret}"}}'.encode(),
+        },
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "apk/base"),))
+    serialized = json.dumps(result.to_dict())
+
+    assert result.status == "completed"
+    assert len(result.secret_candidates) == 3
+    assert {item.value_length for item in result.secret_candidates} == {
+        len(raw_secret),
+        len(query_secret),
+        len("private-password"),
+    }
+    assert "basic_auth_password" in {
+        item.kind for item in result.secret_candidates
+    }
+    assert raw_secret not in serialized
+    assert query_secret not in serialized
+    assert "private-password" not in serialized
+    assert result.endpoints[0].redacted_url == (
+        "https://api.example.test/<redacted>/<redacted>"
+        "?parameter_1=%3Credacted%3E&parameter_2=%3Credacted%3E"
+    )
+    assert [item.inventory_id for item in result.dynamic_loading_apis] == [
+        "DEX_CLASS_LOADER"
+    ]
+    assert [item.policy_id for item in result.api_policy_matches] == [
+        "ANDROID-WEBSETTINGS-SAVE-PASSWORD"
+    ]
+    assert result.embedded_code[0].archive_entry == "assets/plugin.jar"
+
+
+def test_placeholder_values_do_not_become_secret_candidates(tmp_path: Path) -> None:
+    dex = build_dex(
+        extra_strings=(
+            "api_key=example-key",
+            "client_secret=CHANGE_ME",
+            "password=password",
+            "access_token=THESIS_CANARY_123",
+        )
+    )
+    apk = tmp_path / "placeholder.apk"
+    write_apk(apk, dex)
+
+    result = analyze_apks((StaticApkInput(apk, "apk/placeholder"),))
+
+    assert result.secret_candidates == ()
+
+
+def test_private_key_header_is_high_confidence_without_storing_key_material(
+    tmp_path: Path,
+) -> None:
+    apk = tmp_path / "private-key.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={
+            "assets/signing.pem": (
+                b"-----BEGIN PRIVATE KEY-----\n"
+                b"opaque-private-key-material-must-not-be-serialized\n"
+                b"-----END PRIVATE KEY-----\n"
+            ),
+        },
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "apk/private-key"),))
+    payload = json.dumps(result.to_dict())
+
+    assert [(item.kind, item.confidence) for item in result.secret_candidates] == [
+        ("private_key_pem", "high")
+    ]
+    assert "BEGIN PRIVATE KEY" not in payload
+    assert "opaque-private-key-material" not in payload
+
+
+def test_secret_assignment_matching_uses_identifier_boundaries(tmp_path: Path) -> None:
+    apk = tmp_path / "assignment-boundaries.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(
+                "monkey=bananas-12345",
+                "keyboard_layout=qwerty-layout-987",
+                "hockey_score=visitors-12345",
+                "turnkey_mode=enabled-value-42",
+                "apiKey=production-value-98765",
+            )
+        ),
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "apk/assignment-boundaries"),))
+
+    assert len(result.secret_candidates) == 1
+    assert result.secret_candidates[0].key_name == "apiKey"
+
+
+def test_quoted_config_keys_are_detected_without_retaining_values(
+    tmp_path: Path,
+) -> None:
+    json_secret = "JsonDeploySecret9x8y7z6w"
+    single_quoted_secret = "SingleQuotedSecret8w7v6u5t"
+    apk = tmp_path / "quoted-config.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={
+            "assets/settings.json": (
+                f'{{"client_secret":"{json_secret}"}}\n'
+                f"{{'api_key': '{single_quoted_secret}'}}\n"
+                '{"monkey":"bananas-12345"}\n'
+                '{"client_secret":"CHANGE_ME"}\n'
+            ).encode(),
+        },
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "apk/quoted-config"),))
+    payload = json.dumps(result.to_dict())
+
+    assert {
+        (item.key_name, item.confidence, item.value_length)
+        for item in result.secret_candidates
+    } == {
+        ("client_secret", "medium", len(json_secret)),
+        ("api_key", "medium", len(single_quoted_secret)),
+    }
+    assert json_secret not in payload
+    assert single_quoted_secret not in payload
+    assert "bananas-12345" not in payload
+    assert "CHANGE_ME" not in payload
+
+
+def test_resource_strings_share_bounded_redacted_scanning(tmp_path: Path) -> None:
+    apk = tmp_path / "resources.apk"
+    write_apk(apk, build_dex())
+    raw_secret = "resource-value-8z7y6x5w4v3u"
+
+    result = analyze_apks(
+        (
+            StaticApkInput(
+                apk,
+                "apk/resources",
+                resource_strings=(
+                    f"client_secret={raw_secret}",
+                    "https://resource.example.test/config?api_key=hidden-resource-value",
+                ),
+            ),
+        )
+    )
+
+    payload = json.dumps(result.to_dict())
+    assert result.metrics["resource_strings_scanned"] == 2
+    assert result.secret_candidates[0].location == "resource_string:0"
+    assert raw_secret not in payload
+    assert "hidden-resource-value" not in payload
+
+
+def test_nested_archives_are_inventory_only_and_entries_are_never_extracted(
+    tmp_path: Path,
+) -> None:
+    nested = io.BytesIO()
+    nested_secret = "NESTED_SECRET_MUST_NOT_BE_SCANNED"
+    with ZipFile(nested, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("assets/config.txt", f"api_key={nested_secret}")
+    apk = tmp_path / "nested.apk"
+    with ZipFile(apk, "w") as archive:
+        archive.writestr("classes.dex", build_dex())
+        archive.writestr("assets/plugin.jar", nested.getvalue())
+        archive.writestr("../outside.txt", "api_key=path-traversal-secret")
+
+    result = analyze_apks((StaticApkInput(apk, "apk/nested"),))
+
+    assert result.secret_candidates == ()
+    assert [item.archive_entry for item in result.embedded_code] == [
+        "assets/plugin.jar"
+    ]
+    assert not (tmp_path.parent / "outside.txt").exists()
+    assert nested_secret not in json.dumps(result.to_dict())
+
+
+def test_crc_corrupt_scannable_text_entry_degrades_to_partial(tmp_path: Path) -> None:
+    apk = tmp_path / "crc-corrupt.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={"assets/config.txt": b"ordinary configuration"},
+    )
+    mutate_zip_entry(apk, "assets/config.txt", corrupt_data=True)
+
+    result = analyze_apks((StaticApkInput(apk, "apk/crc-corrupt"),))
+
+    assert result.status == "partial"
+    assert result.limitations == ("apk/crc-corrupt:text_entry_read_failed",)
+    assert result.metrics["text_entries_scanned"] == 0
+
+
+def test_encrypted_scannable_text_entry_degrades_to_partial(tmp_path: Path) -> None:
+    apk = tmp_path / "encrypted-entry.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={"res/raw/protected.txt": b"ordinary configuration"},
+    )
+    mutate_zip_entry(apk, "res/raw/protected.txt", set_flags=0x1)
+
+    result = analyze_apks((StaticApkInput(apk, "apk/encrypted-entry"),))
+
+    assert result.status == "partial"
+    assert result.limitations == ("apk/encrypted-entry:text_entry_encrypted",)
+    assert result.metrics["text_entries_scanned"] == 0
+
+
+def test_encrypted_root_dex_cannot_produce_a_completed_inventory(tmp_path: Path) -> None:
+    apk = tmp_path / "encrypted-dex.apk"
+    write_apk(apk, build_dex(extra_strings=("api_key=real-secret-value",)))
+    mutate_zip_entry(apk, "classes.dex", set_flags=0x1)
+
+    result = analyze_apks((StaticApkInput(apk, "apk/encrypted-dex"),))
+
+    assert result.status == "partial"
+    assert result.limitations == ("apk/encrypted-dex:dex_entry_encrypted",)
+    assert result.metrics["dex_files_scanned"] == 0
+    assert result.secret_candidates == ()
+
+
+@pytest.mark.parametrize(
+    ("entry_name", "content", "expected_problem"),
+    [
+        ("assets/../unsafe.txt", b"ordinary configuration", "text_entry_unsafe_name"),
+        ("assets/binary.txt", b"\x00" * 20, "text_entry_binary_content"),
+        ("res/raw/invalid.txt", b"invalid-utf8-\xff", "text_entry_decode_replacement"),
+    ],
+)
+def test_unscannable_planned_text_entries_record_structured_limitations(
+    tmp_path: Path,
+    entry_name: str,
+    content: bytes,
+    expected_problem: str,
+) -> None:
+    apk = tmp_path / f"{expected_problem}.apk"
+    write_apk(apk, build_dex(), entries={entry_name: content})
+
+    result = analyze_apks((StaticApkInput(apk, "apk/unscannable"),))
+
+    assert result.status == "partial"
+    assert result.limitations == (f"apk/unscannable:{expected_problem}",)
+
+
+def test_compression_and_total_byte_limits_are_structured(tmp_path: Path) -> None:
+    apk = tmp_path / "bounded.apk"
+    with ZipFile(apk, "w") as archive:
+        archive.writestr("classes.dex", build_dex(), compress_type=ZIP_STORED)
+        archive.writestr(
+            "assets/repeated.txt",
+            b"A" * 50_000,
+            compress_type=ZIP_DEFLATED,
+        )
+    policy = replace(StaticApkPolicy(), max_compression_ratio=2)
+
+    result = analyze_apks((StaticApkInput(apk, "apk/bounded"),), policy=policy)
+
+    assert result.status == "partial"
+    assert "limit:compression_ratio" in result.limitations
+    assert result.metrics["text_entries_scanned"] == 0
+
+
+def test_archive_entry_limit_is_enforced_before_zipfile_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apk = tmp_path / "too-many-entries.apk"
+    with ZipFile(apk, "w") as archive:
+        archive.writestr("classes.dex", build_dex())
+        archive.writestr("assets/one.txt", "one")
+        archive.writestr("assets/two.txt", "two")
+
+    def fail_zipfile(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("ZipFile must not parse an archive over the entry bound")
+
+    monkeypatch.setattr(static_analysis, "ZipFile", fail_zipfile)
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/entry-limit"),),
+        policy=replace(StaticApkPolicy(), max_archive_entries=2),
+    )
+
+    assert result.status == "partial"
+    assert result.metrics["archive_entries_seen"] == 3
+    assert result.metrics["apks_scanned"] == 0
+    assert result.limitations == ("limit:archive_entries",)
+
+
+def test_spoofed_eocd_count_cannot_bypass_central_directory_entry_limit(
+    tmp_path: Path,
+) -> None:
+    apk = tmp_path / "spoofed-count.apk"
+    with ZipFile(apk, "w") as archive:
+        archive.writestr("classes.dex", build_dex())
+        archive.writestr("assets/one.txt", "one")
+        archive.writestr("assets/two.txt", "two")
+    value = bytearray(apk.read_bytes())
+    eocd = value.rfind(b"PK\x05\x06")
+    struct.pack_into("<HH", value, eocd + 8, 1, 1)
+    apk.write_bytes(value)
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/spoofed-count"),),
+        policy=replace(StaticApkPolicy(), max_archive_entries=2),
+    )
+
+    assert result.status == "partial"
+    assert result.limitations == ("limit:archive_entries",)
+    assert result.metrics["apks_scanned"] == 0
+
+
+def test_zip64_and_oversized_central_directories_are_rejected_preflight(
+    tmp_path: Path,
+) -> None:
+    zip64 = tmp_path / "zip64-marker.apk"
+    write_apk(zip64, build_dex())
+    value = bytearray(zip64.read_bytes())
+    eocd = value.rfind(b"PK\x05\x06")
+    struct.pack_into("<HH", value, eocd + 8, 0xFFFF, 0xFFFF)
+    zip64.write_bytes(value)
+
+    zip64_result = analyze_apks((StaticApkInput(zip64, "apk/zip64"),))
+
+    assert zip64_result.status == "partial"
+    assert zip64_result.limitations == ("apk/zip64:zip64_unsupported",)
+    assert zip64_result.metrics["apks_scanned"] == 0
+
+    oversized = tmp_path / "central-limit.apk"
+    write_apk(oversized, build_dex())
+    central_result = analyze_apks(
+        (StaticApkInput(oversized, "apk/central-limit"),),
+        policy=replace(StaticApkPolicy(), max_central_directory_bytes=1),
+    )
+
+    assert central_result.status == "partial"
+    assert central_result.limitations == ("limit:central_directory_bytes",)
+    assert central_result.metrics["apks_scanned"] == 0
+
+
+def test_total_decompression_budget_stops_later_entries(tmp_path: Path) -> None:
+    apk = tmp_path / "total-budget.apk"
+    with ZipFile(apk, "w", compression=ZIP_STORED) as archive:
+        archive.writestr("classes.dex", build_dex())
+        archive.writestr("assets/config.txt", b"B" * 1024)
+    policy = replace(
+        StaticApkPolicy(),
+        max_dex_bytes=1024,
+        max_total_uncompressed_bytes=1024,
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "apk/total-budget"),), policy=policy)
+
+    assert "limit:total_uncompressed_bytes" in result.limitations
+    assert result.metrics["dex_files_scanned"] == 1
+    assert result.metrics["text_entries_scanned"] == 0
+
+
+def test_apk_file_size_is_checked_before_zip_parsing(tmp_path: Path) -> None:
+    apk = tmp_path / "oversized.apk"
+    write_apk(apk, build_dex())
+    policy = replace(StaticApkPolicy(), max_apk_file_bytes=32)
+
+    result = analyze_apks((StaticApkInput(apk, "apk/oversized"),), policy=policy)
+
+    assert result.metrics["archive_entries_seen"] == 0
+    assert result.limitations == ("limit:apk_file_bytes",)
+
+
+def test_malformed_dex_degrades_to_partial_without_scanning_strings(tmp_path: Path) -> None:
+    apk = tmp_path / "malformed.apk"
+    write_apk(apk, b"dex\n035\x00" + b"\x00" * 16)
+
+    result = analyze_apks((StaticApkInput(apk, "apk/malformed"),))
+
+    assert result.status == "partial"
+    assert result.secret_candidates == ()
+    assert result.dynamic_loading_apis == ()
+    assert result.limitations == ("apk/malformed:malformed_dex",)
+
+
+def test_dex_duplicate_string_offsets_are_decoded_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = bytearray(build_dex(extra_strings=("alpha-value", "bravo-value")))
+    string_ids_offset = struct.unpack_from("<I", value, 0x3C)[0]
+    first_offset = struct.unpack_from("<I", value, string_ids_offset)[0]
+    struct.pack_into("<I", value, string_ids_offset + 4, first_offset)
+    calls = 0
+    original = static_analysis._read_dex_string
+
+    def count_decode(*args: object, **kwargs: object) -> tuple[str | None, bool, int]:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(static_analysis, "_read_dex_string", count_decode)
+
+    inventory = parse_dex_inventory(bytes(value))
+
+    assert calls == 1
+    assert inventory.strings == ("alpha-value", "alpha-value")
+
+
+def test_shared_dex_parameter_lists_count_once_against_work_budget() -> None:
+    dex = build_dex(
+        methods=(
+            ("Lcom/example/One;", "first", ("I",), "V"),
+            ("Lcom/example/Two;", "second", ("I",), "I"),
+        )
+    )
+    policy = replace(StaticApkPolicy(), max_dex_parameter_references=1)
+
+    inventory = parse_dex_inventory(dex, policy=policy)
+
+    assert {item.prototype for item in inventory.method_references} == {"(I)V", "(I)I"}
+
+
+@pytest.mark.parametrize(
+    ("policy", "match"),
+    [
+        (replace(StaticApkPolicy(), max_dex_string_work_bytes=1), "string decode work"),
+        (
+            replace(StaticApkPolicy(), max_dex_parameter_references=1),
+            "parameter decode work",
+        ),
+        (replace(StaticApkPolicy(), max_dex_prototype_bytes=1), "prototype decode work"),
+    ],
+)
+def test_dex_aggregate_decode_work_is_bounded(
+    policy: StaticApkPolicy,
+    match: str,
+) -> None:
+    dex = build_dex(
+        extra_strings=("bounded-string",),
+        methods=(("Lcom/example/Work;", "work", ("I", "I"), "V"),),
+    )
+
+    with pytest.raises(DexFormatError, match=match):
+        parse_dex_inventory(dex, policy=policy)
+
+
+def test_api_policy_is_exact_and_caller_driven(tmp_path: Path) -> None:
+    apk = tmp_path / "policy.apk"
+    write_apk(
+        apk,
+        build_dex(
+            methods=(("Lcom/example/Legacy;", "open", ("I",), "V"),),
+        ),
+    )
+    policy = (
+        ApiPolicyEntry(
+            "LAB-WRONG-PROTO",
+            "Lcom/example/Legacy;",
+            "open",
+            "deprecated",
+            "Fixture policy with a nonmatching prototype.",
+            prototype="()V",
+        ),
+        ApiPolicyEntry(
+            "LAB-EXACT-PROTO",
+            "Lcom/example/Legacy;",
+            "open",
+            "banned",
+            "Fixture policy with an exact prototype.",
+            prototype="(I)V",
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/policy"),),
+        api_policy=policy,
+    )
+
+    assert [item.policy_id for item in result.api_policy_matches] == [
+        "LAB-EXACT-PROTO"
+    ]
+    assert result.api_policy_matches[0].disposition == "banned"
+
+
+def test_limits_and_order_are_deterministic(tmp_path: Path) -> None:
+    first = tmp_path / "first.apk"
+    second = tmp_path / "second.apk"
+    write_apk(first, build_dex(extra_strings=("https://one.example.test/",)))
+    write_apk(second, build_dex(extra_strings=("https://two.example.test/",)))
+    policy = replace(StaticApkPolicy(), max_apks=1, max_endpoints=1)
+    inputs = (
+        StaticApkInput(second, "z/source"),
+        StaticApkInput(first, "a/source"),
+    )
+
+    first_run = analyze_apks(inputs, policy=policy).to_dict()
+    second_run = analyze_apks(inputs, policy=policy).to_dict()
+
+    assert first_run == second_run
+    assert first_run["sources"] == ["a/source"]
+    assert first_run["endpoints"][0]["host"] == "one.example.test"
+    assert "limit:apks" in first_run["limitations"]
+
+
+def test_endpoint_metadata_never_retains_raw_path_query_or_known_secret(
+    tmp_path: Path,
+) -> None:
+    aws_key = "AKIA1234567890ABCDEF"
+    google_key = "AIza12345678901234567890123456789012345"
+    endpoint = (
+        f"https://api.example.test/private/{aws_key}"
+        f"?opaque={google_key}&ordinary=visible-value"
+    )
+    apk = tmp_path / "endpoint-redaction.apk"
+    write_apk(apk, build_dex(extra_strings=(endpoint,)))
+
+    result = analyze_apks((StaticApkInput(apk, "apk/endpoint-redaction"),))
+    payload = json.dumps(result.to_dict())
+
+    assert aws_key not in payload
+    assert google_key not in payload
+    assert "private" not in result.endpoints[0].redacted_url
+    assert "opaque" not in result.endpoints[0].redacted_url
+    assert "ordinary" not in result.endpoints[0].redacted_url
+    assert "visible-value" not in result.endpoints[0].redacted_url
+    assert result.endpoints[0].redacted_url == (
+        "https://api.example.test/<redacted>/<redacted>"
+        "?parameter_1=%3Credacted%3E&parameter_2=%3Credacted%3E"
+    )
+
+
+def test_hostile_source_and_archive_names_cannot_leak_known_secrets(
+    tmp_path: Path,
+) -> None:
+    aws_key = "AKIA1234567890ABCDEF"
+    apk = tmp_path / "hostile-metadata.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={
+            f"assets/{aws_key}.txt": b"https://metadata.example.test/value",
+            f"assets/{aws_key}.jar": b"inventory only",
+        },
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, f"apk/{aws_key}"),)
+    )
+    payload = json.dumps(result.to_dict())
+
+    assert aws_key not in payload
+    assert result.sources[0].startswith("<redacted>:")
+    assert result.endpoints[0].location == "assets/<redacted>.txt:line:1"
+    assert result.embedded_code[0].archive_entry == "assets/<redacted>.jar"
+
+
+def test_detected_arbitrary_secret_is_removed_from_all_candidate_metadata(
+    tmp_path: Path,
+) -> None:
+    secret = "OpaqueDeploySecret9x8y7z6w"
+    apk = tmp_path / "arbitrary-secret-location.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={f"assets/{secret}.txt": f"client_secret={secret}".encode()},
+    )
+
+    result = analyze_apks((StaticApkInput(apk, f"apk/{secret}"),))
+    payload = json.dumps(result.to_dict())
+
+    assert result.secret_candidates
+    assert secret not in payload
+    assert result.secret_candidates[0].source_id.startswith("<redacted>:")
+    assert result.secret_candidates[0].location == "assets/<redacted>.txt:line:1"
+
+
+def test_detected_secret_is_redacted_across_all_static_inventory_categories(
+    tmp_path: Path,
+) -> None:
+    secret = "CrossCategorySecret9x8y7z6w"
+    apk = tmp_path / "cross-category-secret.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(f"client_secret={secret}",),
+            methods=(
+                (
+                    "Ldalvik/system/DexClassLoader;",
+                    "loadClass",
+                    ("Ljava/lang/String;",),
+                    "Ljava/lang/Class;",
+                ),
+                ("Landroid/webkit/WebSettings;", "setSavePassword", ("Z",), "V"),
+            ),
+        ),
+        entries={
+            f"assets/{secret}.txt": b"https://metadata.example.test/value",
+            f"assets/{secret}.jar": b"inventory only",
+        },
+    )
+
+    result = analyze_apks((StaticApkInput(apk, f"apk/{secret}"),))
+    payload = json.dumps(result.to_dict())
+
+    assert result.secret_candidates
+    assert result.endpoints
+    assert result.dynamic_loading_apis
+    assert result.api_policy_matches
+    assert result.embedded_code
+    assert secret not in payload
+    assert result.sources[0].startswith("<redacted>:")
+    assert result.endpoints[0].source_id.startswith("<redacted>:")
+    assert result.endpoints[0].location == "assets/<redacted>.txt:line:1"
+    assert result.dynamic_loading_apis[0].source_id.startswith("<redacted>:")
+    assert result.api_policy_matches[0].source_id.startswith("<redacted>:")
+    assert result.embedded_code[0].source_id.startswith("<redacted>:")
+    assert result.embedded_code[0].archive_entry == "assets/<redacted>.jar"
+
+
+def test_public_google_identifier_requires_sensitive_context_for_finding_candidate(
+    tmp_path: Path,
+) -> None:
+    identifier = "AIza12345678901234567890123456789012345"
+    public_apk = tmp_path / "public-google-config.apk"
+    contextual_apk = tmp_path / "contextual-google-config.apk"
+    write_apk(public_apk, build_dex(extra_strings=(identifier,)))
+    write_apk(
+        contextual_apk,
+        build_dex(extra_strings=(f"client_secret={identifier}",)),
+    )
+
+    public = analyze_apks((StaticApkInput(public_apk, "apk/public"),))
+    contextual = analyze_apks((StaticApkInput(contextual_apk, "apk/contextual"),))
+
+    assert [(item.kind, item.confidence) for item in public.secret_candidates] == [
+        ("google_api_key", "low")
+    ]
+    assert any(
+        item.kind == "named_assignment" and item.confidence == "medium"
+        for item in contextual.secret_candidates
+    )
+
+
+def test_overlong_text_and_resource_strings_create_structured_limitation(
+    tmp_path: Path,
+) -> None:
+    apk = tmp_path / "truncated-input.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={"assets/minified.js": b"A" * 256},
+    )
+    policy = replace(StaticApkPolicy(), max_string_bytes=32)
+
+    result = analyze_apks(
+        (
+            StaticApkInput(
+                apk,
+                "apk/truncated-input",
+                resource_strings=("B" * 256,),
+            ),
+        ),
+        policy=policy,
+    )
+
+    assert result.status == "partial"
+    assert "limit:string_scan_bytes" in result.limitations
+
+
+def test_resource_string_limit_never_false_passes_secret_after_sentinel(
+    tmp_path: Path,
+) -> None:
+    apk = tmp_path / "resource-limit.apk"
+    write_apk(apk, build_dex())
+    policy = replace(StaticApkPolicy(), max_resource_strings=2)
+
+    result = analyze_apks(
+        (
+            StaticApkInput(
+                apk,
+                "apk/resource-limit",
+                resource_strings=(
+                    "first-benign-value",
+                    "second-benign-value",
+                    "client_secret=secret-after-analysis-bound",
+                ),
+            ),
+        ),
+        policy=policy,
+    )
+
+    assert result.status == "partial"
+    assert result.secret_candidates == ()
+    assert "limit:resource_strings" in result.limitations
+
+
+def test_duplicate_policy_identifiers_are_rejected(tmp_path: Path) -> None:
+    apk = tmp_path / "duplicate-policy.apk"
+    write_apk(apk, build_dex())
+    entry = ApiPolicyEntry(
+        "LAB-DUPLICATE",
+        "Lcom/example/Legacy;",
+        "open",
+        "banned",
+        "Fixture duplicate policy.",
+    )
+
+    with pytest.raises(ValueError, match="unique"):
+        analyze_apks(
+            (StaticApkInput(apk, "apk/policy"),),
+            api_policy=(entry, entry),
+        )
+
+
+def test_policy_bounds_validate_consistently() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        StaticApkPolicy(max_apks=0)
+    with pytest.raises(ValueError, match="text-entry"):
+        StaticApkPolicy(max_text_entry_bytes=64, max_string_bytes=128)

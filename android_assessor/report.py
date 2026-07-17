@@ -143,15 +143,20 @@ def _is_runtime_check(finding: dict[str, Any]) -> bool:
     ).startswith("ASL-RUNTIME-")
 
 
-def _is_aggregate_alias(finding: dict[str, Any], rule_ids: set[str]) -> bool:
-    return str(finding.get("rule_id", "")) == "ASL-MVP-004" and bool(
-        rule_ids
-        & {
-            "ASL-MANIFEST-EXPORTED-ACTIVITY",
-            "ASL-MANIFEST-EXPORTED-RECEIVER",
-            "ASL-MANIFEST-EXPORTED-PROVIDER",
-        }
-    )
+def _is_aggregate_alias(
+    finding: dict[str, Any],
+    rule_statuses: dict[str, str],
+) -> bool:
+    if str(finding.get("rule_id", "")) != "ASL-MVP-004":
+        return False
+    family = {
+        "ASL-MANIFEST-EXPORTED-ACTIVITY",
+        "ASL-MANIFEST-EXPORTED-SERVICE",
+        "ASL-MANIFEST-EXPORTED-RECEIVER",
+        "ASL-MANIFEST-EXPORTED-PROVIDER",
+    }
+    conclusive = {"pass", "potential", "confirmed"}
+    return all(rule_statuses.get(rule_id) in conclusive for rule_id in family)
 
 
 def _observation_status(finding: dict[str, Any]) -> str:
@@ -491,8 +496,12 @@ class ReportService:
             provenance=provenance,
             evidence_source=report_evidence_source,
         )
-        rule_ids = {str(item.get("rule_id")) for item in findings}
-        suppressed_findings = [item for item in findings if _is_aggregate_alias(item, rule_ids)]
+        rule_statuses = {
+            str(item.get("rule_id")): str(item.get("status")) for item in findings
+        }
+        suppressed_findings = [
+            item for item in findings if _is_aggregate_alias(item, rule_statuses)
+        ]
         security_rules = [
             item
             for item in findings

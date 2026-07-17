@@ -119,3 +119,35 @@ def test_validation_canary_attribution_can_confirm_cleartext(tmp_path: Path) -> 
     findings = {item.rule_id: item for item in RuleEngine(paths, repository).evaluate(session_id)}
 
     assert findings["ASL-MVP-002"].status is FindingStatus.CONFIRMED
+    assert findings["ASL-MVP-003"].status is FindingStatus.CONFIRMED
+    assert findings["ASL-MVP-003"].details["exact_canary_flow_count"] == 1
+
+
+def test_sensitive_name_without_exact_canary_is_only_potential(tmp_path: Path) -> None:
+    paths, repository, session_id = prepared_rule_session(tmp_path)
+    write_traffic(
+        paths,
+        repository,
+        session_id,
+        [
+            {
+                "event": "request",
+                "flow_id": "target-token-shape",
+                "scheme": "https",
+                "cleartext": False,
+                "sensitive_query_keys": ["access_token"],
+                "attribution": "target",
+            }
+        ],
+    )
+
+    finding = next(
+        item
+        for item in RuleEngine(paths, repository).evaluate(session_id)
+        if item.rule_id == "ASL-MVP-003"
+    )
+
+    assert finding.status is FindingStatus.POTENTIAL
+    assert finding.status is not FindingStatus.CONFIRMED
+    assert finding.details["exact_canary_flow_count"] == 0
+    assert "exact session canary" in finding.details["missing_evidence"][0]

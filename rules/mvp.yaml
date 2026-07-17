@@ -102,6 +102,19 @@ rules:
     cwe_mapping: mapping_pending
     remediation: Restrict exported activities or enforce an appropriate permission.
 
+  - id: ASL-MANIFEST-EXPORTED-SERVICE
+    evaluator: manifest_policy
+    title: Exported service protection boundary
+    category: platform
+    description: Evaluates exported services and their effective permission boundary.
+    severity: medium
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Restrict exported services or enforce an appropriate signature-level permission.
+
   - id: ASL-MANIFEST-EXPORTED-RECEIVER
     evaluator: manifest_policy
     title: Exported receiver protection boundary
@@ -127,6 +140,58 @@ rules:
     mastg_mapping: mapping_pending
     cwe_mapping: mapping_pending
     remediation: Restrict exported providers and review read/write permissions.
+
+  - id: ASL-MANIFEST-CUSTOM-PERMISSION
+    evaluator: manifest_policy
+    title: Weak custom permission protection level
+    category: platform
+    description: Evaluates custom permission definitions and their effective base protection level.
+    severity: medium
+    confidence: high
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Protect security-sensitive IPC with a uniquely named signature-level permission.
+
+  - id: ASL-MANIFEST-FILEPROVIDER-PATHS
+    evaluator: manifest_policy
+    title: Broad FileProvider path exposure
+    category: data-storage
+    description: Evaluates resolved FileProvider path mappings and URI grant configuration.
+    severity: high
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Expose only narrowly scoped application-owned directories through FileProvider.
+
+  - id: ASL-MANIFEST-DEEP-LINK-EXPOSURE
+    evaluator: manifest_policy
+    title: Broad or weakly protected deep-link entry point
+    category: platform
+    description: Evaluates exported browsable intent filters, URI restrictions, and permission boundaries.
+    severity: medium
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Constrain schemes, hosts, and paths; verify app links and validate every incoming URI.
+
+  - id: ASL-STATIC-HARDCODED-SECRET
+    evaluator: static_secret_candidate
+    title: Hardcoded secret candidate in packaged application content
+    category: secrets
+    description: Evaluates bounded APK, DEX, resource, and asset strings for contextual secret candidates.
+    severity: high
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Remove deployable secrets from application packages and rotate any exposed credential.
 
   - id: CRYPTO-ECB
     evaluator: crypto_runtime

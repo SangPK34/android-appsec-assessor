@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +13,7 @@ from android_assessor.apk import (
     parse_package_metadata,
     parse_pm_paths,
 )
-from android_assessor.errors import ApkInspectionError
+from android_assessor.errors import AdbError, ApkInspectionError
 from android_assessor.paths import ProjectPaths
 
 PM_PATHS = """package:/data/app/~~abc/com.example.app-xyz==/base.apk
@@ -86,8 +87,46 @@ def test_badging_merge_rejects_package_mismatch() -> None:
 
 
 class FakePullAdb:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        remote_sizes: dict[str, int] | None = None,
+        pulled_sizes: dict[str, int] | None = None,
+        stat_outputs: dict[str, str] | None = None,
+        stat_error: AdbError | None = None,
+        pull_error: AdbError | None = None,
+    ) -> None:
         self.calls: list[tuple[str, str, Path]] = []
+        self.stat_calls: list[tuple[str, tuple[str, ...], float, bool, str]] = []
+        self.pull_timeouts: list[float] = []
+        self.remote_sizes = remote_sizes or {}
+        self.pulled_sizes = pulled_sizes or {}
+        self.stat_outputs = stat_outputs or {}
+        self.stat_error = stat_error
+        self.pull_error = pull_error
+
+    @staticmethod
+    def _default_size(remote_path: str) -> int:
+        return len(("APK:" + remote_path).encode())
+
+    def shell(
+        self,
+        serial: str,
+        arguments: tuple[str, ...],
+        *,
+        timeout: float,
+        check: bool,
+        operation: str,
+    ) -> object:
+        self.stat_calls.append((serial, arguments, timeout, check, operation))
+        if self.stat_error is not None:
+            raise self.stat_error
+        remote_path = arguments[-1]
+        output = self.stat_outputs.get(
+            remote_path,
+            str(self.remote_sizes.get(remote_path, self._default_size(remote_path))),
+        )
+        return SimpleNamespace(stdout=output)
 
     def pull_file(
         self,
@@ -97,9 +136,15 @@ class FakePullAdb:
         *,
         timeout: float = 180,
     ) -> object:
-        del timeout
+        self.pull_timeouts.append(timeout)
         self.calls.append((serial, remote_path, destination))
-        destination.write_bytes(("APK:" + remote_path).encode())
+        if self.pull_error is not None:
+            raise self.pull_error
+        size = self.pulled_sizes.get(
+            remote_path,
+            self.remote_sizes.get(remote_path, self._default_size(remote_path)),
+        )
+        destination.write_bytes(b"A" * size)
         return object()
 
 
@@ -125,3 +170,212 @@ def test_apk_puller_handles_split_files_spaces_and_atomic_parts(tmp_path: Path) 
     assert all(len(artifact.sha256) == 64 for artifact in artifacts)
     assert not list(destination.glob("*.part"))
     assert all(call[0] == "ABC123" for call in adb.calls)
+    assert [call[1] for call in adb.stat_calls] == [
+        ("stat", "-c", "%s", "--", "/data/app/~~abc/com.example.app-xyz==/base.apk"),
+        (
+            "stat",
+            "-c",
+            "%s",
+            "--",
+            "/data/app/~~abc/com.example.app-xyz==/split_config.arm64_v8a.apk",
+        ),
+    ]
+
+
+def _puller_paths(tmp_path: Path) -> tuple[ProjectPaths, Path, Path]:
+    paths = ProjectPaths(tmp_path / "project")
+    paths.ensure_layout()
+    session_root = paths.results_dir / "20260717-120102-a8f4c2"
+    session_root.mkdir(parents=True)
+    return paths, session_root, session_root / "apk"
+
+
+def test_apk_puller_rejects_file_count_before_stat_or_pull(tmp_path: Path) -> None:
+    paths, session_root, destination = _puller_paths(tmp_path)
+    adb = FakePullAdb()
+
+    with pytest.raises(ApkInspectionError, match=r"\[file_count_limit]"):
+        ApkPuller(paths, adb).pull(  # type: ignore[arg-type]
+            "ABC123",
+            parse_pm_paths(PM_PATHS),
+            session_root=session_root,
+            destination_dir=destination,
+            max_files=1,
+        )
+
+    assert adb.stat_calls == []
+    assert adb.calls == []
+
+
+@pytest.mark.parametrize(
+    ("stat_output", "error_code"),
+    [
+        ("", "invalid_remote_size"),
+        ("0", "invalid_remote_size"),
+        ("-1", "invalid_remote_size"),
+        ("12 bytes", "invalid_remote_size"),
+        ("12\n13", "invalid_remote_size"),
+        ("9" * 21, "invalid_remote_size"),
+    ],
+)
+def test_apk_puller_rejects_invalid_remote_size_without_pull(
+    tmp_path: Path,
+    stat_output: str,
+    error_code: str,
+) -> None:
+    paths, session_root, destination = _puller_paths(tmp_path)
+    remote = "/data/app/example/base.apk"
+    adb = FakePullAdb(stat_outputs={remote: stat_output})
+
+    with pytest.raises(ApkInspectionError, match=rf"\[{error_code}]"):
+        ApkPuller(paths, adb).pull(  # type: ignore[arg-type]
+            "ABC123",
+            (remote,),
+            session_root=session_root,
+            destination_dir=destination,
+        )
+
+    assert adb.calls == []
+
+
+def test_apk_puller_wraps_stat_failure_without_pull(tmp_path: Path) -> None:
+    paths, session_root, destination = _puller_paths(tmp_path)
+    adb = FakePullAdb(stat_error=AdbError("ADB timed out while reading remote APK size."))
+
+    with pytest.raises(ApkInspectionError, match=r"\[remote_stat_failed]"):
+        ApkPuller(paths, adb).pull(  # type: ignore[arg-type]
+            "ABC123",
+            ("/data/app/example/base.apk",),
+            session_root=session_root,
+            destination_dir=destination,
+            stat_timeout=3,
+        )
+
+    assert adb.stat_calls[0][2] == 3
+    assert adb.calls == []
+
+
+def test_apk_puller_preflights_all_files_before_per_file_limit_failure(
+    tmp_path: Path,
+) -> None:
+    paths, session_root, destination = _puller_paths(tmp_path)
+    first = "/data/app/example/base.apk"
+    second = "/data/app/example/split_config.en.apk"
+    adb = FakePullAdb(remote_sizes={first: 10, second: 101})
+
+    with pytest.raises(ApkInspectionError, match=r"\[file_size_limit]"):
+        ApkPuller(paths, adb).pull(  # type: ignore[arg-type]
+            "ABC123",
+            (first, second),
+            session_root=session_root,
+            destination_dir=destination,
+            max_file_bytes=100,
+        )
+
+    assert len(adb.stat_calls) == 2
+    assert adb.calls == []
+
+
+def test_apk_puller_rejects_aggregate_size_before_pull(tmp_path: Path) -> None:
+    paths, session_root, destination = _puller_paths(tmp_path)
+    first = "/data/app/example/base.apk"
+    second = "/data/app/example/split_config.en.apk"
+    adb = FakePullAdb(remote_sizes={first: 60, second: 50})
+
+    with pytest.raises(ApkInspectionError, match=r"\[total_size_limit]"):
+        ApkPuller(paths, adb).pull(  # type: ignore[arg-type]
+            "ABC123",
+            (first, second),
+            session_root=session_root,
+            destination_dir=destination,
+            max_file_bytes=100,
+            max_total_bytes=100,
+        )
+
+    assert len(adb.stat_calls) == 2
+    assert adb.calls == []
+
+
+def test_apk_puller_rejects_unsafe_path_before_adb_dispatch(tmp_path: Path) -> None:
+    paths, session_root, destination = _puller_paths(tmp_path)
+    adb = FakePullAdb()
+
+    with pytest.raises(ApkInspectionError, match=r"\[invalid_remote_path]"):
+        ApkPuller(paths, adb).pull(  # type: ignore[arg-type]
+            "ABC123",
+            ("/data/app/base.apk;whoami",),
+            session_root=session_root,
+            destination_dir=destination,
+        )
+
+    assert adb.stat_calls == []
+    assert adb.calls == []
+
+
+def test_apk_puller_verifies_pulled_size_and_removes_partial(tmp_path: Path) -> None:
+    paths, session_root, destination = _puller_paths(tmp_path)
+    remote = "/data/app/example/base.apk"
+    adb = FakePullAdb(remote_sizes={remote: 20}, pulled_sizes={remote: 19})
+
+    with pytest.raises(ApkInspectionError, match=r"\[pull_size_mismatch]"):
+        ApkPuller(paths, adb).pull(  # type: ignore[arg-type]
+            "ABC123",
+            (remote,),
+            session_root=session_root,
+            destination_dir=destination,
+            pull_timeout=7,
+        )
+
+    assert adb.pull_timeouts == [7]
+    assert not list(destination.glob("*.part"))
+    assert not (destination / "000-base.apk").exists()
+
+
+def test_apk_puller_wraps_adb_pull_failure(tmp_path: Path) -> None:
+    paths, session_root, destination = _puller_paths(tmp_path)
+    adb = FakePullAdb(pull_error=AdbError("device went offline"))
+
+    with pytest.raises(ApkInspectionError, match=r"\[pull_failed]"):
+        ApkPuller(paths, adb).pull(  # type: ignore[arg-type]
+            "ABC123",
+            ("/data/app/example/base.apk",),
+            session_root=session_root,
+            destination_dir=destination,
+        )
+
+    assert len(adb.stat_calls) == 1
+    assert len(adb.calls) == 1
+    assert not list(destination.glob("*.part"))
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("max_files", 0),
+        ("max_file_bytes", -1),
+        ("max_total_bytes", True),
+        ("stat_timeout", 0),
+        ("stat_timeout", float("nan")),
+        ("pull_timeout", -1),
+    ],
+)
+def test_apk_puller_rejects_invalid_limits_before_adb(
+    tmp_path: Path,
+    option: str,
+    value: object,
+) -> None:
+    paths, session_root, destination = _puller_paths(tmp_path)
+    adb = FakePullAdb()
+    options = {option: value}
+
+    with pytest.raises(ApkInspectionError, match=r"\[invalid_limit]"):
+        ApkPuller(paths, adb).pull(  # type: ignore[arg-type]
+            "ABC123",
+            ("/data/app/example/base.apk",),
+            session_root=session_root,
+            destination_dir=destination,
+            **options,  # type: ignore[arg-type]
+        )
+
+    assert adb.stat_calls == []
+    assert adb.calls == []
