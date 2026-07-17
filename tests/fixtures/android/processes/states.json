@@ -2,7 +2,7 @@
   "source": "fixture",
   "environment": "simulated",
   "scenarios": {
-    "owned": {"pid": 4242, "executable_path": "/data/local/tmp/android-assessor/session/frida-server", "start_time": "100", "session_id": "fixture-session", "ownership": "framework"},
+    "owned": {"pid": 4242, "executable_path": "/data/local/tmp/android-security-lab/session/frida-server", "start_time": "100", "session_id": "fixture-session", "ownership": "framework"},
     "pid_reuse": {"pid": 4242, "executable_path": "/system/bin/sleep", "start_time": "200", "session_id": null, "ownership": "external"},
     "similar_name": {"pid": 5151, "executable_path": "/data/local/tmp/frida-server-helper", "start_time": "101", "session_id": null, "ownership": "external"}
   }

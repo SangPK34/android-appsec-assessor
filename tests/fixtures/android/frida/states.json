@@ -6,6 +6,6 @@
     "absent": {"server_version": null, "process": null},
     "version_mismatch": {"server_version": "16.0.0", "process": {"pid": 3131, "ownership": "external"}},
     "preexisting": {"server_version": "17.0.0", "process": {"pid": 3131, "executable_path": "/data/local/tmp/preexisting/frida-server", "start_time": "90", "ownership": "external"}},
-    "framework_owned": {"server_version": "17.0.0", "process": {"pid": 4242, "executable_path": "/data/local/tmp/android-assessor/session/frida-server", "start_time": "100", "ownership": "framework", "session_id": "fixture-session"}}
+    "framework_owned": {"server_version": "17.0.0", "process": {"pid": 4242, "executable_path": "/data/local/tmp/android-security-lab/session/frida-server", "start_time": "100", "ownership": "framework", "session_id": "fixture-session"}}
   }
 }

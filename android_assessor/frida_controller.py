@@ -16,7 +16,7 @@ from .cleanup import CleanupExecutor, capture_remote_process_identity
 from .device_lock import DeviceLock
 from .environment import find_tool_spec, resolve_binary
 from .errors import AndroidAssessorError, FridaError
-from .evidence import EvidenceRepository
+from .evidence import EvidenceRepository, sha256_file
 from .frida_events import (
     OBSERVER_VERSION,
     FridaHandshakeStatus,
@@ -67,6 +67,7 @@ class FridaProbe:
     server_version: str | None
     compatible: bool | None
     server_binary: str | None
+    server_binary_sha256: str | None = None
     guidance: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -96,6 +97,7 @@ class FridaObservationState:
     observer_version: str = OBSERVER_VERSION
     handshake_status: str = "UNVERIFIED"
     runtime_event_count: int = 0
+    server_binary_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -258,15 +260,43 @@ class FridaController:
             return None
         return self._version(result.stdout or result.stderr)
 
-    def _server_binary(self, version: str, architecture: str) -> Path | None:
-        directory = self.paths.tools_dir / "frida"
-        candidates = (
-            directory / f"frida-server-{version}-android-{architecture}",
-            directory / f"frida-server-android-{architecture}",
-            directory / f"frida-server-{architecture}",
-            directory / "frida-server",
-        )
-        return next((path.resolve() for path in candidates if path.is_file()), None)
+    def _server_binary(
+        self,
+        version: str,
+        architecture: str,
+    ) -> tuple[Path | None, str | None]:
+        lock_path = self.paths.config_dir / "tools.lock.json"
+        try:
+            manifest = read_json_object(lock_path, root=self.paths.root)
+            tools = manifest.get("tools")
+            frida = tools.get("frida_servers") if isinstance(tools, dict) else None
+            assets = frida.get("assets") if isinstance(frida, dict) else None
+            asset = assets.get(architecture) if isinstance(assets, dict) else None
+            if (
+                not isinstance(frida, dict)
+                or str(frida.get("version")) != version
+                or not isinstance(asset, dict)
+            ):
+                return None, None
+            expected_hash = str(asset.get("output_sha256", "")).casefold()
+            minimum_bytes = int(asset.get("output_minimum_bytes", 0))
+        except (AndroidAssessorError, OSError, TypeError, ValueError):
+            return None, None
+        if not re.fullmatch(r"[a-f0-9]{64}", expected_hash) or minimum_bytes <= 0:
+            return None, None
+        candidate = (
+            self.paths.tools_dir
+            / "frida"
+            / f"frida-server-{version}-android-{architecture}"
+        ).resolve()
+        try:
+            self.paths.require_inside_root(candidate)
+            if candidate.stat().st_size < minimum_bytes:
+                return None, None
+            actual_hash = sha256_file(candidate)
+        except (AndroidAssessorError, OSError):
+            return None, None
+        return (candidate, actual_hash) if actual_hash == expected_hash else (None, None)
 
     def _connectivity_check(self, client: Path, serial: str) -> bool:
         frida_ps = client.with_name("frida-ps.exe")
@@ -295,7 +325,7 @@ class FridaController:
                 if server_version is not None
                 else self._connectivity_check(client, serial)
             )
-        binary = self._server_binary(client_version, architecture)
+        binary, binary_sha256 = self._server_binary(client_version, architecture)
         guidance = None
         if pid is None and binary is None:
             guidance = "Matching Frida Server asset is missing. Run repair.cmd."
@@ -315,6 +345,7 @@ class FridaController:
             server_version=server_version,
             compatible=compatible,
             server_binary=str(binary) if binary else None,
+            server_binary_sha256=binary_sha256,
             guidance=guidance,
         )
 
@@ -365,7 +396,11 @@ class FridaController:
         cleanup_ids: dict[str, str],
         command_log: Path,
     ) -> tuple[int, str, str]:
-        if probe.client_version is None or probe.server_binary is None:
+        if (
+            probe.client_version is None
+            or probe.server_binary is None
+            or probe.server_binary_sha256 is None
+        ):
             raise FridaError(probe.guidance or "A matching Frida Server is unavailable.")
         adb = self.context.adb_client(command_log=command_log)
         if not probe_root(adb, serial).available:
@@ -385,7 +420,10 @@ class FridaController:
             {"path": remote},
         )
         cleanup_ids["server_file"] = action.action_id
-        adb.push_managed_file(serial, Path(probe.server_binary), remote)
+        local_server = Path(probe.server_binary)
+        if sha256_file(local_server) != probe.server_binary_sha256:
+            raise FridaError("Frida Server changed after its pinned hash was verified.")
+        adb.push_managed_file(serial, local_server, remote)
         adb.shell(
             serial,
             ("chmod", "700", remote),
@@ -393,6 +431,21 @@ class FridaController:
             check=True,
             operation="making the managed Frida Server executable",
         )
+        remote_hash_result = adb.shell(
+            serial,
+            ("sha256sum", remote),
+            timeout=20,
+            check=False,
+            operation="verifying the pushed Frida Server hash",
+        )
+        remote_hash_parts = remote_hash_result.stdout.strip().split(maxsplit=1)
+        remote_hash = remote_hash_parts[0] if remote_hash_parts else ""
+        if (
+            remote_hash_result.timed_out
+            or remote_hash_result.exit_code != 0
+            or remote_hash.casefold() != probe.server_binary_sha256
+        ):
+            raise FridaError("Pushed Frida Server SHA-256 verification failed.")
         version_result = adb.shell(
             serial,
             ("su", "-c", f"{remote} --version"),
@@ -622,6 +675,9 @@ class FridaController:
                     events_path=events.relative_to(paths.root).as_posix(),
                     raw_events_path=raw_events.relative_to(paths.root).as_posix(),
                     handshake_status=FridaHandshakeStatus.VALID.value,
+                    server_binary_sha256=(
+                        probe.server_binary_sha256 if server_started else None
+                    ),
                 )
                 write_json_atomic(
                     self._state_path(record.session_id),

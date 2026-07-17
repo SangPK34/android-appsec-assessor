@@ -18,6 +18,8 @@ from android_assessor.frida_events import (
     parse_frida_jsonl,
     stage_observer_hook,
 )
+from android_assessor.paths import ProjectPaths
+from android_assessor.storage import write_json_atomic
 from tests.fakes import FIXTURE_ROOT
 
 SESSION_ID = "fixture-session"
@@ -110,6 +112,37 @@ def test_frida_parser_reports_missing_json_and_oversized_lines() -> None:
 
     assert len(result.errors) == 2
     assert result.events == ()
+
+
+def test_frida_parser_redacts_unknown_raw_string_fields_fail_closed() -> None:
+    event = json.loads(fixture_events().splitlines()[3])
+    event["arguments_redacted"] = [
+        "opaque-fixture-secret",
+        {
+            "value": "raw-value-secret",
+            "custom_field": "raw-custom-secret",
+        },
+    ]
+    event["return_value_redacted"] = "raw-return-secret"
+
+    result = parse_frida_jsonl(
+        json.dumps(event),
+        expected_session_id=SESSION_ID,
+        expected_package=PACKAGE,
+        source="fixture",
+        environment="simulated",
+    )
+    rendered = result.to_jsonl()
+
+    assert result.errors == ()
+    for secret in (
+        "opaque-fixture-secret",
+        "raw-value-secret",
+        "raw-custom-secret",
+        "raw-return-secret",
+    ):
+        assert secret not in rendered
+    assert rendered.count("<redacted>") >= 4
 
 
 @pytest.mark.parametrize(
@@ -216,3 +249,68 @@ def test_fixture_provenance_cannot_be_labeled_physical() -> None:
             source="fixture",
             environment="physical",
         )
+
+
+def test_frida_server_asset_requires_pinned_output_hash(tmp_path: Path) -> None:
+    paths = ProjectPaths(tmp_path / "lab")
+    paths.ensure_layout()
+    server = paths.tools_dir / "frida" / "frida-server-17.0.0-android-arm64"
+    server.parent.mkdir(parents=True)
+    server.write_bytes(b"fixture-frida-server")
+    digest = hashlib.sha256(server.read_bytes()).hexdigest()
+    write_json_atomic(
+        paths.config_dir / "tools.lock.json",
+        {
+            "tools": {
+                "frida_servers": {
+                    "version": "17.0.0",
+                    "assets": {
+                        "arm64": {
+                            "output_sha256": digest,
+                            "output_minimum_bytes": server.stat().st_size,
+                        }
+                    },
+                }
+            }
+        },
+        root=paths.root,
+    )
+    context = SimpleNamespace(paths=paths)
+    controller = FridaController(context)  # type: ignore[arg-type]
+
+    selected, selected_hash = controller._server_binary("17.0.0", "arm64")
+
+    assert selected == server.resolve()
+    assert selected_hash == digest
+
+    server.write_bytes(b"tampered-frida-server")
+    assert controller._server_binary("17.0.0", "arm64") == (None, None)
+
+
+def test_frida_server_asset_does_not_use_unpinned_generic_fallback(tmp_path: Path) -> None:
+    paths = ProjectPaths(tmp_path / "lab")
+    paths.ensure_layout()
+    generic = paths.tools_dir / "frida" / "frida-server"
+    generic.parent.mkdir(parents=True)
+    generic.write_bytes(b"unversioned")
+    write_json_atomic(
+        paths.config_dir / "tools.lock.json",
+        {
+            "tools": {
+                "frida_servers": {
+                    "version": "17.0.0",
+                    "assets": {
+                        "arm64": {
+                            "output_sha256": hashlib.sha256(b"unversioned").hexdigest(),
+                            "output_minimum_bytes": 1,
+                        }
+                    },
+                }
+            }
+        },
+        root=paths.root,
+    )
+
+    controller = FridaController(SimpleNamespace(paths=paths))  # type: ignore[arg-type]
+
+    assert controller._server_binary("17.0.0", "arm64") == (None, None)

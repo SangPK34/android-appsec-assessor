@@ -196,7 +196,6 @@ def _redact_observer_value(value: Any, *, key: str | None = None) -> Any:
         "indicator_type",
         "response",
         "type",
-        "value",
     }:
         return (
             value
@@ -210,6 +209,8 @@ def _redact_observer_value(value: Any, *, key: str | None = None) -> Any:
             return None
         return value if isinstance(value, bool) else False
     if key is not None and is_sensitive_name(key):
+        return REDACTED
+    if isinstance(value, str):
         return REDACTED
     return redact_data(value)
 

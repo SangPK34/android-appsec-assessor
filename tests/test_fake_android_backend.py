@@ -155,7 +155,7 @@ def test_fake_frida_owned_process_stops_only_with_exact_identity() -> None:
     backend = FakeAndroidBackend(client_version="17.0.0")
     identity = backend.start_frida_server(
         backend.serial,
-        executable_path="/data/local/tmp/android-assessor/s/frida-server",
+        executable_path="/data/local/tmp/android-security-lab/s/frida-server",
         session_id="fixture-session",
     )
     backend.reuse_pid(executable_path="/system/bin/sleep", start_time="200")
@@ -194,7 +194,7 @@ def test_fake_backend_can_fault_after_each_mutation(
         else:
             backend.start_frida_server(
                 backend.serial,
-                executable_path="/data/local/tmp/android-assessor/frida-server",
+                executable_path="/data/local/tmp/android-security-lab/frida-server",
                 session_id="fixture-session",
             )
 
