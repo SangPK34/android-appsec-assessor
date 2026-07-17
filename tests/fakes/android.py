@@ -63,6 +63,8 @@ class FakeAndroidBackend:
     mutations: int = 0
     operations: list[tuple[str, tuple[Any, ...]]] = field(default_factory=list)
     pushed_files: dict[str, bytes] = field(default_factory=dict)
+    ca_certificates: dict[tuple[str, str], str] = field(default_factory=dict)
+    ca_snapshot_fails: bool = False
 
     def _require_connected(self, serial: str) -> None:
         validate_serial(serial)
@@ -262,3 +264,44 @@ class FakeAndroidBackend:
         self.server_process["executable_path"] = executable_path
         self.server_process["proc_exe"] = executable_path
         self.server_process["start_time"] = start_time
+
+    def read_ca_fingerprint(
+        self,
+        serial: str,
+        *,
+        store: str,
+        certificate_id: str,
+    ) -> str | None:
+        self._require_connected(serial)
+        self.operations.append(("read_ca", (store, certificate_id)))
+        if self.ca_snapshot_fails:
+            raise AdbError("Injected CA snapshot failure.")
+        return self.ca_certificates.get((store, certificate_id))
+
+    def install_ca(
+        self,
+        serial: str,
+        *,
+        store: str,
+        certificate_id: str,
+        fingerprint_sha256: str,
+    ) -> None:
+        self._require_connected(serial)
+        self.ca_certificates[(store, certificate_id)] = fingerprint_sha256
+        self._mutation("install_ca", store, certificate_id, fingerprint_sha256)
+
+    def remove_ca(
+        self,
+        serial: str,
+        *,
+        store: str,
+        certificate_id: str,
+        expected_fingerprint_sha256: str,
+    ) -> bool:
+        self._require_connected(serial)
+        key = (store, certificate_id)
+        if self.ca_certificates.get(key) != expected_fingerprint_sha256:
+            return False
+        del self.ca_certificates[key]
+        self._mutation("remove_ca", store, certificate_id, expected_fingerprint_sha256)
+        return True

@@ -1,0 +1,8 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "certificate_id": "mitmproxy-lab-ca",
+  "target_fingerprint_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "replacement_fingerprint_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "physical_validation_status": "UNVERIFIED_ON_PHYSICAL_DEVICE"
+}

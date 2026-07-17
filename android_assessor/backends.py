@@ -88,3 +88,31 @@ class PrivateStorageBackend(Protocol):
     def inspect_package(self, serial: str, package: str) -> dict[str, object]: ...
 
     def list_storage(self, serial: str, package: str) -> list[dict[str, object]]: ...
+
+
+class CertificateAuthorityBackend(Protocol):
+    def read_ca_fingerprint(
+        self,
+        serial: str,
+        *,
+        store: str,
+        certificate_id: str,
+    ) -> str | None: ...
+
+    def install_ca(
+        self,
+        serial: str,
+        *,
+        store: str,
+        certificate_id: str,
+        fingerprint_sha256: str,
+    ) -> None: ...
+
+    def remove_ca(
+        self,
+        serial: str,
+        *,
+        store: str,
+        certificate_id: str,
+        expected_fingerprint_sha256: str,
+    ) -> bool: ...
