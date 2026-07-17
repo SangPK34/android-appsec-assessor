@@ -16,7 +16,13 @@ from .cleanup import CleanupExecutor, capture_remote_process_identity
 from .device_lock import DeviceLock
 from .environment import find_tool_spec, resolve_binary
 from .errors import AndroidAssessorError, FridaError
-from .evidence import EvidenceRepository, sha256_file
+from .evidence import EvidenceRepository
+from .frida_events import (
+    OBSERVER_VERSION,
+    FridaHandshakeStatus,
+    parse_frida_jsonl,
+    stage_observer_hook,
+)
 from .host_process import ProcessIdentity, WindowsProcessController
 from .redaction import redact_text
 from .root import probe_root
@@ -87,6 +93,9 @@ class FridaObservationState:
     raw_events_path: str | None = None
     evidence_registered: bool = False
     error: str | None = None
+    observer_version: str = OBSERVER_VERSION
+    handshake_status: str = "UNVERIFIED"
+    runtime_event_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -108,6 +117,37 @@ class FridaController:
 
     def _state_path(self, session_id: str) -> Path:
         return self.repository.paths_for(session_id).frida_dir / "state.json"
+
+    @staticmethod
+    def _wait_observer_handshake(
+        process: subprocess.Popen[bytes],
+        events_path: Path,
+        *,
+        session_id: str,
+        package: str,
+        timeout: float = 10,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        last_errors: tuple[str, ...] = ()
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise FridaError(
+                    f"Frida client exited during observer handshake with code {process.returncode}."
+                )
+            if events_path.is_file():
+                parsed = parse_frida_jsonl(
+                    events_path.read_text(encoding="utf-8", errors="replace"),
+                    expected_session_id=session_id,
+                    expected_package=package,
+                    source="frida",
+                    environment="physical",
+                )
+                last_errors = parsed.errors
+                if parsed.handshake_status is FridaHandshakeStatus.VALID:
+                    return
+            time.sleep(0.2)
+        detail = f" Last parser error: {last_errors[-1]}" if last_errors else ""
+        raise FridaError(f"Observer handshake was not received within {timeout:g}s.{detail}")
 
     @staticmethod
     def _version(output: str) -> str | None:
@@ -433,12 +473,14 @@ class FridaController:
             raise FridaError("The fixed Frida observer hook is missing.")
         session_hook = paths.frida_dir / "basic_observer.js"
         try:
-            write_text_atomic(
+            hook_sha256 = stage_observer_hook(
+                hook,
                 session_hook,
-                hook.read_text(encoding="utf-8"),
-                root=paths.root,
+                session_id=record.session_id,
+                package=record.package,
+                project_root=paths.root,
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise FridaError(f"Could not stage the Frida observer hook: {exc}") from exc
         cleanup_ids: dict[str, str] = {}
         server_started = False
@@ -528,14 +570,21 @@ class FridaController:
                         creationflags=flags,
                         close_fds=True,
                     )
-                time.sleep(2)
-                if process.poll() is not None:
-                    detail = stderr_path.read_text(
-                        encoding="utf-8", errors="replace"
-                    )[-1000:]
-                    raise FridaError(
-                        f"Frida client exited during startup: {redact_text(detail)}"
+                try:
+                    self._wait_observer_handshake(
+                        process,
+                        raw_events,
+                        session_id=record.session_id,
+                        package=record.package,
                     )
+                except FridaError as exc:
+                    detail = (
+                        stderr_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+                        if stderr_path.is_file()
+                        else ""
+                    )
+                    suffix = f" {redact_text(detail)}" if detail else ""
+                    raise FridaError(f"{exc}{suffix}") from exc
                 identity = self.process_controller.capture(process.pid)
                 if identity is None:
                     raise FridaError("Could not capture Frida client process identity.")
@@ -569,9 +618,10 @@ class FridaController:
                     process_identity=identity.to_dict(),
                     cleanup_action_ids=cleanup_ids,
                     hook_path=session_hook.relative_to(paths.root).as_posix(),
-                    hook_sha256=sha256_file(session_hook),
+                    hook_sha256=hook_sha256,
                     events_path=events.relative_to(paths.root).as_posix(),
                     raw_events_path=raw_events.relative_to(paths.root).as_posix(),
+                    handshake_status=FridaHandshakeStatus.VALID.value,
                 )
                 write_json_atomic(
                     self._state_path(record.session_id),
@@ -738,6 +788,8 @@ class FridaController:
 
             evidence_registered = state.evidence_registered
             output_events_path = state.events_path
+            handshake_status = state.handshake_status
+            runtime_event_count = state.runtime_event_count
             if not evidence_registered:
                 try:
                     raw_events = require_under_root(
@@ -786,14 +838,21 @@ class FridaController:
                             redacted=True,
                         )
                     if raw_events.is_file():
+                        parsed_events = parse_frida_jsonl(
+                            raw_events.read_text(
+                                encoding="utf-8",
+                                errors="replace",
+                            ),
+                            expected_session_id=record.session_id,
+                            expected_package=record.package,
+                            source="frida",
+                            environment="physical",
+                        )
+                        handshake_status = parsed_events.handshake_status.value
+                        runtime_event_count = parsed_events.runtime_event_count
                         write_text_atomic(
                             events,
-                            redact_text(
-                                raw_events.read_text(
-                                    encoding="utf-8",
-                                    errors="replace",
-                                )
-                            ),
+                            parsed_events.to_jsonl(),
                             root=self.paths.root,
                         )
                         self.evidence.register_file(
@@ -814,6 +873,17 @@ class FridaController:
                             sensitive=True,
                             redacted=True,
                         )
+                        self.repository.append_event(
+                            record.session_id,
+                            "frida_events_normalized",
+                            {
+                                "event_count": len(parsed_events.events),
+                                "runtime_event_count": runtime_event_count,
+                                "parse_error_count": len(parsed_events.errors),
+                                "handshake_status": handshake_status,
+                                "physical_validation_status": "UNVERIFIED",
+                            },
+                        )
                     evidence_registered = True
                 except (AndroidAssessorError, OSError, ValueError) as exc:
                     errors.append(redact_text(str(exc))[:500])
@@ -825,6 +895,8 @@ class FridaController:
                     "stopped_at": datetime.now(UTC).isoformat(),
                     "evidence_registered": evidence_registered,
                     "events_path": output_events_path,
+                    "handshake_status": handshake_status,
+                    "runtime_event_count": runtime_event_count,
                     "error": "; ".join(errors) if errors else None,
                 }
             )
