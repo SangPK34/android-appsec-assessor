@@ -271,8 +271,11 @@ class WebBackend:
         evidence_values = evidence_state.get("evidence", [])
         report = self._optional_session_json(paths.report_json) or {}
         report_findings = report.get("findings")
-        if isinstance(report_findings, list):
-            findings = report_findings
+        finding_payload = (
+            report_findings
+            if isinstance(report_findings, list)
+            else [finding.to_dict() for finding in findings]
+        )
         observations = report.get("runtime_observations", [])
         runtime_categories = sorted(
             {
@@ -288,7 +291,7 @@ class WebBackend:
             "scan": self._optional_session_json(paths.scan_json),
             "traffic": self._optional_session_json(paths.traffic_dir / "state.json"),
             "frida": self._optional_session_json(paths.frida_dir / "state.json"),
-            "findings": [finding.to_dict() for finding in findings],
+            "findings": finding_payload,
             "evidence_count": len(evidence_values)
             if isinstance(evidence_values, list)
             else 0,
