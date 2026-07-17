@@ -52,7 +52,7 @@ class WebBackendProtocol(Protocol):
 
     def session_detail(self, session_id: str) -> dict[str, Any]: ...
 
-    def scan_session(self, session_id: str) -> dict[str, Any]: ...
+    def scan_session(self, session_id: str, profile: str = "quick") -> dict[str, Any]: ...
 
     def validate_finding(self, session_id: str, finding_id: str) -> dict[str, Any]: ...
 
@@ -267,6 +267,16 @@ class WebBackend:
         findings = FindingRepository(self.paths, self.repository).list(record.session_id)
         evidence_state = self._optional_session_json(paths.evidence_index) or {}
         evidence_values = evidence_state.get("evidence", [])
+        report = self._optional_session_json(paths.report_json) or {}
+        observations = report.get("runtime_observations", [])
+        runtime_categories = sorted(
+            {
+                str(item.get("rule_id", "")).removeprefix("ASL-RUNTIME-").casefold()
+                for item in observations
+                if isinstance(item, dict)
+                and item.get("status") not in {"skipped", "inconclusive"}
+            }
+        ) if isinstance(observations, list) else []
         return {
             "session": record.to_dict(show_serial=False),
             "app": self._optional_session_json(paths.app_json),
@@ -278,10 +288,14 @@ class WebBackend:
             if isinstance(evidence_values, list)
             else 0,
             "report_available": paths.report_html.is_file(),
+            "runtime_categories": runtime_categories,
         }
 
-    def scan_session(self, session_id: str) -> dict[str, Any]:
-        return ScanService(self.context, self.repository).scan_session(session_id).to_dict()
+    def scan_session(self, session_id: str, profile: str = "quick") -> dict[str, Any]:
+        return ScanService(self.context, self.repository).scan_session(
+            session_id,
+            profile=profile,
+        ).to_dict()
 
     def validate_finding(self, session_id: str, finding_id: str) -> dict[str, Any]:
         return ValidationService(self.context, self.repository).validate(

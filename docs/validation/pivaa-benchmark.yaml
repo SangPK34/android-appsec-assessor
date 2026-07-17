@@ -1,0 +1,76 @@
+schema_version: 1
+application: com.htbridge.pivaa
+purpose: "Validation reference for emulator assessments; not a production rule configuration."
+cases:
+  - category: debug_test_configuration
+    ground_truth_evidence: manifest.debuggable_or_test_only
+    eligible_framework_rule: ASL-MVP-001
+    expected_minimum_status: confirmed
+    observed_status: confirmed
+    reason_for_mismatch: null
+  - category: backup_policy
+    ground_truth_evidence: manifest.allow_backup
+    eligible_framework_rule: ASL-MANIFEST-ALLOW-BACKUP
+    expected_minimum_status: potential
+    observed_status: potential
+    reason_for_mismatch: null
+  - category: cleartext_network_configuration
+    ground_truth_evidence: manifest.uses_cleartext_traffic_or_network_security_config
+    eligible_framework_rule: ASL-MVP-002
+    expected_minimum_status: inconclusive
+    observed_status: inconclusive
+    reason_for_mismatch: "No scoped HTTPS or cleartext request evidence was collected."
+  - category: exported_components
+    ground_truth_evidence: manifest.component_export_and_permission_boundary
+    eligible_framework_rule: ASL-MANIFEST-EXPORTED-ACTIVITY
+    expected_minimum_status: pass
+    observed_status: pass
+    reason_for_mismatch: null
+  - category: exported_receiver_boundary
+    ground_truth_evidence: manifest.exported_receiver_without_permission
+    eligible_framework_rule: ASL-MANIFEST-EXPORTED-RECEIVER
+    expected_minimum_status: potential
+    observed_status: potential
+    reason_for_mismatch: null
+  - category: permission_boundaries
+    ground_truth_evidence: manifest.permissions_and_component_permissions
+    eligible_framework_rule: ASL-MANIFEST-EXPORTED-PROVIDER
+    expected_minimum_status: pass
+    observed_status: pass
+    reason_for_mismatch: null
+  - category: crypto_behavior
+    ground_truth_evidence: frida.crypto.transformation_and_execution_metadata
+    eligible_framework_rule: CRYPTO-ECB
+    expected_minimum_status: confirmed
+    observed_status: confirmed
+    reason_for_mismatch: null
+  - category: webview_behavior
+    ground_truth_evidence: frida.webview.events
+    eligible_framework_rule: ASL-RUNTIME-WEBVIEW
+    expected_minimum_status: pass
+    observed_status: pass
+    reason_for_mismatch: null
+  - category: private_storage
+    ground_truth_evidence: bounded_private_storage_metadata_and_content_policy
+    eligible_framework_rule: ASL-RUNTIME-STORAGE
+    expected_minimum_status: pass
+    observed_status: pass
+    reason_for_mismatch: null
+  - category: logging
+    ground_truth_evidence: target_process_logcat_and_frida_logging_events
+    eligible_framework_rule: ASL-RUNTIME-LOGGING
+    expected_minimum_status: pass
+    observed_status: pass
+    reason_for_mismatch: null
+  - category: tls_behavior
+    ground_truth_evidence: https_request_and_certificate_trust_event
+    eligible_framework_rule: ASL-MVP-005
+    expected_minimum_status: inconclusive
+    observed_status: inconclusive
+    reason_for_mismatch: "No in-scope HTTPS action completed through the lab proxy."
+  - category: root_detection
+    ground_truth_evidence: frida.root_detection_events
+    eligible_framework_rule: ASL-RUNTIME-ROOT
+    expected_minimum_status: inconclusive
+    observed_status: inconclusive
+    reason_for_mismatch: "No package-attributed root-detection event was observed."

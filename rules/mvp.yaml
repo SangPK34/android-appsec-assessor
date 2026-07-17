@@ -75,3 +75,139 @@ rules:
     mastg_mapping: mapping_pending
     cwe_mapping: mapping_pending
     remediation: Define the intended trust model and use pinning only where justified by the threat model.
+
+  - id: ASL-MANIFEST-ALLOW-BACKUP
+    evaluator: manifest_policy
+    title: Application backup policy
+    category: configuration
+    description: Evaluates the normalized allowBackup manifest attribute.
+    severity: medium
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Review backup policy against the application's data protection requirements.
+
+  - id: ASL-MANIFEST-EXPORTED-ACTIVITY
+    evaluator: manifest_policy
+    title: Exported activity protection boundary
+    category: platform
+    description: Evaluates exported activities and their normalized permission boundary.
+    severity: medium
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Restrict exported activities or enforce an appropriate permission.
+
+  - id: ASL-MANIFEST-EXPORTED-RECEIVER
+    evaluator: manifest_policy
+    title: Exported receiver protection boundary
+    category: platform
+    description: Evaluates exported receivers and their normalized permission boundary.
+    severity: medium
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Restrict exported receivers or enforce an appropriate permission.
+
+  - id: ASL-MANIFEST-EXPORTED-PROVIDER
+    evaluator: manifest_policy
+    title: Exported provider protection boundary
+    category: platform
+    description: Evaluates exported providers and their normalized permission boundary.
+    severity: high
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Restrict exported providers and review read/write permissions.
+
+  - id: CRYPTO-ECB
+    evaluator: crypto_runtime
+    title: ECB mode observed at runtime
+    category: crypto
+    description: Evaluates runtime crypto metadata for ECB mode.
+    severity: high
+    confidence: high
+    validation_type: instrumented_validation
+    observation_only: false
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Use an authenticated mode with a fresh IV instead of ECB.
+
+  - id: CRYPTO-WEAK-ALGORITHM
+    evaluator: crypto_runtime
+    title: Weak runtime crypto algorithm
+    category: crypto
+    description: Evaluates runtime crypto metadata for configured weak algorithms.
+    severity: high
+    confidence: high
+    validation_type: instrumented_validation
+    observation_only: false
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Replace weak algorithms with a modern, policy-approved primitive.
+
+  - id: ASL-RUNTIME-WEBVIEW
+    evaluator: runtime_observation
+    title: WebView runtime observation
+    category: runtime-observation
+    description: Records package-attributed WebView events without treating loadUrl alone as a vulnerability.
+    severity: info
+    confidence: medium
+    observation_only: true
+    validation_type: instrumented_validation
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Review observed WebView configuration in application context.
+
+  - id: ASL-RUNTIME-LOGGING
+    evaluator: runtime_observation
+    title: Logging runtime observation
+    category: runtime-observation
+    description: Records package-attributed logging events for evidence correlation.
+    severity: info
+    confidence: medium
+    observation_only: true
+    validation_type: instrumented_validation
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Review sensitive values observed in target-process logs.
+
+  - id: ASL-RUNTIME-STORAGE
+    evaluator: storage_observation
+    title: Private storage observation
+    category: runtime-observation
+    description: Records bounded private-storage metadata and policy observations; root readability is not itself a finding.
+    severity: info
+    confidence: medium
+    observation_only: true
+    validation_type: post_compromise_observation
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Review sensitive storage observations against the application's protection requirements.
+
+  - id: ASL-RUNTIME-ROOT
+    evaluator: runtime_observation
+    title: Root-detection runtime observation
+    category: runtime-observation
+    description: Records observed root-detection behavior without treating root capability as an application vulnerability.
+    severity: info
+    confidence: medium
+    observation_only: true
+    validation_type: instrumented_validation
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Review root-detection behavior in the application's threat model.

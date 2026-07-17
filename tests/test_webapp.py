@@ -16,6 +16,7 @@ class FakeWebBackend:
         self.selected_packages: list[str] = []
         self.cleaned_sessions: list[str] = []
         self.scan_sessions: list[str] = []
+        self.scan_profiles: list[str] = []
         self.scan_failure: Exception | None = None
         self.repair_starts = 0
 
@@ -165,8 +166,9 @@ class FakeWebBackend:
             "report_available": False,
         }
 
-    def scan_session(self, session_id: str) -> dict[str, Any]:
+    def scan_session(self, session_id: str, profile: str = "quick") -> dict[str, Any]:
         self.scan_sessions.append(session_id)
+        self.scan_profiles.append(profile)
         if self.scan_failure is not None:
             raise self.scan_failure
         return {"session_id": session_id, "status": "completed"}
@@ -269,7 +271,11 @@ def test_app_scan_form_has_visible_progress_and_error_swap_contract() -> None:
     response = client.get(f"/sessions/{session_id}/app")
 
     assert response.status_code == 200
-    assert "Start MVP scan" in response.text
+    assert "Start MVP scan" not in response.text
+    assert "Quick Scan" in response.text
+    assert "Full Assessment" in response.text
+    assert 'name="profile" value="quick"' in response.text
+    assert 'name="profile" value="full"' in response.text
     assert f'hx-post="/sessions/{session_id}/scan"' in response.text
     assert 'hx-target="body"' in response.text
     assert 'hx-select="body"' in response.text
@@ -290,8 +296,27 @@ def test_scan_success_uses_single_backend_call_and_htmx_redirect() -> None:
     )
 
     assert response.status_code == 204
-    assert response.headers["hx-redirect"] == f"/sessions/{session_id}?notice=MVP+scan+completed."
+    assert response.headers["hx-redirect"] == f"/sessions/{session_id}?notice=Quick+scan+completed."
     assert backend.scan_sessions == [session_id]
+    assert backend.scan_profiles == ["quick"]
+
+
+def test_full_assessment_profile_is_forwarded_once() -> None:
+    client, backend = make_client()
+    session_id = "20260717-021530-a8f4c2"
+
+    response = client.post(
+        f"/sessions/{session_id}/scan",
+        data={
+            "action_token": client.app.state.action_token,
+            "profile": "full",
+        },
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 204
+    assert backend.scan_sessions == [session_id]
+    assert backend.scan_profiles == ["full"]
 
 
 @pytest.mark.parametrize(

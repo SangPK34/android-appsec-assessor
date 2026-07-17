@@ -1,4 +1,4 @@
-"""Five-rule MVP evaluator over app, traffic, logcat, and Frida evidence."""
+"""Profile-neutral rule evaluation over shared static and runtime evidence."""
 
 from __future__ import annotations
 
@@ -6,15 +6,19 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import yaml
 
+from .crypto_analysis import CryptoAnalyzer, operations_from_frida_events
 from .errors import AndroidAssessorError, SessionError
 from .evidence import EvidenceRepository
 from .findings import FindingRecord, FindingRepository, FindingStatus
+from .manifest_analysis import ManifestSecurityAnalyzer
 from .paths import ProjectPaths
 from .redaction import redact_text
+from .root_detection import RootDetectionAnalyzer, root_events_from_frida
 from .session import SessionRepository
 from .storage import read_json_object, require_under_root
 from .tls_analysis import TlsBehaviorAnalyzer
@@ -35,6 +39,7 @@ class RuleDefinition:
     validation_type: str
     validation_supported: bool
     validation_observable: str | None
+    observation_only: bool = False
 
 
 def _optional_json(path: Path, root: Path) -> dict[str, Any] | None:
@@ -83,14 +88,14 @@ class RuleEngine:
         try:
             payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         except (OSError, yaml.YAMLError) as exc:
-            raise SessionError(f"Could not load MVP rules: {exc}") from exc
+            raise SessionError(f"Could not load rules: {exc}") from exc
         values = payload.get("rules") if isinstance(payload, dict) else None
-        if not isinstance(values, list) or len(values) != 5:
-            raise SessionError("MVP rule file must contain exactly five rules.")
+        if not isinstance(values, list) or not values:
+            raise SessionError("Rule file must contain at least one rule.")
         output: list[RuleDefinition] = []
         for value in values:
             if not isinstance(value, dict):
-                raise SessionError("MVP rule entry is invalid.")
+                raise SessionError("Rule entry is invalid.")
             validation_type = str(value.get("validation_type", "none"))
             output.append(
                 RuleDefinition(
@@ -115,6 +120,7 @@ class RuleEngine:
                         if value.get("validation_observable")
                         else None
                     ),
+                    observation_only=bool(value.get("observation_only", False)),
                 )
             )
         return tuple(output)
@@ -161,6 +167,46 @@ class RuleEngine:
                 else FindingStatus.INCONCLUSIVE
             )
             return status, "static", values, evidence("manifest_tree"), False, False
+
+        if definition.evaluator == "manifest_policy":
+            if manifest is None:
+                return FindingStatus.SKIPPED, "static", {}, (), False, False
+            source = (
+                "emulator"
+                if str(context["serial"]).startswith("emulator-")
+                else "physical_device"
+            )
+            results = ManifestSecurityAnalyzer.analyze(
+                manifest,
+                source=source,
+                environment=source,
+            )
+            selected = next(
+                (item for item in results if item.test_id == definition.rule_id),
+                None,
+            )
+            if selected is None:
+                return (
+                    FindingStatus.INCONCLUSIVE,
+                    "static",
+                    {"reason": "policy result unavailable"},
+                    (),
+                    False,
+                    False,
+                )
+            details = {
+                **selected.details,
+                "rationale": selected.rationale,
+                "observation_only": definition.observation_only,
+            }
+            return (
+                selected.finding_status,
+                "static",
+                details,
+                evidence("manifest_tree"),
+                False,
+                False,
+            )
 
         if definition.evaluator == "cleartext":
             observed = [
@@ -281,7 +327,117 @@ class RuleEngine:
                 bool(context["root_used"] and frida_tls),
                 bool(frida_tls),
             )
-        raise SessionError(f"Unknown MVP rule evaluator: {definition.evaluator}")
+        if definition.evaluator == "crypto_runtime":
+            values = [SimpleNamespace(**item) for item in frida]
+            source = (
+                "emulator"
+                if str(context["serial"]).startswith("emulator-")
+                else "physical_device"
+            )
+            extraction = operations_from_frida_events(
+                values,
+                source=source,
+                environment=source,
+            )
+            results = CryptoAnalyzer().analyze(extraction.operations)
+            matched = next((item for item in results if item.rule_id == definition.rule_id), None)
+            if matched is None:
+                matched = next((item for item in results if item.rule_id == "CRYPTO-POLICY"), None)
+            if matched is None:
+                return (
+                    FindingStatus.INCONCLUSIVE,
+                    "instrumentation",
+                    {"observation_only": definition.observation_only},
+                    evidence("frida_events"),
+                    False,
+                    bool(frida),
+                )
+            details = {
+                **matched.details,
+                "operation_ids": list(matched.operation_ids),
+                "observation_only": definition.observation_only,
+            }
+            return (
+                matched.status,
+                "instrumentation",
+                details,
+                evidence("frida_events"),
+                False,
+                bool(frida),
+            )
+
+        if definition.evaluator == "runtime_observation":
+            category = definition.rule_id.rsplit("-", 1)[-1].casefold()
+            if category == "webview":
+                observed = [item for item in frida if item.get("category") == "webview"]
+            elif category == "logging":
+                observed = [item for item in frida if item.get("category") == "logging"]
+            elif category == "storage":
+                observed = [item for item in frida if item.get("category") == "storage"]
+            elif category == "root":
+                observed = [item for item in frida if item.get("category") == "root_detection"]
+            else:
+                observed = []
+            if category == "root":
+                values = [SimpleNamespace(**item) for item in frida]
+                source = (
+                    "emulator"
+                    if str(context["serial"]).startswith("emulator-")
+                    else "physical_device"
+                )
+                root_events = root_events_from_frida(values, source=source, environment=source)
+                result = RootDetectionAnalyzer.analyze(
+                    root_events,
+                    expected_root_present=bool(context["root_available"]),
+                )
+                details = {**result.to_dict(), "observation_only": True}
+                return (
+                    FindingStatus.PASS if root_events else FindingStatus.INCONCLUSIVE,
+                    "instrumentation",
+                    details,
+                    evidence("frida_events"),
+                    False,
+                    bool(frida),
+                )
+            status = FindingStatus.PASS if observed else FindingStatus.INCONCLUSIVE
+            return (
+                status,
+                "instrumentation",
+                {"event_count": len(observed), "observation_only": True},
+                evidence("frida_events"),
+                False,
+                bool(observed),
+            )
+
+        if definition.evaluator == "storage_observation":
+            storage = context["private_storage"]
+            if not storage:
+                return (
+                    FindingStatus.SKIPPED,
+                    "root_assisted",
+                    {"observation_only": True},
+                    (),
+                    True,
+                    False,
+                )
+            observations = storage.get("observations", [])
+            eligible = [item for item in observations if item.get("finding_eligible")]
+            status = FindingStatus.POTENTIAL if eligible else FindingStatus.PASS
+            return (
+                status,
+                "root_assisted",
+                {
+                    "observation_count": len(observations),
+                    "finding_eligible_count": len(eligible),
+                    "observation_only": True,
+                    "root_mode": storage.get("root_mode"),
+                },
+                evidence("private_storage_metadata"),
+                True,
+                False,
+            )
+
+        raise SessionError(f"Unknown rule evaluator: {definition.evaluator}")
 
     def evaluate(self, session_id: str) -> list[FindingRecord]:
         with self.sessions.state_lock(session_id):
@@ -291,6 +447,22 @@ class RuleEngine:
         paths = self.sessions.paths_for(session_id)
         app = read_json_object(paths.app_json, root=self.paths.root)
         manifest = app.get("manifest") if isinstance(app.get("manifest"), dict) else None
+        if manifest is not None:
+            manifest = dict(manifest)
+            metadata = app.get("metadata") if isinstance(app.get("metadata"), dict) else {}
+            flags = {
+                str(item).casefold()
+                for item in metadata.get("flags", [])
+                if isinstance(item, str)
+            }
+            # Package-manager metadata is the authoritative fallback when an
+            # AAPT2 tree omits a defaulted application attribute.
+            if manifest.get("debuggable") is None:
+                manifest["debuggable"] = "debuggable" in flags
+            if manifest.get("test_only") is None:
+                manifest["test_only"] = "test_only" in flags
+            if manifest.get("allow_backup") is None and flags:
+                manifest["allow_backup"] = "allow_backup" in flags
         traffic_state = _optional_json(paths.traffic_dir / "state.json", self.paths.root)
         traffic_path = (
             require_under_root(
@@ -311,8 +483,35 @@ class RuleEngine:
             if frida_state
             else None
         )
-        frida_events = _frida_events(frida_path) if frida_path else []
+        private_storage = _optional_json(
+            paths.redacted_dir / "storage" / "private-storage.json", self.paths.root
+        )
+        device_state = _optional_json(paths.device_json, self.paths.root) or {}
+        capability_values = device_state.get("capabilities", {}).get("capabilities", [])
+        root_capability = any(
+            isinstance(item, dict)
+            and item.get("name") == "ANDROID_ROOT"
+            and item.get("available") is True
+            for item in capability_values
+        ) if isinstance(capability_values, list) else False
         evidence_values = self.evidence.list(session_id)
+        frida_paths: list[Path] = []
+        if frida_path is not None:
+            frida_paths.append(frida_path)
+        for item in evidence_values:
+            if item.get("evidence_type") != "frida_events":
+                continue
+            candidate = require_under_root(
+                paths.root / str(item.get("relative_path", "")),
+                paths.root,
+            )
+            if candidate not in frida_paths:
+                frida_paths.append(candidate)
+        frida_events = [
+            event
+            for candidate in frida_paths
+            for event in _frida_events(candidate)
+        ]
 
         def evidence_ids(evidence_type: str) -> tuple[str, ...]:
             return tuple(
@@ -329,7 +528,14 @@ class RuleEngine:
             "evidence": evidence_ids,
             "root_used": bool(
                 frida_state and frida_state.get("server_started_by_framework") is True
+            ) or bool(private_storage),
+            "root_available": root_capability or bool(
+                private_storage
+                and private_storage.get("root_mode")
+                not in {None, "none", "non_root"}
             ),
+            "private_storage": private_storage,
+            "serial": self.sessions.load(session_id).serial,
         }
         now = datetime.now(UTC).isoformat()
         previous_findings = {
@@ -391,7 +597,7 @@ class RuleEngine:
         self.findings.save(session_id, findings)
         self.sessions.append_event(
             session_id,
-            "mvp_rules_evaluated",
+            "rules_evaluated",
             {"rule_count": len(findings)},
         )
         return findings

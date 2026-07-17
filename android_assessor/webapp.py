@@ -377,6 +377,7 @@ def create_app(
         request: Request,
         session_id: str,
         submitted_token: Annotated[str, Form(alias="action_token")],
+        profile: Annotated[str, Form()] = "quick",
     ) -> Response:
         verify_action_token(submitted_token)
         is_hx_request = request.headers.get("HX-Request", "").casefold() == "true"
@@ -394,7 +395,10 @@ def create_app(
             return "unknown", "unknown"
 
         try:
-            service.scan_session(session_id)
+            if profile == "quick":
+                service.scan_session(session_id)
+            else:
+                service.scan_session(session_id, profile=profile)
         except (AndroidAssessorError, OSError, ValueError) as exc:
             safe_error = expected_error(exc)
             device, package = scan_context()
@@ -442,7 +446,8 @@ def create_app(
                 ),
                 status_code=200 if is_hx_request else 500,
             )
-        return action_redirect(request, f"/sessions/{session_id}", "MVP scan completed.")
+        label = "Full assessment completed." if profile == "full" else "Quick scan completed."
+        return action_redirect(request, f"/sessions/{session_id}", label)
 
     @app.post("/sessions/{session_id}/findings/{finding_id}/validate")
     def validate_finding(

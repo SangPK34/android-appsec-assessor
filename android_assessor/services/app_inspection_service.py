@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ class AppInspectionResult:
     limitations: tuple[str, ...]
     errors: tuple[str, ...]
     evidence: tuple[dict[str, Any], ...]
+    phase_timings: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +60,7 @@ class AppInspectionResult:
             "limitations": list(self.limitations),
             "errors": list(self.errors),
             "evidence": list(self.evidence),
+            "phase_timings": dict(self.phase_timings),
         }
 
 
@@ -114,6 +117,8 @@ class AppInspectionService:
         session_paths = self.repository.paths_for(record.session_id)
         errors: list[str] = []
         limitations: list[str] = []
+        phase_timings: dict[str, float] = {}
+        phase_started = time.perf_counter()
         steps = {
             "package_metadata": "pending",
             "apk_pull": "pending",
@@ -145,7 +150,12 @@ class AppInspectionService:
                 sensitive=True,
             )
             steps["package_metadata"] = "completed"
+            phase_timings["device_inspection"] = round(
+                (time.perf_counter() - phase_started) * 1000,
+                2,
+            )
 
+            phase_started = time.perf_counter()
             artifacts = ApkPuller(self.paths, adb).pull(
                 record.serial,
                 metadata.apk_paths,
@@ -163,6 +173,10 @@ class AppInspectionService:
                     redacted=False,
                 )
             steps["apk_pull"] = "completed"
+            phase_timings["apk_acquisition"] = round(
+                (time.perf_counter() - phase_started) * 1000,
+                2,
+            )
             base_artifact = next(
                 (artifact for artifact in artifacts if artifact.role == "base"),
                 artifacts[0],
@@ -180,6 +194,7 @@ class AppInspectionService:
                 steps["aapt2_manifest"] = "skipped"
                 limitations.append("aapt2 is unavailable; manifest inspection was skipped.")
             else:
+                phase_started = time.perf_counter()
                 try:
                     aapt_result = Aapt2Inspector(
                         aapt2.path,
@@ -261,6 +276,10 @@ class AppInspectionService:
                         redacted=True,
                     )
                     steps["aapt2_manifest"] = "completed"
+                    phase_timings["manifest"] = round(
+                        (time.perf_counter() - phase_started) * 1000,
+                        2,
+                    )
                 except (AndroidAssessorError, OSError, ValueError) as exc:
                     steps["aapt2_manifest"] = "error"
                     errors.append(redact_text(str(exc))[:500])
@@ -278,6 +297,7 @@ class AppInspectionService:
                     "Java or apksigner.jar is unavailable; signature inspection was skipped."
                 )
             else:
+                phase_started = time.perf_counter()
                 try:
                     signature_result = ApkSignatureInspector(
                         java.path,
@@ -306,6 +326,10 @@ class AppInspectionService:
                     )
                     if signature_result.error:
                         errors.append(signature_result.error)
+                    phase_timings["signature"] = round(
+                        (time.perf_counter() - phase_started) * 1000,
+                        2,
+                    )
                 except (AndroidAssessorError, OSError, ValueError) as exc:
                     steps["apksigner"] = "error"
                     errors.append(redact_text(str(exc))[:500])
@@ -330,6 +354,7 @@ class AppInspectionService:
                 limitations=tuple(limitations),
                 errors=tuple(errors),
                 evidence=tuple(self.evidence.list(record.session_id)),
+                phase_timings=phase_timings,
             )
             write_json_atomic(
                 session_paths.app_json,

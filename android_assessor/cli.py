@@ -23,7 +23,7 @@ from .report import ReportService
 from .services.app_inspection_service import AppInspectionResult, AppInspectionService
 from .services.cleanup_service import CleanupService
 from .services.device_service import DeviceInspection, DeviceService
-from .services.scan_service import ScanResult, ScanService
+from .services.scan_service import ScanProfile, ScanResult, ScanService
 from .services.session_service import SessionService
 from .services.validation_service import ValidationService
 from .session import SessionRepository
@@ -78,10 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan = commands.add_parser(
         "scan",
-        help="Run the bounded end-to-end MVP scan and generate a report.",
+        help="Run a quick or full assessment and generate a report.",
     )
-    scan.add_argument("--package", required=True)
+    scan.add_argument("--package")
     scan.add_argument("--serial")
+    scan.add_argument("--session", dest="session_id")
+    scan.add_argument("--profile", choices=[item.value for item in ScanProfile], default="quick")
+    scan.add_argument("--runtime-seconds", type=int, default=None)
     scan.add_argument("--json", action="store_true", dest="as_json")
     scan.add_argument("--output", type=Path)
 
@@ -283,7 +286,21 @@ def _print_scan(result: ScanResult) -> None:
 
 
 def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
-    result = ScanService(context).scan(package=args.package, serial=args.serial)
+    if bool(args.package) == bool(args.session_id):
+        raise AndroidAssessorError("Provide exactly one of --package or --session.")
+    service = ScanService(context)
+    if args.session_id:
+        result = service.scan_session(
+            args.session_id,
+            profile=args.profile,
+            runtime_seconds=args.runtime_seconds,
+        )
+    else:
+        result = service.scan(
+            package=args.package,
+            serial=args.serial,
+            profile=args.profile,
+        )
     payload = result.to_dict()
     _write_output(payload, args.output, context.paths)
     if args.as_json:

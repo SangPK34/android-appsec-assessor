@@ -4,7 +4,7 @@
 <div id="page-content">
   <header class="page-heading">
     <div>
-      <p class="eyebrow">MVP workflow</p>
+      <p class="eyebrow">Assessment workflow</p>
       <h1>Scan session</h1>
       {% if detail %}<p><code>{{ detail.session.package }}</code> · <code>{{ detail.session.session_id }}</code></p>{% endif %}
     </div>
@@ -22,6 +22,15 @@
     <article class="metric"><span>Cleanup</span><strong>{{ 'pending' if detail.session.pending_cleanup else 'clean' }}</strong><small>success={{ detail.session.cleanup_success }}</small></article>
   </section>
 
+  {% if detail.scan and detail.scan.dynamic_steps %}
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Assessment phases</h2><p>Profile: {{ detail.scan.profile or detail.scan.dynamic_steps.profile or 'quick' }}</p></div></div>
+    <div class="facts manifest-facts">
+      {% for phase, status in detail.scan.dynamic_steps.items() if phase != 'profile' %}<div><dt>{{ phase }}</dt><dd><span class="status {{ status }}">{{ status }}</span></dd></div>{% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
   <section class="panel">
     <div class="panel-heading">
       <div><h2>Actions</h2><p>Mỗi modifying action được serialize theo device và ghi cleanup ledger.</p></div>
@@ -29,7 +38,10 @@
     </div>
     <div class="actions panel-actions">
       <form method="post" action="/sessions/{{ detail.session.session_id }}/scan" hx-post="/sessions/{{ detail.session.session_id }}/scan" hx-target="body" hx-select="body" hx-swap="outerHTML" hx-indicator="closest .panel" hx-disabled-elt="find button">
-        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button" type="submit">Start scan</button>
+        <input type="hidden" name="action_token" value="{{ action_token }}"><input type="hidden" name="profile" value="quick"><button class="button" type="submit">Quick Scan</button>
+      </form>
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/scan" hx-post="/sessions/{{ detail.session.session_id }}/scan" hx-target="body" hx-select="body" hx-swap="outerHTML" hx-indicator="closest .panel" hx-disabled-elt="find button">
+        <input type="hidden" name="action_token" value="{{ action_token }}"><input type="hidden" name="profile" value="full"><button class="button" type="submit">Full Assessment</button>
       </form>
       {% if not detail.traffic or detail.traffic.status != 'running' %}
       <form method="post" action="/sessions/{{ detail.session.session_id }}/traffic/start" hx-post="/sessions/{{ detail.session.session_id }}/traffic/start" hx-swap="none">
@@ -42,11 +54,11 @@
       {% endif %}
       {% if not detail.frida or detail.frida.status != 'running' %}
       <form method="post" action="/sessions/{{ detail.session.session_id }}/frida/start" hx-post="/sessions/{{ detail.session.session_id }}/frida/start" hx-swap="none">
-        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Start Frida</button>
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Start runtime observation</button>
       </form>
       {% else %}
       <form method="post" action="/sessions/{{ detail.session.session_id }}/frida/stop" hx-post="/sessions/{{ detail.session.session_id }}/frida/stop" hx-swap="none">
-        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Stop Frida</button>
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Stop and analyze</button>
       </form>
       {% endif %}
       <form method="post" action="/sessions/{{ detail.session.session_id }}/report" hx-post="/sessions/{{ detail.session.session_id }}/report" hx-swap="none">
@@ -64,12 +76,12 @@
     <div class="panel-heading"><div><h2>Runtime state</h2><p>Traffic và Frida chỉ dừng process do framework sở hữu.</p></div></div>
     <div class="facts manifest-facts">
       <div><dt>Traffic</dt><dd><span class="status {{ detail.traffic.status if detail.traffic else 'skipped' }}">{{ detail.traffic.status if detail.traffic else 'not started' }}</span>{% if detail.traffic and detail.traffic.error %}<small>{{ detail.traffic.error }}</small>{% endif %}</dd></div>
-      <div><dt>Frida</dt><dd><span class="status {{ detail.frida.status if detail.frida else 'skipped' }}">{{ detail.frida.status if detail.frida else 'not started' }}</span>{% if detail.frida and detail.frida.error %}<small>{{ detail.frida.error }}</small>{% endif %}</dd></div>
+      <div><dt>Observer</dt><dd><span class="status {{ detail.frida.status if detail.frida else 'skipped' }}">{{ 'ready' if detail.frida and detail.frida.status == 'running' else detail.frida.status if detail.frida else 'not started' }}</span>{% if detail.frida %}<small>started={{ detail.frida.started_at or '—' }} · events={{ detail.frida.runtime_event_count or 0 }} · mode={{ detail.frida.mode or '—' }}</small>{% endif %}{% if detail.runtime_categories %}<small>categories={{ detail.runtime_categories|join(', ') }}</small>{% endif %}{% if detail.frida and detail.frida.error %}<small>{{ detail.frida.error }}</small>{% endif %}</dd></div>
     </div>
   </section>
 
   <section class="panel">
-    <div class="panel-heading"><div><h2>Findings</h2><p>Năm rule MVP; mapping chưa xác minh được giữ nguyên <code>mapping_pending</code>.</p></div></div>
+    <div class="panel-heading"><div><h2>Findings</h2><p>Security findings và runtime observations được đánh giá theo evidence đã thu thập.</p></div></div>
     {% if detail.findings %}
     <div class="table-wrap"><table>
       <thead><tr><th>Rule</th><th>Status</th><th>Finding</th><th>Method</th><th>Validation</th><th>Action</th></tr></thead>
@@ -91,7 +103,7 @@
       </tbody>
     </table></div>
     {% else %}
-    <div class="empty-state"><h3>Chưa chạy rules</h3><p>Nhấn Start scan để inspect dynamic startup, tạo findings và report.</p></div>
+    <div class="empty-state"><h3>Chưa chạy rules</h3><p>Chọn Quick Scan hoặc Full Assessment để tạo findings và report.</p></div>
     {% endif %}
   </section>
 

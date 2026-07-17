@@ -21,23 +21,36 @@
   <h2>Executive summary</h2>
   <p>Package <code>{{ report.session.package }}</code> on {{ report.device.device.model or 'unknown device' if report.device else 'unknown device' }}.</p>
   <table>
-    <tr><th>Rules</th><th>Confirmed</th><th>Potential</th><th>Pass</th><th>Inconclusive / skipped / error</th></tr>
-    <tr><td>{{ report.summary.total }}</td><td>{{ report.summary.confirmed }}</td><td>{{ report.summary.potential }}</td><td>{{ report.summary.pass }}</td><td>{{ report.summary.other }}</td></tr>
+    <tr><th>Rules evaluated</th><th>Confirmed</th><th>Potential</th><th>Pass</th><th>Inconclusive</th><th>Skipped</th><th>Error</th></tr>
+    <tr><td>{{ report.summary.total }}</td><td>{{ report.summary.confirmed }}</td><td>{{ report.summary.potential }}</td><td>{{ report.summary.pass }}</td><td>{{ report.summary.inconclusive }}</td><td>{{ report.summary.skipped }}</td><td>{{ report.summary.error }}</td></tr>
   </table>
+  <p>Security findings: {{ report.summary.security_findings }} · Runtime observations: {{ report.summary.runtime_observations }} · Duration: {{ report.summary.assessment_duration_ms }} ms.</p>
 
   <h2>Scope and runtime</h2>
   <table>
     <tr><th>Package</th><td><code>{{ report.session.package }}</code></td></tr>
     <tr><th>Device</th><td>{{ report.session.serial_masked }}</td></tr>
     <tr><th>App version</th><td>{{ report.app.metadata.version_name if report.app and report.app.metadata else '-' }}</td></tr>
-    <tr><th>Root used by findings</th><td>{{ report.root_used }}</td></tr>
     <tr><th>Root available</th><td>{{ report.root_available }}</td></tr>
-    <tr><th>Frida used by findings</th><td>{{ report.frida_used }}</td></tr>
+    <tr><th>Root used in session</th><td>{{ report.root_used_in_session }}</td></tr>
+    <tr><th>Root used by findings</th><td>{{ report.root_used_by_findings }}</td></tr>
     <tr><th>Frida available</th><td>{{ report.frida_available }}</td></tr>
+    <tr><th>Frida used in session</th><td>{{ report.frida_used_in_session }}</td></tr>
+    <tr><th>Frida used by findings</th><td>{{ report.frida_used_by_findings }}</td></tr>
+    <tr><th>Environment type</th><td>{{ report.experiment.environment_type }}</td></tr>
     <tr><th>Evidence source</th><td>{{ report.evidence_source }}</td></tr>
     <tr><th>Device validation</th><td>{{ report.device_validation_status }}</td></tr>
     <tr><th>Cleanup</th><td>{{ report.cleanup.status }}; success={{ report.cleanup.success }}; pending={{ report.cleanup.pending }}</td></tr>
   </table>
+
+  <h2>Module execution coverage</h2>
+  <table>
+    <thead><tr><th>Module</th><th>Planned</th><th>Executed</th><th>Result</th><th>Duration</th><th>Skip reason</th></tr></thead>
+    <tbody>{% for item in report.module_execution_coverage %}<tr><td>{{ item.module }}</td><td>{{ item.planned }}</td><td>{{ item.executed }}</td><td>{{ item.result }}</td><td>{{ item.duration_ms or '-' }} ms</td><td>{{ item.skip_reason or '-' }}</td></tr>{% endfor %}</tbody>
+  </table>
+
+  <h2>Runtime observations</h2>
+  {% if report.runtime_observations %}<table><thead><tr><th>Rule</th><th>Status</th><th>Title</th><th>Evidence</th></tr></thead><tbody>{% for finding in report.runtime_observations %}<tr><td><code>{{ finding.rule_id }}</code></td><td>{{ finding.status }}</td><td>{{ finding.title }}</td><td>{% for evidence_id in finding.evidence_ids %}<code>{{ evidence_id }}</code> {% endfor %}</td></tr>{% endfor %}</tbody></table>{% else %}<p>No runtime observation rule output was recorded.</p>{% endif %}
 
   <h2>Findings and coverage</h2>
   <table>

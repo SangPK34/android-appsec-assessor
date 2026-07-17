@@ -113,6 +113,69 @@ def _fixture_or_physical(
     return "physical"
 
 
+def _environment_type(
+    record_serial: str,
+    device: dict[str, Any] | None,
+    provenance: str,
+) -> str:
+    if provenance == "fixture":
+        return "simulated"
+    info = device.get("device", {}) if isinstance(device, dict) else {}
+    model = str(info.get("model", "")).casefold() if isinstance(info, dict) else ""
+    if record_serial.startswith("emulator-") or "sdk_gphone" in model or "emulator" in model:
+        return "emulator"
+    return "physical_device"
+
+
+def _capability_used_by_security_findings(
+    findings: list[dict[str, Any]],
+    capability_key: str,
+) -> bool:
+    return any(
+        bool(item.get(capability_key))
+        and not bool((item.get("details") or {}).get("observation_only"))
+        for item in findings
+    )
+
+
+def _root_coverage_aliases(
+    coverage: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project newer analyzer rule IDs onto the stable root-focused catalog."""
+    observed = {str(item.get("test_id")): item for item in coverage}
+    findings_by_rule = {str(item.get("rule_id")): item for item in findings}
+    aliases = {
+        "ASL-ROOT-STORAGE": ("ASL-RUNTIME-STORAGE",),
+        "ASL-ROOT-CRYPTO": ("CRYPTO-ECB", "CRYPTO-WEAK-ALGORITHM"),
+        "ASL-ROOT-DETECTION": ("ASL-RUNTIME-ROOT",),
+    }
+    output = list(coverage)
+    for alias, targets in aliases.items():
+        if alias in observed:
+            continue
+        target = next(
+            (
+                findings_by_rule.get(rule_id)
+                for rule_id in targets
+                if rule_id in findings_by_rule
+            ),
+            None,
+        )
+        if target is None:
+            continue
+        output.append(
+            {
+                "test_id": alias,
+                "physical_validation_status": str(
+                    target.get("device_validation_status", "UNVERIFIED")
+                ),
+                "finding_status": str(target.get("status", "inconclusive")),
+            }
+        )
+    return output
+
+
 def _validation_type(finding: dict[str, Any]) -> str:
     validation = finding.get("validation")
     if isinstance(validation, dict):
@@ -153,6 +216,7 @@ def _normalize_findings(
     root_available: bool,
     frida_available: bool,
     provenance: str,
+    evidence_source: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     evidence_by_id = {
         str(item.get("evidence_id")): item
@@ -191,7 +255,7 @@ def _normalize_findings(
                     if not finding.get("evidence_ids")
                     else "fixture"
                     if provenance == "fixture"
-                    else "physical_device"
+                    else evidence_source or "physical_device"
                 ),
                 "evidence_sources": evidence_sources,
             }
@@ -302,7 +366,10 @@ class ReportService:
         paths = self.sessions.paths_for(record.session_id)
         findings = [item.to_dict() for item in self.findings.list(record.session_id)]
         evidence = self.evidence.list(record.session_id)
-        counts = {name: 0 for name in ("confirmed", "potential", "pass")}
+        counts = {
+            name: 0
+            for name in ("confirmed", "potential", "pass", "inconclusive", "skipped", "error")
+        }
         for finding in findings:
             status = str(finding["status"])
             if status in counts:
@@ -323,22 +390,195 @@ class ReportService:
             root_metadata.get("root_mode")
             or ("su_root" if root_available else "none")
         )
-        frida_available = _capability_available(
-            device, "FRIDA_CLIENT"
-        ) and _capability_available(device, "FRIDA_SERVER")
+        frida_state = _optional_json(paths.frida_dir / "state.json", self.paths.root)
+        private_storage = _optional_json(
+            paths.redacted_dir / "storage" / "private-storage.json", self.paths.root
+        )
+        frida_available = _capability_available(device, "FRIDA_CLIENT") and (
+            _capability_available(device, "FRIDA_SERVER") or frida_state is not None
+        )
+        root_used_in_session = bool(
+            private_storage
+            or (frida_state and frida_state.get("server_started_by_framework") is True)
+        )
+        frida_used_in_session = bool(
+            frida_state and frida_state.get("server_started_by_framework") is True
+        )
+        environment_type = _environment_type(record.serial, device, provenance)
+        report_evidence_source = (
+            "fixture"
+            if provenance == "fixture"
+            else "emulator"
+            if environment_type == "emulator"
+            else "physical_device"
+        )
         findings, coverage = _normalize_findings(
             findings,
             evidence,
             root_available=root_available,
             frida_available=frida_available,
             provenance=provenance,
+            evidence_source=report_evidence_source,
         )
-        coverage = merge_root_coverage(coverage)
+        coverage = merge_root_coverage(_root_coverage_aliases(coverage, findings))
         device_info = (
             device.get("device", {})
             if isinstance(device, dict) and isinstance(device.get("device"), dict)
             else {}
         )
+        app_timings = app.get("phase_timings", {}) if isinstance(app, dict) else {}
+        scan_timings = {
+            **(
+                app_timings
+                if isinstance(app_timings, dict)
+                else {}
+            ),
+            **(
+                scan.get("phase_timings", {})
+                if isinstance(scan, dict)
+                else {}
+            ),
+        }
+        scan_steps = scan.get("dynamic_steps", {}) if isinstance(scan, dict) else {}
+        app_steps = app.get("steps", {}) if isinstance(app, dict) else {}
+        scan_profile = str(scan.get("profile", "quick")) if isinstance(scan, dict) else "quick"
+        planned_modules = {
+            "device_inspection": ("preflight", "Device and capability preflight."),
+            "apk_acquisition": ("apk_acquisition", "Shared APK acquisition."),
+            "manifest": ("manifest", "Shared manifest parsing."),
+            "signature": ("signature", "APK signature verification."),
+            "static_rules": ("rule_evaluation", "Static rule evaluation."),
+            "logcat": ("logcat", "Bounded target-process logcat."),
+            "private_storage": ("storage", "Bounded private-storage analysis."),
+            "frida": ("frida_start", "Frida observer lifecycle."),
+            "runtime_observation": ("runtime_observation", "Runtime event observation."),
+            "traffic": ("traffic", "Scoped traffic capture."),
+            "report": ("report", "Report generation."),
+        }
+        modules: list[dict[str, Any]] = []
+        module_evidence_prefixes = {
+            "device_inspection": ("device_", "package_metadata"),
+            "apk_acquisition": ("apk",),
+            "manifest": ("manifest_", "apk_badging"),
+            "signature": ("apk_signature",),
+            "static_rules": ("manifest_", "apk_badging", "apk_signature"),
+            "logcat": ("target_logcat",),
+            "private_storage": ("private_storage_",),
+            "frida": ("frida_",),
+            "runtime_observation": ("frida_events", "target_logcat"),
+            "traffic": ("traffic_",),
+            "report": ("report_", "experiment_results_csv"),
+        }
+        for module, (timing_key, description) in planned_modules.items():
+            planned = scan_profile == "full" or module not in {
+                "private_storage",
+                "frida",
+                "runtime_observation",
+                "traffic",
+            }
+            app_step = {
+                "apk_acquisition": "apk_pull",
+                "manifest": "aapt2_manifest",
+                "signature": "apksigner",
+            }.get(module)
+            executed = (app_step is not None and app_steps.get(app_step) == "completed") or (
+                timing_key in scan_timings
+            ) or (
+                module == "frida" and scan_steps.get("frida_observation") not in {None, "skipped"}
+            ) or (
+                module == "report"
+            )
+            skipped_step = {
+                "traffic": "traffic_capture",
+                "frida": "frida_observation",
+                "private_storage": "private_storage",
+                "logcat": "target_logcat",
+            }.get(module, "")
+            skipped = scan_steps.get(skipped_step) == "skipped" or (
+                app_step is not None
+                and app_steps.get(app_step) in {"skipped", "error"}
+            )
+            limitation_values = []
+            if isinstance(app, dict) and isinstance(app.get("limitations"), list):
+                limitation_values.extend(str(item) for item in app["limitations"])
+            if isinstance(app, dict) and isinstance(app.get("errors"), list):
+                limitation_values.extend(str(item) for item in app["errors"])
+            if isinstance(scan, dict) and isinstance(scan.get("limitations"), list):
+                limitation_values.extend(str(item) for item in scan["limitations"])
+            module_terms = {
+                "apk_acquisition": ("apk",),
+                "manifest": ("manifest", "aapt2"),
+                "signature": ("signature", "apksigner"),
+                "logcat": ("logcat",),
+                "private_storage": ("storage",),
+                "frida": ("frida",),
+                "traffic": ("traffic", "proxy"),
+            }
+            evidence_count = (
+                sum(
+                    1
+                    for item in evidence
+                    if str(item.get("evidence_type", "")).startswith(
+                        module_evidence_prefixes[module]
+                    )
+                )
+                if executed
+                else 0
+            )
+            skip_reason = (
+                next(
+                    (
+                        item
+                        for item in limitation_values
+                        if any(
+                            term in str(item).casefold()
+                            for term in module_terms.get(module, (module.replace("_", " "),))
+                        )
+                    ),
+                    None,
+                )
+                if skipped
+                else None
+            )
+            modules.append(
+                {
+                    "module": module,
+                    "planned": planned,
+                    "executed": bool(executed),
+                    "result": (
+                        "not_planned"
+                        if not planned
+                        else "skipped"
+                        if skipped
+                        else "completed"
+                        if executed
+                        else "not_executed"
+                    ),
+                    "duration_ms": scan_timings.get(timing_key),
+                    "evidence": evidence_count,
+                    "skip_reason": skip_reason,
+                    "description": description,
+                }
+            )
+        security_findings = [
+            item for item in findings
+            if not bool((item.get("details") or {}).get("observation_only"))
+        ]
+        root_used_by_findings = _capability_used_by_security_findings(findings, "root_used")
+        frida_used_by_findings = _capability_used_by_security_findings(findings, "frida_used")
+        observations = [
+            item
+            for item in findings
+            if bool((item.get("details") or {}).get("observation_only"))
+            or str(item.get("rule_id", "")).startswith("CRYPTO-")
+        ]
+        experiment = {
+            "fixture_or_physical": provenance,
+            "environment_type": environment_type,
+            "eligible_for_empirical_metrics": provenance == "physical",
+        }
+        if provenance != "fixture":
+            experiment["physical_device_validation"] = "UNVERIFIED"
         payload: dict[str, Any] = {
             "schema_version": 2,
             "generated_at": datetime.now(UTC).isoformat(),
@@ -349,41 +589,42 @@ class ReportService:
             "scan": scan,
             "traffic": _optional_json(paths.traffic_dir / "state.json", self.paths.root),
             "frida": _optional_json(paths.frida_dir / "state.json", self.paths.root),
-            "private_storage": _optional_json(
-                paths.redacted_dir / "storage" / "private-storage.json",
-                self.paths.root,
-            ),
+            "private_storage": private_storage,
             "findings": findings,
             "evidence": evidence,
             "summary": {
                 "total": len(findings),
                 **counts,
-                "other": len(findings) - sum(counts.values()),
+                "other": 0,
+                "security_findings": len(security_findings),
+                "runtime_observations": len(observations),
+                "modules_executed": sum(1 for item in modules if item["executed"]),
+                "modules_skipped": sum(1 for item in modules if item["result"] == "skipped"),
+                "assessment_duration_ms": sum(
+                    float(value)
+                    for value in scan_timings.values()
+                    if isinstance(value, (int, float))
+                ),
             },
-            "root_used": any(bool(item.get("root_used")) for item in findings),
+            "root_used": root_used_in_session,
             "root_available": root_available,
             "root_mode": root_mode,
             "root_probe_status": root_metadata.get("root_probe_status", "unknown"),
             "root_required": any(bool(item.get("root_required")) for item in findings),
-            "frida_used": any(bool(item.get("frida_used")) for item in findings),
+            "root_used_in_session": root_used_in_session,
+            "root_used_by_findings": root_used_by_findings,
+            "frida_used": frida_used_in_session,
+            "frida_used_in_session": frida_used_in_session,
+            "frida_used_by_findings": frida_used_by_findings,
             "frida_available": frida_available,
             "frida_required": any(bool(item.get("frida_required")) for item in findings),
             "device_validation_status": _aggregate_physical_status(coverage),
-            "evidence_source": (
-                "none"
-                if not evidence
-                else "fixture"
-                if provenance == "fixture"
-                else "physical_device"
-            ),
+            "evidence_source": "none" if not evidence else report_evidence_source,
+            "runtime_observations": observations,
+            "module_execution_coverage": modules,
+            "module_timing": scan_timings,
             "root_vs_non_root_coverage": coverage,
-            "experiment": {
-                "fixture_or_physical": provenance,
-                "environment_type": (
-                    "simulated" if provenance == "fixture" else "physical_android"
-                ),
-                "eligible_for_empirical_metrics": provenance == "physical",
-            },
+            "experiment": experiment,
             "cleanup": {
                 "status": record.status.value,
                 "success": record.cleanup_success,

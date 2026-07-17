@@ -38,6 +38,8 @@ _REPORT_IDENTIFIER_KEYS = {
     "evidence_id",
     "related_findings",
     "validation_type",
+    "root_used_in_session",
+    "frida_used_in_session",
 }
 _AUTH_PATTERN = re.compile(
     r"(?i)\b(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"

@@ -412,6 +412,9 @@ def operations_from_frida_events(
             continue
         payload = dict(arguments[0])
         payload["canary_match"] = bool(getattr(event, "canary_match", False))
+        for digest_name in ("key_sha256", "iv_sha256"):
+            if payload.get(digest_name) == "<redacted>":
+                payload[digest_name] = None
         try:
             operations.append(
                 CryptoOperation.from_mapping(
