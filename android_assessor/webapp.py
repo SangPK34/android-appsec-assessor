@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from contextlib import AbstractContextManager
@@ -27,6 +28,8 @@ from .errors import AndroidAssessorError, ConfigurationError, DeviceBusyError
 from .paths import ProjectPaths
 from .redaction import redact_text
 from .web_service import WebBackend, WebBackendProtocol
+
+logger = logging.getLogger(__name__)
 
 
 class WebInstanceLock(AbstractContextManager["WebInstanceLock"]):
@@ -376,14 +379,68 @@ def create_app(
         submitted_token: Annotated[str, Form(alias="action_token")],
     ) -> Response:
         verify_action_token(submitted_token)
+        is_hx_request = request.headers.get("HX-Request", "").casefold() == "true"
+
+        def scan_context() -> tuple[str, str]:
+            try:
+                detail = service.session_detail(session_id)
+                session = detail.get("session")
+                if isinstance(session, dict):
+                    device = str(session.get("serial_masked") or "unknown")[:128]
+                    package = str(session.get("package") or "unknown")[:255]
+                    return device, package
+            except (AndroidAssessorError, OSError, ValueError):
+                pass
+            return "unknown", "unknown"
+
         try:
             service.scan_session(session_id)
         except (AndroidAssessorError, OSError, ValueError) as exc:
+            safe_error = expected_error(exc)
+            device, package = scan_context()
+            category = type(exc).__name__
+            message = (
+                f"Scan failed operation=scan device={device} package={package} "
+                f"session={session_id} category={category}: {safe_error}"
+            )
+            logger.exception(
+                "web scan failed operation=scan device=%s package=%s session=%s "
+                "error_category=%s error=%s",
+                device,
+                package,
+                session_id,
+                category,
+                safe_error,
+            )
             return render_session_detail(
                 request,
                 session_id,
-                error=expected_error(exc),
-                status_code=409 if isinstance(exc, DeviceBusyError) else 400,
+                error=message,
+                status_code=(
+                    200
+                    if is_hx_request
+                    else 409
+                    if isinstance(exc, DeviceBusyError)
+                    else 400
+                ),
+            )
+        except Exception:
+            device, package = scan_context()
+            logger.exception(
+                "web scan failed operation=scan device=%s package=%s session=%s "
+                "error_category=internal_error",
+                device,
+                package,
+                session_id,
+            )
+            return render_session_detail(
+                request,
+                session_id,
+                error=(
+                    f"Scan failed operation=scan device={device} package={package} "
+                    f"session={session_id} category=internal_error: internal error."
+                ),
+                status_code=200 if is_hx_request else 500,
             )
         return action_redirect(request, f"/sessions/{session_id}", "MVP scan completed.")
 

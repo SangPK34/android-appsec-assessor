@@ -25,7 +25,7 @@ from .errors import (
 )
 from .evidence import EvidenceRepository
 from .host_process import ProcessIdentity, WindowsProcessController
-from .redaction import redact_text
+from .redaction import redact_data, redact_text
 from .scope import load_scope
 from .session import (
     CleanupActionStatus,
@@ -77,6 +77,20 @@ def load_traffic_events(path: Path) -> list[dict[str, Any]]:
     except (OSError, json.JSONDecodeError) as exc:
         raise ProxyError(f"Could not parse traffic events: {exc}") from exc
     return events
+
+
+def _redact_jsonl(value: str) -> str:
+    lines: list[str] = []
+    for line in value.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            lines.append(redact_text(line))
+        else:
+            lines.append(json.dumps(redact_data(payload), ensure_ascii=False))
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 class TrafficCaptureService:
@@ -485,7 +499,7 @@ class TrafficCaptureService:
                     if event_file.is_file():
                         write_text_atomic(
                             event_file,
-                            redact_text(
+                            _redact_jsonl(
                                 event_file.read_text(
                                     encoding="utf-8",
                                     errors="replace",

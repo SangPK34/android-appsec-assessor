@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
-from android_assessor.errors import DeviceSelectionError
+from android_assessor.errors import AndroidAssessorError, DeviceSelectionError
 from android_assessor.paths import ProjectPaths
 from android_assessor.webapp import create_app
 
@@ -14,6 +15,8 @@ class FakeWebBackend:
         self.selected_serials: list[str] = []
         self.selected_packages: list[str] = []
         self.cleaned_sessions: list[str] = []
+        self.scan_sessions: list[str] = []
+        self.scan_failure: Exception | None = None
         self.repair_starts = 0
 
     def environment(self) -> dict[str, Any]:
@@ -133,6 +136,41 @@ class FakeWebBackend:
             }
         ]
 
+    def app_inspection(self, session_id: str) -> dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "package": "com.example.lab",
+            "inspection_status": "completed",
+            "metadata": {"version_name": "1.0", "version_code": 1},
+            "apks": [],
+            "manifest": None,
+        }
+
+    def session_detail(self, session_id: str) -> dict[str, Any]:
+        return {
+            "session": {
+                "session_id": session_id,
+                "status": "active",
+                "serial_masked": "AB****7890",
+                "package": "com.example.lab",
+                "pending_cleanup": False,
+                "cleanup_success": None,
+            },
+            "app": {"inspection_status": "completed"},
+            "scan": None,
+            "traffic": None,
+            "frida": None,
+            "findings": [],
+            "evidence_count": 0,
+            "report_available": False,
+        }
+
+    def scan_session(self, session_id: str) -> dict[str, Any]:
+        self.scan_sessions.append(session_id)
+        if self.scan_failure is not None:
+            raise self.scan_failure
+        return {"session_id": session_id, "status": "completed"}
+
     def cleanup_session(self, session_id: str) -> dict[str, Any]:
         self.cleaned_sessions.append(session_id)
         return {"success": True, "session_id": session_id}
@@ -222,6 +260,88 @@ def test_htmx_package_selection_returns_safe_local_redirect() -> None:
     assert response.status_code == 204
     assert response.headers["hx-redirect"].startswith("/applications?notice=")
     assert backend.selected_packages == ["com.example.lab"]
+
+
+def test_app_scan_form_has_visible_progress_and_error_swap_contract() -> None:
+    client, _backend = make_client()
+    session_id = "20260717-021530-a8f4c2"
+
+    response = client.get(f"/sessions/{session_id}/app")
+
+    assert response.status_code == 200
+    assert "Start MVP scan" in response.text
+    assert f'hx-post="/sessions/{session_id}/scan"' in response.text
+    assert 'hx-target="body"' in response.text
+    assert 'hx-select="body"' in response.text
+    assert 'hx-swap="outerHTML"' in response.text
+    assert 'hx-disabled-elt="find button"' in response.text
+    assert 'id="scan-feedback"' in response.text
+    assert "Starting scan" in response.text
+
+
+def test_scan_success_uses_single_backend_call_and_htmx_redirect() -> None:
+    client, backend = make_client()
+    session_id = "20260717-021530-a8f4c2"
+
+    response = client.post(
+        f"/sessions/{session_id}/scan",
+        data={"action_token": client.app.state.action_token},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 204
+    assert response.headers["hx-redirect"] == f"/sessions/{session_id}?notice=MVP+scan+completed."
+    assert backend.scan_sessions == [session_id]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "Scope denied for action inspect.",
+        "Device offline.",
+        "Package does not exist.",
+        "backend scan exception",
+    ],
+)
+def test_scan_failure_is_visible_to_htmx(
+    failure: str,
+) -> None:
+    client, backend = make_client()
+    backend.scan_failure = AndroidAssessorError(failure)
+    session_id = "20260717-021530-a8f4c2"
+
+    response = client.post(
+        f"/sessions/{session_id}/scan",
+        data={"action_token": client.app.state.action_token},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 200
+    assert failure in response.text
+    assert "operation=scan" in response.text
+    assert "device=AB****7890" in response.text
+    assert "package=com.example.lab" in response.text
+    assert f"session={session_id}" in response.text
+    assert 'role="alert"' in response.text
+    assert backend.scan_sessions == [session_id]
+
+
+def test_scan_unexpected_failure_is_safe_and_visible_to_htmx() -> None:
+    client, backend = make_client()
+    backend.scan_failure = RuntimeError("fixture internal detail")
+    session_id = "20260717-021530-a8f4c2"
+
+    response = client.post(
+        f"/sessions/{session_id}/scan",
+        data={"action_token": client.app.state.action_token},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 200
+    assert "category=internal_error" in response.text
+    assert "internal error." in response.text
+    assert "fixture internal detail" not in response.text
+    assert 'role="alert"' in response.text
 
 
 def test_cleanup_and_repair_are_fixed_token_protected_actions() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -302,7 +303,7 @@ def test_traffic_stop_keeps_raw_artifacts_and_creates_redacted_copies(
     raw_secret = "custom-traffic-credential"
     (session_paths.root / state.flow_path).write_bytes(b"raw-flow")
     (session_paths.root / state.events_path).write_text(
-        f'{{"X-Lab-Credential":"{raw_secret}"}}\n',
+        f'{{"X-Lab-Credential":"{raw_secret}","sensitive_query_keys":["access_token"]}}\n',
         encoding="utf-8",
     )
     raw_stdout = session_paths.raw_dir / "traffic" / "mitmdump.stdout.log"
@@ -321,6 +322,10 @@ def test_traffic_stop_keeps_raw_artifacts_and_creates_redacted_copies(
     assert raw_secret not in (session_paths.root / state.events_path).read_text(
         encoding="utf-8"
     )
+    events = json.loads(
+        (session_paths.root / state.events_path).read_text(encoding="utf-8")
+    )
+    assert events["sensitive_query_keys"] == ["access_token"]
     evidence = service.evidence.list(session_id)
     raw = next(item for item in evidence if item["evidence_type"] == "traffic_flow")
     redacted = next(

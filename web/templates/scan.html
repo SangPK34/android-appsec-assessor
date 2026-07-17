@@ -25,10 +25,10 @@
   <section class="panel">
     <div class="panel-heading">
       <div><h2>Actions</h2><p>Mỗi modifying action được serialize theo device và ghi cleanup ledger.</p></div>
-      <span class="htmx-indicator">Đang chạy, đừng spam nút như noob…</span>
+      <span class="htmx-indicator">Đang xử lý scan…</span>
     </div>
     <div class="actions panel-actions">
-      <form method="post" action="/sessions/{{ detail.session.session_id }}/scan" hx-post="/sessions/{{ detail.session.session_id }}/scan" hx-swap="none" hx-indicator="closest .panel">
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/scan" hx-post="/sessions/{{ detail.session.session_id }}/scan" hx-target="body" hx-select="body" hx-swap="outerHTML" hx-indicator="closest .panel" hx-disabled-elt="find button">
         <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button" type="submit">Start scan</button>
       </form>
       {% if not detail.traffic or detail.traffic.status != 'running' %}

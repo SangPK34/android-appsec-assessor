@@ -10,10 +10,11 @@
     </div>
     <div class="actions">
       {% if inspection %}
-      <form method="post" action="/sessions/{{ inspection.session_id }}/scan" hx-post="/sessions/{{ inspection.session_id }}/scan" hx-swap="none">
+      <form method="post" action="/sessions/{{ inspection.session_id }}/scan" hx-post="/sessions/{{ inspection.session_id }}/scan" hx-target="body" hx-select="body" hx-swap="outerHTML" hx-indicator="#scan-feedback" hx-disabled-elt="find button">
         <input type="hidden" name="action_token" value="{{ action_token }}">
         <button class="button" type="submit">Start MVP scan</button>
       </form>
+      <span id="scan-feedback" class="htmx-indicator" role="status" aria-live="polite">Starting scan…</span>
       <a class="button secondary" href="/sessions/{{ inspection.session_id }}">Open session</a>
       {% endif %}
       <a class="button secondary" href="/applications">Back to applications</a>
