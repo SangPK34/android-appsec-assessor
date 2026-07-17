@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Android Security Lab · {{ report.session.session_id }}</title>
+  <style>
+    body { font: 15px/1.5 system-ui, sans-serif; color: #172033; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; }
+    h1, h2 { color: #0f172a; } table { width: 100%; border-collapse: collapse; margin: 1rem 0 2rem; }
+    th, td { text-align: left; vertical-align: top; border: 1px solid #d8dee9; padding: .55rem; }
+    th { background: #f1f5f9; } code { overflow-wrap: anywhere; }
+    .confirmed { color: #b91c1c; } .potential { color: #a16207; } .pass { color: #15803d; }
+    .meta { color: #526174; } .warning { background: #fff7ed; padding: .8rem; border-left: 4px solid #f97316; }
+  </style>
+</head>
+<body>
+  <h1>Android Security Lab Report</h1>
+  <p class="meta">Generated {{ report.generated_at }} · Session <code>{{ report.session.session_id }}</code></p>
+  <p class="warning">Raw evidence may contain sensitive lab data. HTML values are redacted or bounded, but review before sharing.</p>
+
+  <h2>Executive summary</h2>
+  <p>Package <code>{{ report.session.package }}</code> on {{ report.device.device.model or 'unknown device' if report.device else 'unknown device' }}.</p>
+  <table>
+    <tr><th>Rules</th><th>Confirmed</th><th>Potential</th><th>Pass</th><th>Inconclusive / skipped / error</th></tr>
+    <tr><td>{{ report.summary.total }}</td><td>{{ report.summary.confirmed }}</td><td>{{ report.summary.potential }}</td><td>{{ report.summary.pass }}</td><td>{{ report.summary.other }}</td></tr>
+  </table>
+
+  <h2>Scope and runtime</h2>
+  <table>
+    <tr><th>Package</th><td><code>{{ report.session.package }}</code></td></tr>
+    <tr><th>Device</th><td>{{ report.session.serial_masked }}</td></tr>
+    <tr><th>App version</th><td>{{ report.app.metadata.version_name if report.app and report.app.metadata else '-' }}</td></tr>
+    <tr><th>Root used by findings</th><td>{{ report.root_used }}</td></tr>
+    <tr><th>Frida used by findings</th><td>{{ report.frida_used }}</td></tr>
+    <tr><th>Cleanup</th><td>{{ report.cleanup.status }}; success={{ report.cleanup.success }}; pending={{ report.cleanup.pending }}</td></tr>
+  </table>
+
+  <h2>Findings and coverage</h2>
+  <table>
+    <thead><tr><th>Rule</th><th>Status</th><th>Title</th><th>Method</th><th>Validation</th><th>Evidence</th><th>Remediation</th></tr></thead>
+    <tbody>
+    {% for finding in report.findings %}
+      <tr>
+        <td><code>{{ finding.rule_id }}</code><br>{{ finding.severity }} / {{ finding.confidence }}</td>
+        <td class="{{ finding.status }}">{{ finding.status }}</td>
+        <td>{{ finding.title }}<br><small>{{ finding.description }}</small></td>
+        <td>{{ finding.analysis_type }}<br><small>root={{ finding.root_used }}, frida={{ finding.frida_used }}</small></td>
+        <td>{% if finding.validation %}{{ finding.validation.status }} · {{ finding.validation.validation_type }}<br>{{ finding.validation.summary }}{% else %}-{% endif %}</td>
+        <td>{% for evidence_id in finding.evidence_ids %}<code>{{ evidence_id }}</code><br>{% endfor %}</td>
+        <td>{{ finding.remediation }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Evidence index</h2>
+  <table>
+    <thead><tr><th>ID</th><th>Type</th><th>Path</th><th>SHA-256</th><th>Sensitive / redacted</th></tr></thead>
+    <tbody>
+    {% for item in report.evidence %}
+      <tr><td><code>{{ item.evidence_id }}</code></td><td>{{ item.evidence_type }}</td><td><code>{{ item.relative_path }}</code></td><td><code>{{ item.sha256 }}</code></td><td>{{ item.sensitive }} / {{ item.redacted }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Preconditions, cleanup, and limitations</h2>
+  <p>ADB authorization was required. Root and Frida use are recorded per finding. Root-assisted observations do not by themselves establish an application vulnerability.</p>
+  {% if report.limitations %}<ul>{% for item in report.limitations %}<li>{{ item }}</li>{% endfor %}</ul>{% else %}<p>No framework limitation was recorded for this run.</p>{% endif %}
+</body>
+</html>

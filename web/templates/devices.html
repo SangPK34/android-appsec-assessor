@@ -1,0 +1,68 @@
+{% extends "_base.html" %}
+{% block title %}Devices · Android Security Lab{% endblock %}
+{% block content %}
+<div id="page-content">
+  <header class="page-heading">
+    <div>
+      <p class="eyebrow">Explicit selection</p>
+      <h1>Devices</h1>
+      <p>Serial được che trên giao diện; mọi operation sau đó vẫn khóa đúng device đã chọn.</p>
+    </div>
+    <a class="button secondary" href="/devices" hx-get="/devices" hx-target="#page-content" hx-select="#page-content" hx-swap="outerHTML">Refresh devices</a>
+  </header>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <div>
+        <h2>ADB inventory</h2>
+        <p>Active: <code>{{ inventory.active_serial_masked or 'none' }}</code></p>
+      </div>
+      <span class="count">{{ inventory.devices|length }} detected</span>
+    </div>
+    {% if inventory.devices %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Serial</th><th>Model</th><th>Transport</th><th>State</th><th>Device lock</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+        {% for device in inventory.devices %}
+          <tr>
+            <td><code>{{ device.serial }}</code>{% if device.selected %}<small>selected</small>{% endif %}</td>
+            <td>{{ device.model or '—' }}<small>{{ device.product or device.device or '' }}</small></td>
+            <td>{{ device.transport_id or 'USB / unknown' }}</td>
+            <td>
+              <span class="status {{ 'available' if device.authorized else 'error' }}">{{ device.state }}</span>
+              {% if device.guidance %}<small class="guidance">{{ device.guidance }}</small>{% endif %}
+            </td>
+            <td>
+              {% if device.lock %}
+                <span class="status error">busy</span>
+                <small>{{ device.lock.operation }}{% if device.lock.session_id %} · {{ device.lock.session_id }}{% endif %}</small>
+              {% else %}
+                <span class="status ok">idle</span>
+              {% endif %}
+            </td>
+            <td>
+              <form method="post" action="/devices/select" hx-post="/devices/select" hx-swap="none">
+                <input type="hidden" name="action_token" value="{{ action_token }}">
+                <input type="hidden" name="serial" value="{{ device.selection_value }}">
+                <button class="button small" type="submit" {% if not device.authorized or device.selected %}disabled{% endif %}>
+                  {{ 'Selected' if device.selected else 'Select' }}
+                </button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+      <h3>Không thấy Android device</h3>
+      <p>Cắm cáp dữ liệu, bật USB debugging và chấp nhận RSA prompt trên thiết bị Android. Nếu Windows chưa nhận driver, xem hướng dẫn OEM USB Driver trong README.</p>
+    </div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,55 @@
+{% extends "_base.html" %}
+{% block title %}Environment · Android Security Lab{% endblock %}
+{% block content %}
+<div id="page-content">
+  <header class="page-heading">
+    <div>
+      <p class="eyebrow">Portable diagnostics</p>
+      <h1>Environment</h1>
+      <p>Binary discovery: config → portable tools → user PATH. Không sửa system PATH.</p>
+    </div>
+    <div class="actions">
+      <a class="button secondary" href="/environment" hx-get="/environment" hx-target="#page-content" hx-select="#page-content" hx-swap="outerHTML">Refresh</a>
+      <a class="button secondary" href="/api/environment">JSON</a>
+    </div>
+  </header>
+
+  <section class="metrics three">
+    <article class="metric"><span>Environment</span><strong>{{ 'Ready' if report.ready else 'Repair required' }}</strong><span class="status {{ 'ok' if report.ready else 'error' }}">{{ 'healthy' if report.ready else 'attention' }}</span></article>
+    <article class="metric"><span>Windows admin</span><strong>{{ 'Yes' if report.host.windows_admin else 'No' }}</strong><small>daily use never requires it</small></article>
+    <article class="metric"><span>Repair</span><strong>{{ 'Running' if repair.running else ('Exit ' ~ repair.exit_code if repair.exit_code is not none else 'Idle') }}</strong><small>{% if repair.pid %}PID {{ repair.pid }}{% else %}explicit action only{% endif %}</small></article>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <div>
+        <h2>Environment / Diagnostics</h2>
+        <p>Repair chỉ tải lại component thiếu hoặc hỏng; không xóa results.</p>
+      </div>
+      <div class="actions">
+        <a class="button secondary" href="/environment/setup-log" target="_blank" rel="noopener">Open setup log</a>
+        <form method="post" action="/environment/repair" hx-post="/environment/repair" hx-swap="none">
+          <input type="hidden" name="action_token" value="{{ action_token }}">
+          <button class="button" type="submit" {% if repair.running %}disabled{% endif %}>{{ 'Repair running' if repair.running else 'Repair' }}</button>
+        </form>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Component</th><th>Status</th><th>Version</th><th>Source</th><th>Path / error</th></tr></thead>
+        <tbody>
+        {% for component in report.components %}
+          <tr>
+            <td>{{ component.name }}{% if component.required %}<small>required</small>{% endif %}</td>
+            <td><span class="status {{ component.status }}">{{ component.status }}</span></td>
+            <td>{{ component.version or '—' }}</td>
+            <td>{{ component.source or '—' }}</td>
+            <td class="path">{{ component.path or component.error or '—' }}{% if component.error and component.path %}<small class="guidance">{{ component.error }}</small>{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

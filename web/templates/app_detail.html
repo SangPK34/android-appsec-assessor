@@ -1,0 +1,75 @@
+{% extends "_base.html" %}
+{% block title %}App inspection · Android Security Lab{% endblock %}
+{% block content %}
+<div id="page-content">
+  <header class="page-heading">
+    <div>
+      <p class="eyebrow">Static support</p>
+      <h1>App inspection</h1>
+      {% if inspection %}<p><code>{{ inspection.package }}</code> · session <code>{{ inspection.session_id }}</code></p>{% endif %}
+    </div>
+    <div class="actions">
+      {% if inspection %}
+      <form method="post" action="/sessions/{{ inspection.session_id }}/scan" hx-post="/sessions/{{ inspection.session_id }}/scan" hx-swap="none">
+        <input type="hidden" name="action_token" value="{{ action_token }}">
+        <button class="button" type="submit">Start MVP scan</button>
+      </form>
+      <a class="button secondary" href="/sessions/{{ inspection.session_id }}">Open session</a>
+      {% endif %}
+      <a class="button secondary" href="/applications">Back to applications</a>
+    </div>
+  </header>
+
+  {% if inspection %}
+  <section class="metrics three">
+    <article class="metric"><span>Status</span><strong>{{ inspection.inspection_status }}</strong></article>
+    <article class="metric"><span>Version</span><strong>{{ inspection.metadata.version_name or '—' }}</strong><small>code {{ inspection.metadata.version_code or '—' }}</small></article>
+    <article class="metric"><span>APK files</span><strong>{{ inspection.apks|length }}</strong><small>{{ 'split APK' if inspection.metadata.split_apk else 'base APK' }}</small></article>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Package metadata</h2><p>UID {{ inspection.metadata.uid or '—' }} · min SDK {{ inspection.metadata.min_sdk or '—' }} · target SDK {{ inspection.metadata.target_sdk or '—' }}</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>APK</th><th>Role</th><th>Size</th><th>SHA-256</th></tr></thead><tbody>
+      {% for apk in inspection.apks %}<tr><td>{{ apk.relative_path }}</td><td>{{ apk.role }}</td><td>{{ apk.size_bytes }}</td><td class="path"><code>{{ apk.sha256 }}</code></td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+
+  {% if inspection.manifest %}
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Manifest flags</h2><p>Focused fields used by dynamic testing.</p></div></div>
+    <div class="facts manifest-facts">
+      <div><dt>debuggable</dt><dd>{{ inspection.manifest.debuggable }}</dd></div>
+      <div><dt>testOnly</dt><dd>{{ inspection.manifest.test_only }}</dd></div>
+      <div><dt>usesCleartextTraffic</dt><dd>{{ inspection.manifest.uses_cleartext_traffic }}</dd></div>
+      <div><dt>networkSecurityConfig</dt><dd>{{ inspection.manifest.network_security_config or '—' }}</dd></div>
+      <div><dt>allowBackup</dt><dd>{{ inspection.manifest.allow_backup }}</dd></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Permissions</h2><p>{{ inspection.manifest.permissions|length }} declared uses-permission entries.</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Permission</th><th>Max SDK</th></tr></thead><tbody>
+      {% for permission in inspection.manifest.permissions %}<tr><td><code>{{ permission.name }}</code></td><td>{{ permission.max_sdk or '—' }}</td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Components</h2><p>Export state is labeled explicit or inferred; it is not automatically a vulnerability.</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Type</th><th>Name</th><th>Exported</th><th>Protection</th></tr></thead><tbody>
+      {% for component in inspection.manifest.components %}<tr><td>{{ component.component_type }}</td><td class="path"><code>{{ component.name }}</code></td><td>{{ component.effective_exported }}<small>{{ component.exported_source }}</small></td><td>{{ component.permission or component.read_permission or component.write_permission or 'none declared' }}</td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+  {% endif %}
+
+  {% if inspection.signature %}
+  <section class="panel compact-panel"><div class="panel-heading"><div><h2>Signature</h2><p>Verified: {{ inspection.signature.verified }} · schemes: {{ inspection.signature.schemes }}</p></div></div></section>
+  {% endif %}
+
+  {% if inspection.limitations or inspection.errors %}
+  <div class="callout warning">{% for item in inspection.limitations %}<div>{{ item }}</div>{% endfor %}{% for item in inspection.errors %}<div>{{ item }}</div>{% endfor %}</div>
+  {% endif %}
+  {% else %}
+  <div class="empty-state"><h3>Inspection not available</h3><p>Run Inspect app from Applications.</p></div>
+  {% endif %}
+</div>
+{% endblock %}

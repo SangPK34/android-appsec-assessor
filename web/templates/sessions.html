@@ -1,0 +1,61 @@
+{% extends "_base.html" %}
+{% block title %}Sessions · Android Security Lab{% endblock %}
+{% block content %}
+<div id="page-content">
+  <header class="page-heading">
+    <div>
+      <p class="eyebrow">Reproducible evidence</p>
+      <h1>Sessions</h1>
+      <p>Mỗi session giữ snapshot, command log đã redact và cleanup ledger riêng.</p>
+    </div>
+    <a class="button secondary" href="/sessions" hx-get="/sessions" hx-target="#page-content" hx-select="#page-content" hx-swap="outerHTML">Refresh sessions</a>
+  </header>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <div><h2>Session history</h2><p>Cleanup idempotent, chỉ hoàn tác resource do session ghi nhận.</p></div>
+      <span class="count">{{ sessions|length }} total</span>
+    </div>
+    {% if sessions %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Session</th><th>Package / device</th><th>Status</th><th>Updated</th><th>Cleanup</th></tr></thead>
+        <tbody>
+        {% for session in sessions %}
+          <tr>
+            <td><code>{{ session.session_id }}</code><small>Created {{ session.created_at }}</small></td>
+            <td><code>{{ session.package }}</code><small>{{ session.serial }}</small></td>
+            <td><span class="status {{ session.status }}">{{ session.status }}</span>{% if session.last_error %}<small class="guidance">{{ session.last_error }}</small>{% endif %}</td>
+            <td>{{ session.updated_at }}</td>
+            <td>
+              <small>{{ session.cleanup_action_count }} recorded action(s)</small>
+              {% if session.app_inspection_available %}
+              <a class="button small secondary" href="/sessions/{{ session.session_id }}/app">Open inspection</a>
+              <a class="button small secondary" href="/sessions/{{ session.session_id }}">Open session</a>
+              {% endif %}
+              {% if session.report_available %}
+              <a class="button small secondary" href="/sessions/{{ session.session_id }}/report" target="_blank" rel="noopener">Open report</a>
+              {% endif %}
+              {% if session.status != 'cleaned' %}
+              <form method="post" action="/sessions/{{ session.session_id }}/cleanup" hx-post="/sessions/{{ session.session_id }}/cleanup" hx-swap="none">
+                <input type="hidden" name="action_token" value="{{ action_token }}">
+                <button class="button small danger" type="submit">Cleanup</button>
+              </form>
+              {% else %}
+              <span class="status ok">complete</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+      <h3>Chưa có session</h3>
+      <p>Dùng CLI <code>run.cmd session create --package com.example.app</code> sau khi chọn device và package.</p>
+    </div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

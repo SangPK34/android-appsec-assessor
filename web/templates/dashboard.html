@@ -1,0 +1,112 @@
+{% extends "_base.html" %}
+{% block title %}Dashboard · Android Security Lab{% endblock %}
+{% block content %}
+<div id="page-content">
+  <header class="page-heading">
+    <div>
+      <p class="eyebrow">Lab overview</p>
+      <h1>Dashboard</h1>
+      <p>Trạng thái host, thiết bị, capability và session đang hoạt động.</p>
+    </div>
+    <a class="button secondary" href="/" hx-get="/" hx-target="#page-content" hx-select="#page-content" hx-swap="outerHTML">Refresh</a>
+  </header>
+
+  {% if dashboard %}
+  <section class="metrics" aria-label="Tóm tắt">
+    <article class="metric">
+      <span>Environment</span>
+      <strong>{{ 'Ready' if dashboard.environment.ready else 'Repair required' }}</strong>
+      <span class="status {{ 'ok' if dashboard.environment.ready else 'error' }}">{{ 'healthy' if dashboard.environment.ready else 'degraded' }}</span>
+    </article>
+    <article class="metric">
+      <span>ADB devices</span>
+      <strong>{{ dashboard.authorized_count }} / {{ dashboard.device_count }}</strong>
+      <small>authorized / detected</small>
+    </article>
+    <article class="metric">
+      <span>Target package</span>
+      <strong class="compact">{{ dashboard.target_package or 'Chưa chọn' }}</strong>
+      <a href="/applications">Chọn application</a>
+    </article>
+    <article class="metric">
+      <span>Sessions</span>
+      <strong>{{ dashboard.session_count }}</strong>
+      <small>{{ dashboard.pending_cleanup_count }} chờ cleanup</small>
+    </article>
+  </section>
+
+  {% if dashboard.pending_cleanup_count %}
+  <div class="callout warning">
+    Có {{ dashboard.pending_cleanup_count }} session còn cleanup action. <a href="/sessions">Mở Sessions</a> trước khi tạo thực nghiệm mới.
+  </div>
+  {% endif %}
+
+  <section class="panel">
+    <div class="panel-heading">
+      <div>
+        <h2>Selected device</h2>
+        <p>Không tự chọn device dù chỉ cắm một máy.</p>
+      </div>
+      <a class="button" href="/devices">Manage devices</a>
+    </div>
+    {% if dashboard.device %}
+    <div class="device-hero">
+      <div>
+        <span class="kicker">{{ dashboard.device.manufacturer or 'Android' }}</span>
+        <h3>{{ dashboard.device.model or 'Unknown model' }}</h3>
+        <p>{{ dashboard.device.serial }} · Android {{ dashboard.device.android_version or '—' }} · SDK {{ dashboard.device.sdk or '—' }}</p>
+      </div>
+      <dl class="facts">
+        <div><dt>Security patch</dt><dd>{{ dashboard.device.security_patch or '—' }}</dd></div>
+        <div><dt>Build</dt><dd>{{ dashboard.device.build_id or '—' }}</dd></div>
+        <div><dt>ABI</dt><dd>{{ dashboard.device.abi or '—' }}</dd></div>
+        <div><dt>Proxy</dt><dd>{{ dashboard.proxy or 'none' }}</dd></div>
+      </dl>
+    </div>
+    {% else %}
+    <div class="empty-state">
+      <h3>Chưa có selected device</h3>
+      <p>{{ dashboard.device_error or 'Cắm thiết bị Android, bật USB debugging rồi chọn thiết bị.' }}</p>
+      <a class="button" href="/devices">Open Devices</a>
+    </div>
+    {% endif %}
+  </section>
+
+  {% if dashboard.device %}
+  <section class="panel">
+    <div class="panel-heading">
+      <div>
+        <h2>Capability detection</h2>
+        <p>Thiếu capability sẽ được đánh dấu, không làm sập toàn bộ workflow.</p>
+      </div>
+      {% if dashboard.device_lock %}<span class="status error">device busy</span>{% else %}<span class="status ok">device idle</span>{% endif %}
+    </div>
+    <div class="capability-grid">
+      {% set featured = ['ADB_AUTHORIZED', 'ANDROID_ROOT', 'MAGISK_AVAILABLE', 'ZYGISK_AVAILABLE', 'FRIDA_CLIENT', 'FRIDA_SERVER', 'SCRCPY_AVAILABLE', 'MITMPROXY_AVAILABLE'] %}
+      {% for capability in dashboard.capabilities if capability.name in featured %}
+      <article class="capability">
+        <span>{{ capability.name.replace('_', ' ') }}</span>
+        <strong class="status {{ capability.state }}">{{ capability.state }}</strong>
+        <p>{{ capability.reason }}</p>
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  <section class="panel compact-panel">
+    <div class="panel-heading">
+      <div>
+        <h2>Active session</h2>
+        {% if dashboard.active_session %}
+        <p><code>{{ dashboard.active_session.session_id }}</code> · {{ dashboard.active_session.package }}</p>
+        {% else %}
+        <p>Không có modifying session đang hoạt động trên selected device.</p>
+        {% endif %}
+      </div>
+      <a class="button secondary" href="/sessions">View sessions</a>
+    </div>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

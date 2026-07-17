@@ -1,0 +1,77 @@
+schema_version: 1
+rules:
+  - id: ASL-MVP-001
+    evaluator: app_debuggable
+    title: Debuggable or test-only application build
+    category: code-quality
+    description: The installed application build permits debugging or is marked test-only.
+    severity: high
+    confidence: high
+    required_capabilities: [AAPT2_AVAILABLE]
+    inputs: [app.manifest.debuggable, app.manifest.test_only]
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Disable android:debuggable and android:testOnly in release builds.
+
+  - id: ASL-MVP-002
+    evaluator: cleartext
+    title: Cleartext network traffic or permissive cleartext configuration
+    category: network
+    description: Cleartext is enabled in configuration or HTTP traffic was observed dynamically.
+    severity: high
+    confidence: high
+    required_capabilities: [AAPT2_AVAILABLE]
+    inputs: [app.manifest.uses_cleartext_traffic, traffic.events]
+    validation_type: natural_validation
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Enforce HTTPS and deny cleartext traffic in Network Security Configuration.
+
+  - id: ASL-MVP-003
+    evaluator: sensitive_token
+    title: Sensitive token exposed in URL or application log
+    category: data-storage
+    description: A sensitive token-shaped value was observed in a URL query or target-process log.
+    severity: high
+    confidence: high
+    required_capabilities: [LOGCAT_ACCESS]
+    inputs: [traffic.events.sensitive_query_keys, logcat.sensitive_marker_types]
+    validation_type: natural_validation
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Keep tokens out of URLs and logs; use protected headers and remove sensitive logging.
+
+  - id: ASL-MVP-004
+    evaluator: exported_component
+    title: Exported component without an explicit protection boundary
+    category: platform
+    description: A non-launcher component is exported without an explicit permission boundary.
+    severity: medium
+    confidence: medium
+    required_capabilities: [AAPT2_AVAILABLE]
+    inputs: [app.manifest.components]
+    validation_type: natural_validation
+    validation_observable: Target-process evidence contains the exact controlled canary after launch.
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Disable unnecessary exports or enforce a signature-level permission and input validation.
+
+  - id: ASL-MVP-005
+    evaluator: tls_interception
+    title: TLS interception and certificate trust behavior
+    category: network
+    description: Records whether HTTPS completed through the configured lab interception proxy.
+    severity: info
+    confidence: medium
+    required_capabilities: [MITMPROXY_AVAILABLE]
+    inputs: [traffic.events, frida.events]
+    validation_type: instrumented_validation
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Define the intended trust model and use pinning only where justified by the threat model.

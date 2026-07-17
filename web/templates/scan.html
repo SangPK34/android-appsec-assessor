@@ -1,0 +1,103 @@
+{% extends "_base.html" %}
+{% block title %}Scan session · Android Security Lab{% endblock %}
+{% block content %}
+<div id="page-content">
+  <header class="page-heading">
+    <div>
+      <p class="eyebrow">MVP workflow</p>
+      <h1>Scan session</h1>
+      {% if detail %}<p><code>{{ detail.session.package }}</code> · <code>{{ detail.session.session_id }}</code></p>{% endif %}
+    </div>
+    <div class="actions">
+      <a class="button secondary" href="/sessions">All sessions</a>
+      {% if detail and detail.report_available %}<a class="button secondary" href="/sessions/{{ detail.session.session_id }}/report" target="_blank" rel="noopener">Open report</a>{% endif %}
+    </div>
+  </header>
+
+  {% if detail %}
+  <section class="metrics">
+    <article class="metric"><span>Session</span><strong class="compact">{{ detail.session.status }}</strong><small>{{ detail.session.serial_masked }}</small></article>
+    <article class="metric"><span>Scan</span><strong>{{ detail.scan.status if detail.scan else 'not started' }}</strong><small>{{ detail.app.inspection_status if detail.app else 'no inspection' }}</small></article>
+    <article class="metric"><span>Findings</span><strong>{{ detail.findings|length }}</strong><small>{{ detail.evidence_count }} evidence item(s)</small></article>
+    <article class="metric"><span>Cleanup</span><strong>{{ 'pending' if detail.session.pending_cleanup else 'clean' }}</strong><small>success={{ detail.session.cleanup_success }}</small></article>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <div><h2>Actions</h2><p>Mỗi modifying action được serialize theo device và ghi cleanup ledger.</p></div>
+      <span class="htmx-indicator">Đang chạy, đừng spam nút như noob…</span>
+    </div>
+    <div class="actions panel-actions">
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/scan" hx-post="/sessions/{{ detail.session.session_id }}/scan" hx-swap="none" hx-indicator="closest .panel">
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button" type="submit">Start scan</button>
+      </form>
+      {% if not detail.traffic or detail.traffic.status != 'running' %}
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/traffic/start" hx-post="/sessions/{{ detail.session.session_id }}/traffic/start" hx-swap="none">
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Start traffic</button>
+      </form>
+      {% else %}
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/traffic/stop" hx-post="/sessions/{{ detail.session.session_id }}/traffic/stop" hx-swap="none">
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Stop traffic</button>
+      </form>
+      {% endif %}
+      {% if not detail.frida or detail.frida.status != 'running' %}
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/frida/start" hx-post="/sessions/{{ detail.session.session_id }}/frida/start" hx-swap="none">
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Start Frida</button>
+      </form>
+      {% else %}
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/frida/stop" hx-post="/sessions/{{ detail.session.session_id }}/frida/stop" hx-swap="none">
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Stop Frida</button>
+      </form>
+      {% endif %}
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/report" hx-post="/sessions/{{ detail.session.session_id }}/report" hx-swap="none">
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Generate report</button>
+      </form>
+      {% if detail.session.status != 'cleaned' %}
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/cleanup" hx-post="/sessions/{{ detail.session.session_id }}/cleanup" hx-swap="none">
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button danger" type="submit">Cleanup</button>
+      </form>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Runtime state</h2><p>Traffic và Frida chỉ dừng process do framework sở hữu.</p></div></div>
+    <div class="facts manifest-facts">
+      <div><dt>Traffic</dt><dd><span class="status {{ detail.traffic.status if detail.traffic else 'skipped' }}">{{ detail.traffic.status if detail.traffic else 'not started' }}</span>{% if detail.traffic and detail.traffic.error %}<small>{{ detail.traffic.error }}</small>{% endif %}</dd></div>
+      <div><dt>Frida</dt><dd><span class="status {{ detail.frida.status if detail.frida else 'skipped' }}">{{ detail.frida.status if detail.frida else 'not started' }}</span>{% if detail.frida and detail.frida.error %}<small>{{ detail.frida.error }}</small>{% endif %}</dd></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Findings</h2><p>Năm rule MVP; mapping chưa xác minh được giữ nguyên <code>mapping_pending</code>.</p></div></div>
+    {% if detail.findings %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>Rule</th><th>Status</th><th>Finding</th><th>Method</th><th>Validation</th><th>Action</th></tr></thead>
+      <tbody>
+      {% for finding in detail.findings %}
+        <tr>
+          <td><code>{{ finding.rule_id }}</code><small>{{ finding.severity }} / {{ finding.confidence }}</small></td>
+          <td><span class="status {{ finding.status }}">{{ finding.status }}</span></td>
+          <td>{{ finding.title }}<small>{{ finding.description }}</small></td>
+          <td>{{ finding.analysis_type }}<small>root={{ finding.root_used }} · frida={{ finding.frida_used }}</small></td>
+          <td>{% if finding.validation %}<span class="status {{ finding.validation.status }}">{{ finding.validation.status }}</span><small>{{ finding.validation.summary }}</small>{% else %}—{% endif %}</td>
+          <td>{% if finding.validation_supported and detail.session.status != 'cleaned' %}
+            <form method="post" action="/sessions/{{ detail.session.session_id }}/findings/{{ finding.finding_id }}/validate" hx-post="/sessions/{{ detail.session.session_id }}/findings/{{ finding.finding_id }}/validate" hx-swap="none">
+              <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button small secondary" type="submit">Validate</button>
+            </form>
+          {% else %}—{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    {% else %}
+    <div class="empty-state"><h3>Chưa chạy rules</h3><p>Nhấn Start scan để inspect dynamic startup, tạo findings và report.</p></div>
+    {% endif %}
+  </section>
+
+  {% if detail.scan and detail.scan.limitations %}<div class="callout warning">{% for item in detail.scan.limitations %}<div>{{ item }}</div>{% endfor %}</div>{% endif %}
+  {% else %}
+  <div class="empty-state"><h3>Session không tồn tại</h3><p>Quay lại Sessions và chọn một session hợp lệ.</p></div>
+  {% endif %}
+</div>
+{% endblock %}

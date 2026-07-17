@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-07-17",
+  "tools": {
+    "python": {
+      "version": "3.12.10",
+      "url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
+      "sha256": "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3",
+      "minimum_bytes": 10000000,
+      "archive_root": ""
+    },
+    "pip": {
+      "version": "26.1.2",
+      "url": "https://files.pythonhosted.org/packages/5d/95/6b5cb3461ea5673ba0995989746db58eb18b91b54dbf331e72f569540946/pip-26.1.2-py3-none-any.whl",
+      "sha256": "382ff9f685ee3bc25864f820aa50505825f10f5458ffff07e30a6d96e5715cab",
+      "minimum_bytes": 1800000
+    },
+    "platform_tools": {
+      "version": "37.0.0",
+      "url": "https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip",
+      "sha256": "4fe305812db074cea32903a489d061eb4454cbc90a49e8fea677f4b7af764918",
+      "minimum_bytes": 8000000,
+      "archive_root": "platform-tools",
+      "required": true
+    },
+    "scrcpy": {
+      "version": "4.0",
+      "url": "https://github.com/Genymobile/scrcpy/releases/download/v4.0/scrcpy-win64-v4.0.zip",
+      "sha256": "75dbeb5b00e6f64292f26f70900ae55ca397786bdfb0b9bbeb481a0549047457",
+      "minimum_bytes": 15000000,
+      "archive_root": "scrcpy-win64-v4.0",
+      "required": true
+    },
+    "build_tools": {
+      "version": "37.0.0",
+      "url": "https://dl.google.com/android/repository/build-tools_r37_windows.zip",
+      "sha256": "68075aa319ed8a01cf1a565ed1e61a3c1a801dd49191c35851248dc293c33b1a",
+      "minimum_bytes": 60000000,
+      "archive_root": "android-37.0",
+      "required": false,
+      "install_by_default": true
+    },
+    "java_runtime": {
+      "version": "21.0.11+10",
+      "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jre_x64_windows_hotspot_21.0.11_10.zip",
+      "sha256": "be26677aaa20b39a62edcaab4c8857a8b76673b0f45abc0b6143b142b62717e4",
+      "minimum_bytes": 49000000,
+      "archive_root": "jdk-21.0.11+10-jre",
+      "required": false,
+      "install_by_default": true
+    },
+    "frida_servers": {
+      "version": "17.15.5",
+      "required": false,
+      "install_by_default": true,
+      "assets": {
+        "arm": {
+          "url": "https://github.com/frida/frida/releases/download/17.15.5/frida-server-17.15.5-android-arm.xz",
+          "sha256": "7ce66eab1002474c31f1e90ed88a2ebcc6e43baa022d7584bf18d12074486bea",
+          "minimum_bytes": 7000000,
+          "output_sha256": "d070abcbb319f1c42034a1c983a6d3182d320b5fc415f2381571b11cac941512",
+          "output_minimum_bytes": 21000000
+        },
+        "arm64": {
+          "url": "https://github.com/frida/frida/releases/download/17.15.5/frida-server-17.15.5-android-arm64.xz",
+          "sha256": "9799088bc851bcad053388fc02088b3d082c93c3ed7e791b1f4efa803dbad5a5",
+          "minimum_bytes": 16000000,
+          "output_sha256": "d432f4077216d93c5adf3fb0d0f60297e8dc643c75af2bf7f08c2aa292a63e88",
+          "output_minimum_bytes": 53000000
+        },
+        "x86": {
+          "url": "https://github.com/frida/frida/releases/download/17.15.5/frida-server-17.15.5-android-x86.xz",
+          "sha256": "b841efb722ca8348d3bda9f809fce0f29ea31ab8d7d5e46b4902f867e479fe39",
+          "minimum_bytes": 16000000,
+          "output_sha256": "e2c99727f76f4d492c28d79a54de7017ef1dfecb5aec9ad663d41f2c9b187549",
+          "output_minimum_bytes": 53000000
+        },
+        "x86_64": {
+          "url": "https://github.com/frida/frida/releases/download/17.15.5/frida-server-17.15.5-android-x86_64.xz",
+          "sha256": "400cb5b3b08cb897472692636179e44edbc78f9b481651371c8ff8b552a2210e",
+          "minimum_bytes": 31000000,
+          "output_sha256": "c6de0d23b793c8f5f30736f45bdb060696bf9acc9f8f671e8d080e73f3634c3a",
+          "output_minimum_bytes": 111000000
+        }
+      }
+    },
+    "htmx": {
+      "version": "2.0.10",
+      "url": "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js",
+      "sha256": "71ea67185bfa8c98c39d31717c6fce5d852370fcdfd129db4543774d3145c0de",
+      "minimum_bytes": 50000,
+      "required": true
+    }
+  }
+}

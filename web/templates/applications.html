@@ -1,0 +1,67 @@
+{% extends "_base.html" %}
+{% block title %}Applications · Android Security Lab{% endblock %}
+{% block content %}
+<div id="page-content">
+  <header class="page-heading">
+    <div>
+      <p class="eyebrow">User packages</p>
+      <h1>Applications</h1>
+      <p>Danh sách app bên thứ ba trên selected device; chưa chọn package thì scanner không được chạy.</p>
+    </div>
+    <a class="button secondary" href="/applications" hx-get="/applications" hx-target="#page-content" hx-select="#page-content" hx-swap="outerHTML">Refresh apps</a>
+  </header>
+
+  <section class="panel">
+    <div class="panel-heading applications-heading">
+      <div>
+        <h2>Package inventory</h2>
+        <p>Device: <code>{{ inventory.serial_masked or 'none' }}</code> · Target: <code>{{ inventory.selected_package or 'none' }}</code></p>
+      </div>
+      <form class="search" method="get" action="/applications" hx-get="/applications" hx-target="#application-table" hx-select="#application-table" hx-swap="outerHTML" hx-push-url="true">
+        <label class="sr-only" for="package-query">Tìm package</label>
+        <input id="package-query" name="query" maxlength="100" value="{{ inventory.query }}" placeholder="com.example.app" autocomplete="off">
+        <button class="button" type="submit">Search</button>
+      </form>
+    </div>
+    <div id="application-table">
+      {% if inventory.applications %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Package</th><th>UID</th><th>APK path</th><th>Action</th></tr></thead>
+          <tbody>
+          {% for application in inventory.applications %}
+            <tr>
+              <td><code>{{ application.package }}</code>{% if application.selected %}<small>selected target</small>{% endif %}</td>
+              <td>{{ application.uid or '—' }}</td>
+              <td class="path">{{ application.apk_path or '—' }}</td>
+              <td>
+                {% if application.selected %}
+                <form method="post" action="/applications/inspect" hx-post="/applications/inspect" hx-swap="none">
+                  <input type="hidden" name="action_token" value="{{ action_token }}">
+                  <input type="hidden" name="package" value="{{ application.package }}">
+                  <button class="button small" type="submit">Inspect app</button>
+                </form>
+                {% else %}
+                <form method="post" action="/applications/select" hx-post="/applications/select" hx-swap="none">
+                  <input type="hidden" name="action_token" value="{{ action_token }}">
+                  <input type="hidden" name="package" value="{{ application.package }}">
+                  <button class="button small" type="submit">Select</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="empty-state">
+        <h3>Không có package để hiển thị</h3>
+        <p>Chọn authorized device trước, hoặc đổi từ khóa tìm kiếm.</p>
+        <a class="button" href="/devices">Open Devices</a>
+      </div>
+      {% endif %}
+    </div>
+  </section>
+</div>
+{% endblock %}

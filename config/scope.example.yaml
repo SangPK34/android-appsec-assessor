@@ -1,0 +1,11 @@
+devices:
+  - SERIAL
+
+packages:
+  - com.example.labapp
+
+api_hosts:
+  - api.lab.local
+  - 10.0.2.2
+
+allow_read_only_outside_scope: true

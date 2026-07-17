@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>{% block title %}Android Security Lab{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/">
+        <span class="brand-mark">AS</span>
+        <span><strong>Android Security Lab</strong><small>Windows-native</small></span>
+      </a>
+      <nav aria-label="Điều hướng chính" hx-boost="true">
+        <a class="nav-link {{ 'active' if current_path == '/' else '' }}" href="/">Dashboard</a>
+        <a class="nav-link {{ 'active' if current_path == '/devices' else '' }}" href="/devices">Devices</a>
+        <a class="nav-link {{ 'active' if current_path == '/applications' else '' }}" href="/applications">Applications</a>
+        <a class="nav-link {{ 'active' if current_path == '/sessions' else '' }}" href="/sessions">Sessions</a>
+        <a class="nav-link {{ 'active' if current_path == '/environment' else '' }}" href="/environment">Environment</a>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="dot ok"></span>
+        <span>127.0.0.1 only</span>
+        <small>v{{ version }}</small>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      {% if notice %}<div class="flash success" role="status">{{ notice }}</div>{% endif %}
+      {% if error %}<div class="flash error" role="alert">{{ error }}</div>{% endif %}
+      {% block content %}{% endblock %}
+      <footer>
+        <span>Standard Windows user · Local lab only</span>
+        <span>Android Security Lab {{ version }}</span>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

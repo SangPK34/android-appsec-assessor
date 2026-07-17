@@ -1,0 +1,15 @@
+{
+  "web": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "tools": {
+    "adb": null,
+    "fastboot": null,
+    "scrcpy": null,
+    "aapt2": null,
+    "java": null,
+    "frida": null,
+    "mitmdump": null
+  }
+}
