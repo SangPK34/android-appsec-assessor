@@ -1,0 +1,11 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "operations": [
+    {"operation_id": "des-1", "transformation": "DES/CBC/PKCS5Padding", "purpose": "encrypt", "executed": true, "key_length_bits": 64, "key_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iv_sha256": "1111111111111111111111111111111111111111111111111111111111111111", "iv_source": "random", "key_origin": "generated", "canary_match": false},
+    {"operation_id": "ecb-1", "transformation": "AES/ECB/PKCS5Padding", "purpose": "encrypt", "executed": true, "key_length_bits": 128, "key_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "iv_sha256": null, "iv_source": "none", "key_origin": "generated", "canary_match": true},
+    {"operation_id": "gcm-1", "transformation": "AES/GCM/NoPadding", "purpose": "encrypt", "executed": true, "key_length_bits": 256, "key_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "iv_sha256": "2222222222222222222222222222222222222222222222222222222222222222", "iv_source": "constant", "key_origin": "static_runtime", "canary_match": false},
+    {"operation_id": "gcm-2", "transformation": "AES/GCM/NoPadding", "purpose": "encrypt", "executed": true, "key_length_bits": 256, "key_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "iv_sha256": "2222222222222222222222222222222222222222222222222222222222222222", "iv_source": "constant", "key_origin": "static_runtime", "canary_match": false},
+    {"operation_id": "unknown-1", "transformation": "AES", "purpose": "unknown", "executed": true, "key_length_bits": null, "key_sha256": null, "iv_sha256": null, "iv_source": "unknown", "key_origin": "unknown", "canary_match": false}
+  ]
+}

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import AndroidAssessorError
-from .redaction import redact_data, redact_text
+from .redaction import REDACTED, is_sensitive_name, redact_data, redact_text
 from .storage import write_text_atomic
 from .validation import validate_package_name
 
@@ -21,6 +21,8 @@ SESSION_PLACEHOLDER = "__ANDROID_ASSESSOR_SESSION_ID__"
 PACKAGE_PLACEHOLDER = "__ANDROID_ASSESSOR_PACKAGE__"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_SHA256 = re.compile(r"^[a-f0-9]{64}$")
+_SAFE_METADATA = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
 _LIFECYCLE_METHODS = {
     "observer_loading",
     "observer_started",
@@ -156,11 +158,49 @@ def _parse_event(payload: dict[str, Any]) -> FridaObserverEvent:
         hook_id=_safe_id(payload.get("hook_id"), "hook_id"),
         category=_safe_id(payload.get("category"), "category"),
         method=_safe_id(payload.get("method"), "method"),
-        arguments_redacted=tuple(redact_data(arguments)),
-        return_value_redacted=redact_data(payload.get("return_value_redacted")),
+        arguments_redacted=tuple(_redact_observer_value(arguments)),
+        return_value_redacted=_redact_observer_value(
+            payload.get("return_value_redacted")
+        ),
         canary_match=canary,
         observer_version=observer_version,
     )
+
+
+def _redact_observer_value(value: Any, *, key: str | None = None) -> Any:
+    if isinstance(value, list):
+        return [_redact_observer_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(name): _redact_observer_value(item, key=str(name))
+            for name, item in value.items()
+        }
+    if key in {"key_sha256", "iv_sha256", "input_sha256", "output_sha256"}:
+        return value if isinstance(value, str) and _SHA256.fullmatch(value) else "<redacted>"
+    if key in {
+        "algorithm",
+        "transformation",
+        "mode",
+        "padding",
+        "purpose",
+        "iv_source",
+        "key_origin",
+        "operation_id",
+        "type",
+        "value",
+    }:
+        return (
+            value
+            if isinstance(value, str) and _SAFE_METADATA.fullmatch(value)
+            else "<redacted>"
+        )
+    if key in {"length", "key_length_bits"}:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    if key in {"executed", "canary_match"}:
+        return value if isinstance(value, bool) else False
+    if key is not None and is_sensitive_name(key):
+        return REDACTED
+    return redact_data(value)
 
 
 def parse_frida_jsonl(

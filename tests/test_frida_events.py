@@ -39,7 +39,7 @@ def test_frida_event_fixture_parses_handshake_runtime_and_stop() -> None:
 
     assert result.errors == ()
     assert result.handshake_status is FridaHandshakeStatus.VALID
-    assert result.runtime_event_count == 2
+    assert result.runtime_event_count == 3
     assert result.observer_stopped is True
     assert result.physical_validation_status == "UNVERIFIED"
     assert any(event.canary_match for event in result.events)

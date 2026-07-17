@@ -1,0 +1,8 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "operations": [
+    {"operation_id": "safe-1", "transformation": "AES/GCM/NoPadding", "purpose": "encrypt", "executed": true, "key_length_bits": 256, "key_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "iv_sha256": "3333333333333333333333333333333333333333333333333333333333333333", "iv_source": "random", "key_origin": "generated", "canary_match": false},
+    {"operation_id": "safe-2", "transformation": "AES/GCM/NoPadding", "purpose": "encrypt", "executed": true, "key_length_bits": 256, "key_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "iv_sha256": "4444444444444444444444444444444444444444444444444444444444444444", "iv_source": "random", "key_origin": "generated", "canary_match": false}
+  ]
+}
