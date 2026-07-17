@@ -23,7 +23,7 @@ from ..logcat import LogcatCollector
 from ..redaction import redact_text
 from ..report import ReportService
 from ..scope import load_scope
-from ..session import SessionRepository, SessionStatus
+from ..session import SessionRepository
 from ..storage import read_json_object, require_under_root, write_text_atomic
 from ..traffic import TrafficCaptureService, load_traffic_events
 from ..validation_definitions import validation_for_rule
@@ -361,11 +361,6 @@ class ValidationService:
             record.package,
             action="controlled_validation",
         )
-        if record.status not in {
-            SessionStatus.ACTIVE,
-            SessionStatus.CLEANUP_REQUIRED,
-        }:
-            raise SessionError("Controlled validation requires an active session.")
         self.repository.require_modifying_session_slot(record.serial, record.session_id)
         with DeviceLock(
             self.paths,
@@ -374,6 +369,10 @@ class ValidationService:
             session_id=record.session_id,
             timeout=0,
         ):
+            self.repository.require_modifying_session_slot(
+                record.serial,
+                record.session_id,
+            )
             return self._validate_locked(
                 session_id,
                 finding_id,

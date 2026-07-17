@@ -470,7 +470,10 @@ class PrivateStorageService:
         content_requests: Sequence[str] = (),
     ) -> StorageInspectionResult:
         record = self.repository.load(session_id)
-        if record.status is not SessionStatus.ACTIVE:
+        if record.status not in {
+            SessionStatus.ACTIVE,
+            SessionStatus.CLEANUP_REQUIRED,
+        }:
             raise SessionError("Root storage inspection requires an active session.")
         scope = load_scope(self.paths)
         scope.require_device_package(
@@ -486,9 +489,11 @@ class PrivateStorageService:
             session_id=record.session_id,
             timeout=0,
         ):
+            self.repository.require_modifying_session_slot(
+                record.serial,
+                record.session_id,
+            )
             current = self.repository.load(record.session_id)
-            if current.status is not SessionStatus.ACTIVE:
-                raise SessionError("Root storage inspection session is no longer active.")
             metadata = self.backend.inspect_package(current.serial, current.package)
             data_directory = str(metadata.get("data_directory", ""))
             external_directory = str(

@@ -71,7 +71,11 @@ class ScanService:
             session_id=record.session_id,
             timeout=0,
         ):
-            return self._scan_session_locked(record)
+            self.repository.require_modifying_session_slot(
+                record.serial,
+                record.session_id,
+            )
+            return self._scan_session_locked(self.repository.load(record.session_id))
 
     def _scan_session_locked(self, record: SessionRecord) -> ScanResult:
         paths = self.repository.paths_for(record.session_id)

@@ -270,6 +270,15 @@ class SessionRepository:
     def require_modifying_session_slot(self, serial: str, session_id: str) -> None:
         selected = validate_serial(serial)
         current_id = validate_session_id(session_id)
+        with self.state_lock(current_id):
+            current = self.load(current_id)
+            if current.serial != selected:
+                raise SessionError("Session device does not match the modifying operation.")
+            if current.status not in {
+                SessionStatus.ACTIVE,
+                SessionStatus.CLEANUP_REQUIRED,
+            }:
+                raise SessionError("Modifying operations require an active session.")
         for record in self.list():
             if record.serial != selected or record.status is SessionStatus.CLEANED:
                 continue

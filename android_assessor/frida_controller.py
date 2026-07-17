@@ -15,7 +15,7 @@ from .app_context import AppContext
 from .cleanup import CleanupExecutor, capture_remote_process_identity
 from .device_lock import DeviceLock
 from .environment import find_tool_spec, resolve_binary
-from .errors import AndroidAssessorError, FridaError, SessionError
+from .errors import AndroidAssessorError, FridaError
 from .evidence import EvidenceRepository, sha256_file
 from .frida_events import (
     OBSERVER_VERSION,
@@ -515,11 +515,6 @@ class FridaController:
             record.package,
             action="frida_observe",
         )
-        if record.status not in {
-            SessionStatus.ACTIVE,
-            SessionStatus.CLEANUP_REQUIRED,
-        }:
-            raise SessionError("Frida observation requires an active session.")
         existing = self.load_state(record.session_id)
         if existing and existing.status in {"running", "stop_failed"}:
             raise FridaError("Frida observation is running or requires cleanup.")
@@ -551,6 +546,10 @@ class FridaController:
             operation="start_frida_observation",
             session_id=record.session_id,
         ):
+            self.repository.require_modifying_session_slot(
+                record.serial,
+                record.session_id,
+            )
             latest = self.load_state(record.session_id)
             if latest and latest.status in {"running", "stop_failed"}:
                 raise FridaError("Frida observation is running or requires cleanup.")

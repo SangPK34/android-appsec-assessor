@@ -162,11 +162,6 @@ class TrafficCaptureService:
             record.package,
             action="traffic_capture",
         )
-        if record.status not in {
-            SessionStatus.ACTIVE,
-            SessionStatus.CLEANUP_REQUIRED,
-        }:
-            raise SessionError("Traffic capture requires an active session.")
         existing = self.load_state(record.session_id)
         if existing and existing.status in {"running", "stop_failed"}:
             raise ProxyError("Traffic capture is running or requires cleanup for this session.")
@@ -235,6 +230,10 @@ class TrafficCaptureService:
             operation="start_traffic_capture",
             session_id=record.session_id,
         ):
+            self.repository.require_modifying_session_slot(
+                record.serial,
+                record.session_id,
+            )
             latest = self.load_state(record.session_id)
             if latest and latest.status in {"running", "stop_failed"}:
                 raise ProxyError(
