@@ -210,6 +210,10 @@ class SessionPaths:
         return self.root / "scan.json"
 
     @property
+    def experiment_results_csv(self) -> Path:
+        return self.root / "experiment_results.csv"
+
+    @property
     def evidence_index(self) -> Path:
         return self.root / "evidence" / "index.json"
 

@@ -31,7 +31,11 @@
     <tr><th>Device</th><td>{{ report.session.serial_masked }}</td></tr>
     <tr><th>App version</th><td>{{ report.app.metadata.version_name if report.app and report.app.metadata else '-' }}</td></tr>
     <tr><th>Root used by findings</th><td>{{ report.root_used }}</td></tr>
+    <tr><th>Root available</th><td>{{ report.root_available }}</td></tr>
     <tr><th>Frida used by findings</th><td>{{ report.frida_used }}</td></tr>
+    <tr><th>Frida available</th><td>{{ report.frida_available }}</td></tr>
+    <tr><th>Evidence source</th><td>{{ report.evidence_source }}</td></tr>
+    <tr><th>Device validation</th><td>{{ report.device_validation_status }}</td></tr>
     <tr><th>Cleanup</th><td>{{ report.cleanup.status }}; success={{ report.cleanup.success }}; pending={{ report.cleanup.pending }}</td></tr>
   </table>
 
@@ -44,11 +48,21 @@
         <td><code>{{ finding.rule_id }}</code><br>{{ finding.severity }} / {{ finding.confidence }}</td>
         <td class="{{ finding.status }}">{{ finding.status }}</td>
         <td>{{ finding.title }}<br><small>{{ finding.description }}</small></td>
-        <td>{{ finding.analysis_type }}<br><small>root={{ finding.root_used }}, frida={{ finding.frida_used }}</small></td>
+        <td>{{ finding.analysis_type }}<br><small>root={{ finding.root_used }}, frida={{ finding.frida_used }}, validation={{ finding.validation_type }}</small></td>
         <td>{% if finding.validation %}{{ finding.validation.status }} · {{ finding.validation.validation_type }}<br>{{ finding.validation.summary }}{% else %}-{% endif %}</td>
         <td>{% for evidence_id in finding.evidence_ids %}<code>{{ evidence_id }}</code><br>{% endfor %}</td>
         <td>{{ finding.remediation }}</td>
       </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Root vs non-root coverage</h2>
+  <table>
+    <thead><tr><th>Test</th><th>Without root</th><th>With root</th><th>Frida</th><th>Implementation</th><th>Physical validation</th><th>Finding</th></tr></thead>
+    <tbody>
+    {% for item in report.root_vs_non_root_coverage %}
+      <tr><td><code>{{ item.test_id }}</code></td><td>{{ item.available_without_root }}</td><td>{{ item.available_with_root }}</td><td>{{ item.requires_frida }}</td><td>{{ item.implementation_status }}</td><td>{{ item.physical_validation_status }}</td><td>{{ item.finding_status }}</td></tr>
     {% endfor %}
     </tbody>
   </table>
