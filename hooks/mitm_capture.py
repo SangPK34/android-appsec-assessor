@@ -10,6 +10,7 @@ from urllib.parse import parse_qsl, urlsplit
 from mitmproxy import ctx, http
 
 from android_assessor.redaction import (
+    redact_data,
     redact_headers,
     redact_url,
     sensitive_field_names,
@@ -70,8 +71,9 @@ def _write(payload: dict[str, object]) -> None:
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload["timestamp"] = datetime.now(UTC).isoformat()
+    redacted_payload = redact_data(payload)
     with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        handle.write(json.dumps(redacted_payload, ensure_ascii=False) + "\n")
 
 
 def request(flow: http.HTTPFlow) -> None:
