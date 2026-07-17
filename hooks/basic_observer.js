@@ -281,6 +281,192 @@ function installCryptoHooks() {
     installMethod('javax.crypto.spec.IvParameterSpec', '$init', 'crypto', 'iv.parameter_spec');
 }
 
+let rootCheckSequence = 0;
+
+function sha256Text(value) {
+    try {
+        const JString = Java.use('java.lang.String');
+        return sha256Bytes(JString.$new(String(value)).getBytes('UTF-8'));
+    } catch (ignored) {
+        return null;
+    }
+}
+
+function rootCheckMetadata(indicatorType, indicatorValue, detected) {
+    rootCheckSequence += 1;
+    return {
+        check_id: 'root-' + Process.id + '-' + rootCheckSequence,
+        indicator_type: indicatorType,
+        indicator_hash: sha256Text(indicatorValue),
+        detected: detected,
+        response: 'unknown',
+        bypass_instrumented: false
+    };
+}
+
+function fileIndicator(path) {
+    const lower = String(path).toLowerCase();
+    if (/(^|\/)su$/.test(lower) || lower.indexOf('/xbin/su') !== -1) {
+        return 'su_file';
+    }
+    if (lower.indexOf('magisk') !== -1 || lower.indexOf('supersu') !== -1) {
+        return 'root_manager_package';
+    }
+    return null;
+}
+
+function commandIndicator(command) {
+    const lower = String(command).toLowerCase();
+    if (lower.indexOf('getprop') !== -1) {
+        return 'system_property';
+    }
+    if (lower.indexOf('mount') !== -1) {
+        return 'mount_state';
+    }
+    if (/(^|\s|\/)su(\s|$)/.test(lower) || lower.indexOf('which su') !== -1) {
+        return 'executable_lookup';
+    }
+    return null;
+}
+
+function installRootDetectionHooks() {
+    try {
+        const File = Java.use('java.io.File');
+        File.exists.overloads.forEach(function (overload, index) {
+            overload.implementation = function () {
+                let path = '<unavailable>';
+                try {
+                    path = String(this.getAbsolutePath());
+                } catch (ignored) {
+                    path = '<unavailable>';
+                }
+                const result = overload.apply(this, arguments);
+                const indicator = fileIndicator(path);
+                if (indicator !== null) {
+                    emitRedactedEvent(
+                        'root.file_exists.' + index,
+                        'root_detection',
+                        'root.file_exists',
+                        [rootCheckMetadata(indicator, path, Boolean(result))],
+                        { type: 'boolean', value: '<redacted>' },
+                        false
+                    );
+                }
+                return result;
+            };
+            emitLifecycle('hook_installed', 'root.file_exists.' + index, []);
+        });
+    } catch (error) {
+        emitLifecycle('hook_error', 'root.file_exists', [error]);
+    }
+
+    try {
+        const Runtime = Java.use('java.lang.Runtime');
+        Runtime.exec.overloads.forEach(function (overload, index) {
+            overload.implementation = function () {
+                const args = Array.prototype.slice.call(arguments);
+                let command = '<unavailable>';
+                try {
+                    command = Array.isArray(args[0]) ? args[0].join(' ') : String(args[0]);
+                } catch (ignored) {
+                    command = '<unavailable>';
+                }
+                const result = overload.apply(this, args);
+                const indicator = commandIndicator(command);
+                if (indicator !== null) {
+                    emitRedactedEvent(
+                        'root.runtime_exec.' + index,
+                        'root_detection',
+                        'root.runtime_exec',
+                        [rootCheckMetadata(indicator, command, null)],
+                        { type: 'java.lang.Process', value: '<redacted>' },
+                        false
+                    );
+                }
+                return result;
+            };
+            emitLifecycle('hook_installed', 'root.runtime_exec.' + index, []);
+        });
+    } catch (error) {
+        emitLifecycle('hook_error', 'root.runtime_exec', [error]);
+    }
+
+    try {
+        const PackageManager = Java.use('android.app.ApplicationPackageManager');
+        PackageManager.getPackageInfo.overloads.forEach(function (overload, index) {
+            overload.implementation = function () {
+                const args = Array.prototype.slice.call(arguments);
+                const packageName = args.length > 0 ? String(args[0]) : '<unavailable>';
+                const lower = packageName.toLowerCase();
+                const relevant = lower.indexOf('magisk') !== -1 ||
+                    lower.indexOf('supersu') !== -1 || lower.indexOf('superuser') !== -1;
+                try {
+                    const result = overload.apply(this, args);
+                    if (relevant) {
+                        emitRedactedEvent(
+                            'root.package_info.' + index,
+                            'root_detection',
+                            'root.package_info',
+                            [rootCheckMetadata('root_manager_package', packageName, true)],
+                            { type: 'android.content.pm.PackageInfo', value: '<redacted>' },
+                            false
+                        );
+                    }
+                    return result;
+                } catch (error) {
+                    if (relevant) {
+                        emitRedactedEvent(
+                            'root.package_info.' + index,
+                            'root_detection',
+                            'root.package_info',
+                            [rootCheckMetadata('root_manager_package', packageName, false)],
+                            null,
+                            false
+                        );
+                    }
+                    throw error;
+                }
+            };
+            emitLifecycle('hook_installed', 'root.package_info.' + index, []);
+        });
+    } catch (error) {
+        emitLifecycle('hook_error', 'root.package_info', [error]);
+    }
+
+    try {
+        const SystemProperties = Java.use('android.os.SystemProperties');
+        SystemProperties.get.overloads.forEach(function (overload, index) {
+            overload.implementation = function () {
+                const args = Array.prototype.slice.call(arguments);
+                const key = args.length > 0 ? String(args[0]) : '<unavailable>';
+                const result = overload.apply(this, args);
+                const value = String(result).toLowerCase();
+                const relevant = key === 'ro.build.tags' || key === 'ro.debuggable' ||
+                    key === 'ro.secure' || key === 'service.adb.root';
+                if (relevant) {
+                    const indicator = key === 'ro.build.tags' ? 'build_tags' : 'system_property';
+                    const detected = (key === 'ro.build.tags' && value.indexOf('test-keys') !== -1) ||
+                        (key === 'ro.debuggable' && value === '1') ||
+                        (key === 'ro.secure' && value === '0') ||
+                        (key === 'service.adb.root' && value === '1');
+                    emitRedactedEvent(
+                        'root.system_property.' + index,
+                        'root_detection',
+                        'root.system_property',
+                        [rootCheckMetadata(indicator, key, detected)],
+                        { type: 'string', length: value.length, value: '<redacted>' },
+                        false
+                    );
+                }
+                return result;
+            };
+            emitLifecycle('hook_installed', 'root.system_property.' + index, []);
+        });
+    } catch (error) {
+        emitLifecycle('hook_error', 'root.system_property', [error]);
+    }
+}
+
 function installMethod(className, methodName, category, hookId) {
     try {
         const Klass = Java.use(className);
@@ -343,17 +529,14 @@ setImmediate(function () {
             ['okhttp3.OkHttpClient', 'newCall', 'network', 'okhttp.new_call'],
             ['android.webkit.WebView', 'loadUrl', 'webview', 'webview.load_url'],
             ['android.webkit.WebView', 'addJavascriptInterface', 'webview', 'webview.javascript_interface'],
-            ['android.webkit.WebView', 'setWebContentsDebuggingEnabled', 'webview', 'webview.debugging'],
-            ['java.io.File', 'exists', 'root_detection', 'root.file_exists'],
-            ['java.lang.Runtime', 'exec', 'root_detection', 'root.runtime_exec'],
-            ['android.app.ApplicationPackageManager', 'getPackageInfo', 'root_detection', 'root.package_info'],
-            ['android.os.SystemProperties', 'get', 'root_detection', 'root.system_property']
+            ['android.webkit.WebView', 'setWebContentsDebuggingEnabled', 'webview', 'webview.debugging']
         ];
 
         hooks.forEach(function (definition) {
             installMethod(definition[0], definition[1], definition[2], definition[3]);
         });
         installCryptoHooks();
+        installRootDetectionHooks();
         emitLifecycle('observer_started', 'observer.lifecycle', []);
     });
 });

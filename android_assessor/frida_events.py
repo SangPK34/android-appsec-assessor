@@ -175,7 +175,13 @@ def _redact_observer_value(value: Any, *, key: str | None = None) -> Any:
             str(name): _redact_observer_value(item, key=str(name))
             for name, item in value.items()
         }
-    if key in {"key_sha256", "iv_sha256", "input_sha256", "output_sha256"}:
+    if key in {
+        "key_sha256",
+        "iv_sha256",
+        "input_sha256",
+        "output_sha256",
+        "indicator_hash",
+    }:
         return value if isinstance(value, str) and _SHA256.fullmatch(value) else "<redacted>"
     if key in {
         "algorithm",
@@ -186,6 +192,9 @@ def _redact_observer_value(value: Any, *, key: str | None = None) -> Any:
         "iv_source",
         "key_origin",
         "operation_id",
+        "check_id",
+        "indicator_type",
+        "response",
         "type",
         "value",
     }:
@@ -196,7 +205,9 @@ def _redact_observer_value(value: Any, *, key: str | None = None) -> Any:
         )
     if key in {"length", "key_length_bits"}:
         return value if isinstance(value, int) and not isinstance(value, bool) else None
-    if key in {"executed", "canary_match"}:
+    if key in {"executed", "canary_match", "detected", "bypass_instrumented"}:
+        if value is None and key == "detected":
+            return None
         return value if isinstance(value, bool) else False
     if key is not None and is_sensitive_name(key):
         return REDACTED

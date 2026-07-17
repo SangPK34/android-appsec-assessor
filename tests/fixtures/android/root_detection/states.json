@@ -1,0 +1,13 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "scenarios": {
+    "absent": [],
+    "present_not_executed": [{"check_id": "static-su", "indicator_type": "su_file", "present": true, "executed": false, "detected": null, "response": "unknown", "bypass_instrumented": false}],
+    "blocked": [{"check_id": "runtime-su", "indicator_type": "su_file", "present": true, "executed": true, "detected": true, "response": "app_blocked", "bypass_instrumented": false}],
+    "warning": [{"check_id": "runtime-package", "indicator_type": "root_manager_package", "present": true, "executed": true, "detected": true, "response": "warning_only", "bypass_instrumented": false}],
+    "no_effect": [{"check_id": "runtime-property", "indicator_type": "system_property", "present": true, "executed": true, "detected": true, "response": "no_observable_effect", "bypass_instrumented": false}],
+    "not_detected": [{"check_id": "runtime-tags", "indicator_type": "build_tags", "present": true, "executed": true, "detected": false, "response": "no_observable_effect", "bypass_instrumented": false}],
+    "bypassed": [{"check_id": "runtime-native", "indicator_type": "native_check", "present": true, "executed": true, "detected": false, "response": "no_observable_effect", "bypass_instrumented": true}]
+  }
+}
