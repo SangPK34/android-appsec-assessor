@@ -25,6 +25,7 @@ from ..scope import load_scope
 from ..session import SessionRepository
 from ..storage import read_json_object, require_under_root, write_text_atomic
 from ..traffic import TrafficCaptureService, load_traffic_events
+from ..validation_definitions import validation_for_rule
 
 _HOST_PATTERN = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 _PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$")
@@ -129,7 +130,7 @@ class ValidationService:
         if deep_link is None:
             return ValidationRecord(
                 status=FindingStatus.SKIPPED,
-                validation_type="natural_validation",
+                validation_type="adb_assisted_validation",
                 validated_at=datetime.now(UTC).isoformat(),
                 canary=canary,
                 summary="No allowlisted HTTP deep link was available for a cleartext canary.",
@@ -163,7 +164,7 @@ class ValidationService:
             if result.timed_out or result.exit_code != 0:
                 return ValidationRecord(
                     status=FindingStatus.INCONCLUSIVE,
-                    validation_type="natural_validation",
+                    validation_type="adb_assisted_validation",
                     validated_at=datetime.now(UTC).isoformat(),
                     canary=canary,
                     summary="The allowlisted deep-link launch did not complete.",
@@ -195,7 +196,7 @@ class ValidationService:
         )
         return ValidationRecord(
             status=FindingStatus.CONFIRMED if observed else FindingStatus.INCONCLUSIVE,
-            validation_type="natural_validation",
+            validation_type="adb_assisted_validation",
             validated_at=datetime.now(UTC).isoformat(),
             canary=canary,
             summary=(
@@ -219,7 +220,7 @@ class ValidationService:
         if component is None:
             return ValidationRecord(
                 status=FindingStatus.SKIPPED,
-                validation_type="natural_validation",
+                validation_type="adb_assisted_validation",
                 validated_at=datetime.now(UTC).isoformat(),
                 canary=canary,
                 summary="No unprotected exported activity was available for canary delivery.",
@@ -243,7 +244,7 @@ class ValidationService:
         if result.timed_out or result.exit_code != 0:
             return ValidationRecord(
                 status=FindingStatus.INCONCLUSIVE,
-                validation_type="natural_validation",
+                validation_type="adb_assisted_validation",
                 validated_at=datetime.now(UTC).isoformat(),
                 canary=canary,
                 summary="The canary activity launch did not complete.",
@@ -259,7 +260,7 @@ class ValidationService:
                 if state.canary_observed
                 else FindingStatus.INCONCLUSIVE
             ),
-            validation_type="natural_validation",
+            validation_type="adb_assisted_validation",
             validated_at=datetime.now(UTC).isoformat(),
             canary=canary,
             summary=(
@@ -280,7 +281,7 @@ class ValidationService:
         if component is None:
             return ValidationRecord(
                 status=FindingStatus.SKIPPED,
-                validation_type="natural_validation",
+                validation_type="adb_assisted_validation",
                 validated_at=datetime.now(UTC).isoformat(),
                 canary=canary,
                 summary="No unprotected exported activity was identified.",
@@ -338,7 +339,7 @@ class ValidationService:
         )
         return ValidationRecord(
             status=status,
-            validation_type="natural_validation",
+            validation_type="adb_assisted_validation",
             validated_at=datetime.now(UTC).isoformat(),
             canary=canary,
             summary=(
@@ -372,6 +373,9 @@ class ValidationService:
         finding = self.findings.get(session_id, finding_id)
         if not finding.validation_supported:
             raise SessionError("This finding does not support controlled validation.")
+        definition = validation_for_rule(finding.rule_id)
+        if definition is None or not definition.production_enabled:
+            raise SessionError("This controlled validation is not enabled in production.")
         canary = self._canary()
         if finding.rule_id == "ASL-MVP-002":
             validation = self._validate_cleartext(session_id, finding, canary)

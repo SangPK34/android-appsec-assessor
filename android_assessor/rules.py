@@ -32,6 +32,7 @@ class RuleDefinition:
     confidence: str
     remediation: str
     mappings: dict[str, str]
+    validation_type: str
     validation_supported: bool
     validation_observable: str | None
 
@@ -106,7 +107,9 @@ class RuleEngine:
                         "mastg": str(value.get("mastg_mapping", "mapping_pending")),
                         "cwe": str(value.get("cwe_mapping", "mapping_pending")),
                     },
-                    validation_supported=validation_type == "natural_validation",
+                    validation_type=validation_type,
+                    validation_supported=validation_type
+                    in {"natural_validation", "adb_assisted_validation"},
                     validation_observable=(
                         str(value["validation_observable"])
                         if value.get("validation_observable")
@@ -350,6 +353,11 @@ class RuleEngine:
                 details = {
                     **details,
                     "validation_observable": definition.validation_observable,
+                }
+            if definition.validation_type != "none":
+                details = {
+                    **details,
+                    "validation_type": definition.validation_type,
                 }
             validation = previous.validation if previous else None
             if validation and validation.status is FindingStatus.CONFIRMED:

@@ -7,6 +7,9 @@ requires-python = ">=3.12,<3.13"
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+markers = [
+    "physical_android: requires an explicitly enabled physical Android device",
+]
 
 [tool.ruff]
 line-length = 100
