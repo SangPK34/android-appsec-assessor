@@ -1,11 +1,23 @@
 devices:
-  - SERIAL
+  - EXAMPLE_DEVICE_SERIAL
 
 packages:
-  - com.example.labapp
+  - com.example.rootedlab
 
 api_hosts:
   - api.lab.local
-  - 10.0.2.2
+  - 127.0.0.1
+
+allowed_actions:
+  - inspect
+  - root_storage_read
+  - frida_observe
+  - traffic_capture
+  - controlled_validation
+
+limits:
+  max_validation_requests: 10
+  command_timeout_seconds: 30
+  max_evidence_size_mb: 50
 
 allow_read_only_outside_scope: true

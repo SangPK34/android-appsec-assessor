@@ -119,7 +119,8 @@ def prepared_service(
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
     paths.scope_file.write_text(
-        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n",
+        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n"
+        "allowed_actions: [traffic_capture]\n",
         encoding="utf-8",
     )
     (paths.root / "hooks").mkdir()
@@ -204,7 +205,8 @@ def test_scan_stops_started_resources_when_wait_is_interrupted(
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
     paths.scope_file.write_text(
-        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n",
+        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n"
+        "allowed_actions: [inspect, traffic_capture, frida_observe]\n",
         encoding="utf-8",
     )
     repository = SessionRepository(paths)

@@ -417,7 +417,11 @@ class FridaController:
 
     def start(self, session_id: str, *, spawn: bool = False) -> FridaObservationState:
         record = self.repository.load(session_id)
-        load_scope(self.paths).require_device_package(record.serial, record.package)
+        load_scope(self.paths).require_device_package(
+            record.serial,
+            record.package,
+            action="frida_observe",
+        )
         existing = self.load_state(record.session_id)
         if existing and existing.status in {"running", "stop_failed"}:
             raise FridaError("Frida observation is running or requires cleanup.")

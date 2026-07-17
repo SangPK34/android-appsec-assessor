@@ -215,7 +215,8 @@ def test_failed_proxy_snapshot_blocks_start_and_cleanup_mutation(tmp_path: Path)
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
     paths.scope_file.write_text(
-        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n",
+        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n"
+        "allowed_actions: [traffic_capture]\n",
         encoding="utf-8",
     )
     repository = SessionRepository(paths)

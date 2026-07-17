@@ -94,7 +94,8 @@ def test_exported_activity_requires_observable_canary_impact(
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
     paths.scope_file.write_text(
-        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n",
+        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n"
+        "allowed_actions: [controlled_validation]\n",
         encoding="utf-8",
     )
     repository = SessionRepository(paths)

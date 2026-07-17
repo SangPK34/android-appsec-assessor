@@ -60,7 +60,9 @@ class ScanService:
 
     def scan_session(self, session_id: str) -> ScanResult:
         record = self.repository.load(session_id)
-        load_scope(self.paths).require_device_package(record.serial, record.package)
+        scope = load_scope(self.paths)
+        scope.require_device_package(record.serial, record.package)
+        scope.require_actions(("inspect", "traffic_capture", "frida_observe"))
         self.repository.require_modifying_session_slot(record.serial, record.session_id)
         with DeviceLock(
             self.paths,

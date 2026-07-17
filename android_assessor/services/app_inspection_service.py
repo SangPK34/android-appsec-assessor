@@ -15,6 +15,7 @@ from ..errors import AndroidAssessorError, ApkInspectionError
 from ..evidence import EvidenceRepository
 from ..manifest import Aapt2Inspector
 from ..redaction import redact_text
+from ..scope import load_scope
 from ..session import SessionRecord, SessionRepository, SessionStatus
 from ..signature import ApkSignatureInspector
 from ..storage import write_json_atomic, write_text_atomic
@@ -74,6 +75,7 @@ class AppInspectionService:
     def _create_session(self, package: str, serial: str | None) -> SessionRecord:
         discovery_adb = self.context.adb_client()
         selected = self.context.device_selector(discovery_adb).resolve(serial)
+        load_scope(self.paths).require_inspection(selected.serial, package)
         PackageInspector(discovery_adb).inspect(selected.serial, package)
         return SessionService(self.context, self.repository).create(
             package=package,

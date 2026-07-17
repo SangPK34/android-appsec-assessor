@@ -80,7 +80,8 @@ def test_competing_scan_fails_before_any_device_subprocess(tmp_path: Path) -> No
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
     paths.scope_file.write_text(
-        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n",
+        "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n"
+        "allowed_actions: [inspect, traffic_capture, frida_observe]\n",
         encoding="utf-8",
     )
     repository = SessionRepository(paths)

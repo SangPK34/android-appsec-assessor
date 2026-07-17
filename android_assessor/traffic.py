@@ -157,7 +157,11 @@ class TrafficCaptureService:
         canary: str | None = None,
     ) -> TrafficCaptureState:
         record = self.repository.load(session_id)
-        load_scope(self.paths).require_device_package(record.serial, record.package)
+        load_scope(self.paths).require_device_package(
+            record.serial,
+            record.package,
+            action="traffic_capture",
+        )
         existing = self.load_state(record.session_id)
         if existing and existing.status in {"running", "stop_failed"}:
             raise ProxyError("Traffic capture is running or requires cleanup for this session.")

@@ -353,7 +353,11 @@ class ValidationService:
 
     def validate(self, session_id: str, finding_id: str) -> FindingRecord:
         record = self.repository.load(session_id)
-        load_scope(self.paths).require_device_package(record.serial, record.package)
+        load_scope(self.paths).require_device_package(
+            record.serial,
+            record.package,
+            action="controlled_validation",
+        )
         self.repository.require_modifying_session_slot(record.serial, record.session_id)
         with DeviceLock(
             self.paths,
