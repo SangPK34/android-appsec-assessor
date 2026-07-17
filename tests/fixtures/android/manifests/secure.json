@@ -1,0 +1,12 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "package": "com.example.rootedlab",
+  "manifest": {
+    "debuggable": false,
+    "test_only": false,
+    "allow_backup": false,
+    "uses_cleartext_traffic": false,
+    "components": []
+  }
+}

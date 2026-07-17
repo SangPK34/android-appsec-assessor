@@ -1,0 +1,12 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "outcomes": {
+    "available": {"exit_code": 0, "stdout": "uid=0(root) gid=0(root)", "stderr": "", "timed_out": false},
+    "shell_only": {"exit_code": 0, "stdout": "uid=2000(shell) gid=2000(shell)", "stderr": "", "timed_out": false},
+    "denied": {"exit_code": 1, "stdout": "", "stderr": "permission denied", "timed_out": false},
+    "timeout": {"exit_code": -1, "stdout": "", "stderr": "", "timed_out": true},
+    "missing": {"exit_code": 127, "stdout": "", "stderr": "su: not found", "timed_out": false},
+    "malformed": {"exit_code": 0, "stdout": "unexpected identity", "stderr": "", "timed_out": false}
+  }
+}

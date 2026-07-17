@@ -1,0 +1,9 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "format": "threadtime",
+  "lines": [
+    "07-17 10:00:00.000 10123 10123 I RootedLab: fixture startup",
+    "07-17 10:00:01.000 10123 10123 W RootedLab: token=THESIS_CANARY_LOGCAT_TOKEN"
+  ]
+}

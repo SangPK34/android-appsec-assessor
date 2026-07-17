@@ -1,0 +1,9 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "format": "epoch-uid",
+  "lines": [
+    "1784263200.000 10123 10123 10123 I RootedLab: fixture startup",
+    "1784263201.000 10123 10123 10123 W RootedLab: email=fixture@example.invalid"
+  ]
+}

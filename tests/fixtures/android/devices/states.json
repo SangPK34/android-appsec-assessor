@@ -1,0 +1,12 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "scenarios": {
+    "disconnected": {"connected": false},
+    "unauthorized": {"connected": true, "adb_state": "unauthorized"},
+    "offline": {"connected": true, "adb_state": "offline"},
+    "non_root_arm64": {"connected": true, "adb_state": "device", "abi": "arm64-v8a", "root": false},
+    "rooted_arm64": {"connected": true, "adb_state": "device", "abi": "arm64-v8a", "root": true},
+    "rooted_x86_64": {"connected": true, "adb_state": "device", "abi": "x86_64", "root": true}
+  }
+}

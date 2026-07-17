@@ -1,0 +1,9 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "scenarios": {
+    "present": {"available": true, "version": "fixture-27.0", "zygisk": true},
+    "present_without_zygisk": {"available": true, "version": "fixture-27.0", "zygisk": false},
+    "absent": {"available": false, "version": null, "zygisk": false}
+  }
+}

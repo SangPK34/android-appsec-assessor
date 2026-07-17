@@ -22,6 +22,10 @@ evidence/
 traffic/
 screenshots/
 logcat/
+!tests/fixtures/android/traffic/
+!tests/fixtures/android/traffic/**
+!tests/fixtures/android/logcat/
+!tests/fixtures/android/logcat/**
 *.exe
 *.dll
 *.zip

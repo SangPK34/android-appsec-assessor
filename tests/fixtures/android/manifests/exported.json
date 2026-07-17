@@ -1,0 +1,17 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "package": "com.example.rootedlab",
+  "manifest": {
+    "debuggable": true,
+    "test_only": false,
+    "allow_backup": true,
+    "uses_cleartext_traffic": true,
+    "application_permission": "com.example.rootedlab.INTERNAL",
+    "components": [
+      {"type": "activity", "name": ".CanaryActivity", "exported": true, "permission": null},
+      {"type": "receiver", "name": ".LabReceiver", "exported": true, "permission": "com.example.rootedlab.INTERNAL"},
+      {"type": "provider", "name": ".LabProvider", "exported": true, "read_permission": null, "write_permission": null}
+    ]
+  }
+}

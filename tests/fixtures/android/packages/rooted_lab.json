@@ -1,0 +1,16 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "package": "com.example.rootedlab",
+  "metadata": {
+    "uid": 10123,
+    "version_name": "1.0-fixture",
+    "version_code": 1,
+    "data_directory": "/data/user/0/com.example.rootedlab",
+    "base_apk": "/data/app/fixture/base.apk",
+    "split_apks": [
+      "/data/app/fixture/split_config.arm64_v8a.apk",
+      "/data/app/fixture/split_config.en.apk"
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "proxy_scenarios": {
+    "preexisting": "host.lab.local:8888",
+    "empty": null,
+    "snapshot_failed": "CAPTURE_FAILED"
+  },
+  "reverse_scenarios": {
+    "owned": {"tcp:8080": "tcp:8080"},
+    "externally_changed": {"tcp:8080": "tcp:9090"}
+  },
+  "flows": [
+    {"flow_id": "fixture-attributed", "attribution": "validation_canary", "scheme": "http", "url": "http://api.lab.local/canary?value=THESIS_CANARY_TRAFFIC"},
+    {"flow_id": "fixture-unattributed", "attribution": "unattributed", "scheme": "http", "url": "http://background.invalid/?access_token=FIXTURE_BACKGROUND_TOKEN"}
+  ]
+}
