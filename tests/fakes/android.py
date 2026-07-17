@@ -41,6 +41,8 @@ class FakeAndroidBackend:
     """Stateful fake used only by tests; every mutation is fault-injectable."""
 
     serial: str = "FIXTURE_SERIAL"
+    evidence_source: str = "fixture"
+    environment_type: str = "simulated"
     connected: bool = True
     adb_state: str = "device"
     model: str = "Fixture Android"
@@ -149,6 +151,7 @@ class FakeAndroidBackend:
 
     def inspect_package(self, serial: str, package: str) -> dict[str, Any]:
         self._require_connected(serial)
+        self.operations.append(("inspect_package", (package,)))
         try:
             return deepcopy(self.packages[package])
         except KeyError as exc:
@@ -156,6 +159,7 @@ class FakeAndroidBackend:
 
     def list_storage(self, serial: str, package: str) -> list[dict[str, Any]]:
         self._require_connected(serial)
+        self.operations.append(("list_storage", (package,)))
         if package not in self.packages:
             raise AdbError("Fixture package is not installed.")
         return deepcopy(self.storage_entries)

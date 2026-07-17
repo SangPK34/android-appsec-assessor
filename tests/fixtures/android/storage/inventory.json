@@ -5,12 +5,14 @@
   "data_directory": "/data/user/0/com.example.rootedlab",
   "entries": [
     {"path": "shared_prefs/session.xml", "type": "shared_preferences", "size": 180, "uid": 10123, "gid": 10123, "mode": "0600", "content_fixture": "<string name=\"token\">THESIS_CANARY_STORAGE_TOKEN</string>"},
-    {"path": "databases/lab.db", "type": "sqlite", "size": 4096, "uid": 10123, "gid": 10123, "mode": "0600", "tables": ["canary_records"]},
+    {"path": "databases/lab.db", "type": "sqlite", "size": 4096, "uid": 10123, "gid": 10123, "mode": "0600", "tables": ["canary_records"], "content_fixture": "THESIS_CANARY_SQLITE_TOKEN"},
     {"path": "files/ciphertext.bin", "type": "file", "size": 64, "uid": 10123, "gid": 10123, "mode": "0600"},
     {"path": "files/key.txt", "type": "file", "size": 32, "uid": 10123, "gid": 10123, "mode": "0644", "content_fixture": "FIXTURE_KEY_MATERIAL"},
     {"path": "cache/stale-token.txt", "type": "cache", "size": 40, "uid": 10123, "gid": 10123, "mode": "0600", "after_logout": true, "content_fixture": "THESIS_CANARY_LOGOUT_TOKEN"},
     {"path": "no_backup/state.json", "type": "no_backup", "size": 20, "uid": 10123, "gid": 10123, "mode": "0600"},
     {"path": "app_webview/Default/Cookies", "type": "webview", "size": 1024, "uid": 10123, "gid": 10123, "mode": "0600"},
-    {"path": "external/files/export.txt", "type": "external", "size": 50, "uid": 10123, "gid": 10123, "mode": "0644"}
+    {"path": "external/files/export.txt", "canonical_path": "/storage/emulated/0/Android/data/com.example.rootedlab/files/export.txt", "type": "external", "size": 50, "uid": 10123, "gid": 10123, "mode": "0644"},
+    {"path": "files/outside-link", "type": "symlink", "size": 0, "uid": 10123, "gid": 10123, "mode": "0777", "symlink_target": "/data/local/tmp/outside"},
+    {"path": "files/oversized.txt", "type": "file", "size": 99999999, "uid": 10123, "gid": 10123, "mode": "0600", "content_fixture": "THESIS_CANARY_TOO_LARGE"}
   ]
 }
