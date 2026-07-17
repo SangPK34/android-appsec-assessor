@@ -52,7 +52,14 @@ class WebBackendProtocol(Protocol):
 
     def session_detail(self, session_id: str) -> dict[str, Any]: ...
 
-    def scan_session(self, session_id: str, profile: str = "quick") -> dict[str, Any]: ...
+    def scan_session(
+        self,
+        session_id: str,
+        profile: str = "quick",
+        *,
+        runtime_seconds: int | None = None,
+        autonomous: bool | None = None,
+    ) -> dict[str, Any]: ...
 
     def request_runtime_stop(self, session_id: str) -> dict[str, Any]: ...
 
@@ -138,9 +145,7 @@ class RepairController:
             command_processor = os.environ.get("COMSPEC", "cmd.exe")
             creation_flags = 0
             if os.name == "nt":
-                creation_flags = (
-                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-                )
+                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
             try:
                 self._process = subprocess.Popen(
                     [command_processor, "/d", "/c", str(self.script)],
@@ -246,10 +251,14 @@ class WebBackend:
         selected_target = self.target_store.read(serial=serial)
         if selected_target != target:
             raise AndroidAssessorError("Select the package before starting app inspection.")
-        return AppInspectionService(self.context, self.repository).inspect(
-            package=target,
-            serial=serial,
-        ).to_dict()
+        return (
+            AppInspectionService(self.context, self.repository)
+            .inspect(
+                package=target,
+                serial=serial,
+            )
+            .to_dict()
+        )
 
     def app_inspection(self, session_id: str) -> dict[str, Any]:
         session_paths = self.repository.paths_for(session_id)
@@ -277,14 +286,18 @@ class WebBackend:
             else [finding.to_dict() for finding in findings]
         )
         observations = report.get("runtime_observations", [])
-        runtime_categories = sorted(
-            {
-                str(item.get("rule_id", "")).removeprefix("ASL-RUNTIME-").casefold()
-                for item in observations
-                if isinstance(item, dict)
-                and item.get("status") not in {"skipped", "inconclusive"}
-            }
-        ) if isinstance(observations, list) else []
+        runtime_categories = (
+            sorted(
+                {
+                    str(item.get("rule_id", "")).removeprefix("ASL-RUNTIME-").casefold()
+                    for item in observations
+                    if isinstance(item, dict)
+                    and item.get("status") not in {"skipped", "inconclusive"}
+                }
+            )
+            if isinstance(observations, list)
+            else []
+        )
         return {
             "session": record.to_dict(show_serial=False),
             "app": self._optional_session_json(paths.app_json),
@@ -292,35 +305,54 @@ class WebBackend:
             "traffic": self._optional_session_json(paths.traffic_dir / "state.json"),
             "frida": self._optional_session_json(paths.frida_dir / "state.json"),
             "findings": finding_payload,
-            "evidence_count": len(evidence_values)
-            if isinstance(evidence_values, list)
-            else 0,
+            "evidence_count": len(evidence_values) if isinstance(evidence_values, list) else 0,
             "report_available": paths.report_html.is_file(),
             "runtime_categories": runtime_categories,
             "runtime_checks": report.get("runtime_checks", []),
             "runtime_observations": observations if isinstance(observations, list) else [],
         }
 
-    def scan_session(self, session_id: str, profile: str = "quick") -> dict[str, Any]:
-        return ScanService(self.context, self.repository).scan_session(
-            session_id,
-            profile=profile,
-        ).to_dict()
+    def scan_session(
+        self,
+        session_id: str,
+        profile: str = "quick",
+        *,
+        runtime_seconds: int | None = None,
+        autonomous: bool | None = None,
+    ) -> dict[str, Any]:
+        return (
+            ScanService(self.context, self.repository)
+            .scan_session(
+                session_id,
+                profile=profile,
+                runtime_seconds=runtime_seconds,
+                autonomous=autonomous,
+            )
+            .to_dict()
+        )
 
     def request_runtime_stop(self, session_id: str) -> dict[str, Any]:
         return ScanService(self.context, self.repository).request_runtime_stop(session_id)
 
     def validate_finding(self, session_id: str, finding_id: str) -> dict[str, Any]:
-        return ValidationService(self.context, self.repository).validate(
-            session_id,
-            finding_id,
-        ).to_dict()
+        return (
+            ValidationService(self.context, self.repository)
+            .validate(
+                session_id,
+                finding_id,
+            )
+            .to_dict()
+        )
 
     def start_traffic(self, session_id: str) -> dict[str, Any]:
-        return TrafficCaptureService(self.context, self.repository).start(
-            session_id,
-            launch_app=True,
-        ).to_dict()
+        return (
+            TrafficCaptureService(self.context, self.repository)
+            .start(
+                session_id,
+                launch_app=True,
+            )
+            .to_dict()
+        )
 
     def stop_traffic(self, session_id: str) -> dict[str, Any]:
         state = TrafficCaptureService(self.context, self.repository).stop(session_id)

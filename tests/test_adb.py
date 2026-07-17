@@ -70,6 +70,52 @@ def test_parses_reverse_list_for_only_selected_serial() -> None:
     assert [(item.remote, item.local) for item in mappings] == [("tcp:8080", "tcp:8080")]
 
 
+def test_parses_reverse_list_with_scoped_transport_label() -> None:
+    output = (
+        "host-12 tcp:8080 tcp:8080\n"
+        "ABC123 tcp:8081 tcp:8081\n"
+        "OTHER tcp:9000 tcp:9000\n"
+        "host-invalid tcp:9001 tcp:9001\n"
+    )
+
+    mappings = parse_reverse_list(output, "ABC123")
+
+    assert [(item.remote, item.local) for item in mappings] == [
+        ("tcp:8080", "tcp:8080"),
+        ("tcp:8081", "tcp:8081"),
+    ]
+
+
+def test_list_reverse_scopes_command_to_selected_serial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "platform tools" / "adb.exe"
+    executable.parent.mkdir()
+    executable.touch()
+    captured: list[str] = []
+
+    def fake_run(arguments: object, **_kwargs: object) -> CommandResult:
+        captured.extend(str(item) for item in arguments)  # type: ignore[union-attr]
+        return CommandResult(
+            arguments=(),
+            exit_code=0,
+            stdout="host-12 tcp:8080 tcp:8080\n",
+            stderr="",
+            started_at="2026-07-17T00:00:00+00:00",
+            duration_ms=1,
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(adb_module, "run_command", fake_run)
+    client = AdbClient(executable)
+
+    mappings = client.list_reverse("ABC123")
+
+    assert captured[1:] == ["-s", "ABC123", "reverse", "--list"]
+    assert [(item.remote, item.local) for item in mappings] == [("tcp:8080", "tcp:8080")]
+
+
 def test_device_command_always_includes_explicit_serial(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

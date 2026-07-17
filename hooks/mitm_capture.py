@@ -31,6 +31,12 @@ def load(loader: object) -> None:
         "",
         "Unique controlled-validation canary used for conservative attribution",
     )
+    loader.add_option(  # type: ignore[attr-defined]
+        "android_assessor_allowed_hosts",
+        str,
+        "",
+        "Comma-separated exact host allowlist for outbound capture",
+    )
 
 
 def _headers(headers: http.Headers) -> dict[str, str]:
@@ -64,6 +70,15 @@ def _attribution(value: str) -> str:
     return "unattributed"
 
 
+def _allowed_hosts() -> frozenset[str]:
+    configured = str(getattr(ctx.options, "android_assessor_allowed_hosts", ""))
+    return frozenset(
+        host.strip().casefold().rstrip(".")
+        for host in configured.split(",")
+        if host.strip()
+    )
+
+
 def _write(payload: dict[str, object]) -> None:
     output = str(ctx.options.android_assessor_events)
     if not output:
@@ -78,7 +93,13 @@ def _write(payload: dict[str, object]) -> None:
 
 def request(flow: http.HTTPFlow) -> None:
     request_value = flow.request
-    attribution = _attribution(request_value.pretty_url)
+    request_host = request_value.pretty_host.casefold().rstrip(".")
+    scope_allowed = request_host in _allowed_hosts()
+    attribution = (
+        _attribution(request_value.pretty_url)
+        if scope_allowed
+        else "blocked_outside_scope"
+    )
     flow.metadata["android_assessor_attribution"] = attribution
     _write(
         {
@@ -97,8 +118,16 @@ def request(flow: http.HTTPFlow) -> None:
             ),
             "cleartext": request_value.scheme.casefold() == "http",
             "attribution": attribution,
+            "scope_allowed": scope_allowed,
+            "blocked": not scope_allowed,
         }
     )
+    if not scope_allowed:
+        flow.response = http.Response.make(
+            451,
+            b"",
+            {"content-type": "text/plain; charset=utf-8"},
+        )
 
 
 def response(flow: http.HTTPFlow) -> None:

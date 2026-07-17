@@ -20,6 +20,7 @@ from .validation import (
 _SERIAL_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _SETTING_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _GETPROP_PATTERN = re.compile(r"^\[([^]]+)]\s*:\s*\[(.*)]$")
+_REVERSE_TRANSPORT_LABEL_PATTERN = re.compile(r"^host-\d+$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +113,9 @@ def parse_reverse_list(output: str, serial: str) -> list[ReverseMapping]:
         columns = raw_line.split()
         if len(columns) == 3:
             listed_serial, remote, local = columns
-            if listed_serial != serial:
+            if listed_serial != serial and not _REVERSE_TRANSPORT_LABEL_PATTERN.fullmatch(
+                listed_serial
+            ):
                 continue
         elif len(columns) == 2:
             remote, local = columns

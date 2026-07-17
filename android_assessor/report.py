@@ -75,9 +75,7 @@ def _capability_available(device: dict[str, Any] | None, name: str) -> bool:
     if not isinstance(values, list):
         return False
     return any(
-        isinstance(item, dict)
-        and item.get("name") == name
-        and item.get("available") is True
+        isinstance(item, dict) and item.get("name") == name and item.get("available") is True
         for item in values
     )
 
@@ -103,9 +101,7 @@ def _fixture_or_physical(
     marker = ""
     if environment:
         marker = str(
-            environment.get("fixture_or_physical")
-            or environment.get("environment_type")
-            or ""
+            environment.get("fixture_or_physical") or environment.get("environment_type") or ""
         ).casefold()
     if marker in {"fixture", "simulated"} or any(
         item.get("source") == "fixture" for item in evidence
@@ -149,7 +145,8 @@ def _is_runtime_check(finding: dict[str, Any]) -> bool:
 
 def _is_aggregate_alias(finding: dict[str, Any], rule_ids: set[str]) -> bool:
     return str(finding.get("rule_id", "")) == "ASL-MVP-004" and bool(
-        rule_ids & {
+        rule_ids
+        & {
             "ASL-MANIFEST-EXPORTED-ACTIVITY",
             "ASL-MANIFEST-EXPORTED-RECEIVER",
             "ASL-MANIFEST-EXPORTED-PROVIDER",
@@ -206,8 +203,7 @@ def _runtime_event_rows(
             (
                 str(item.get("finding_id"))
                 for item in findings
-                if str(item.get("rule_id")) == "CRYPTO-ECB"
-                and category == "crypto"
+                if str(item.get("rule_id")) == "CRYPTO-ECB" and category == "crypto"
             ),
             None,
         )
@@ -241,11 +237,7 @@ def _root_coverage_aliases(
         if alias in observed:
             continue
         target = next(
-            (
-                findings_by_rule.get(rule_id)
-                for rule_id in targets
-                if rule_id in findings_by_rule
-            ),
+            (findings_by_rule.get(rule_id) for rule_id in targets if rule_id in findings_by_rule),
             None,
         )
         if target is None:
@@ -273,10 +265,7 @@ def _validation_type(finding: dict[str, Any]) -> str:
         value = str(details.get("validation_type", ""))
         if value in _VALIDATION_TYPES:
             return value
-    if (
-        finding.get("frida_used") is True
-        or finding.get("analysis_type") == "instrumentation"
-    ):
+    if finding.get("frida_used") is True or finding.get("analysis_type") == "instrumentation":
         return "instrumented_validation"
     if finding.get("root_used") is True or finding.get("root_required") is True:
         return "root_assisted_validation"
@@ -285,9 +274,11 @@ def _validation_type(finding: dict[str, Any]) -> str:
 
 def _physical_status(finding: dict[str, Any], provenance: str) -> str:
     details = finding.get("details")
-    value = str(details.get("physical_validation_status", "UNVERIFIED")) if isinstance(
-        details, dict
-    ) else "UNVERIFIED"
+    value = (
+        str(details.get("physical_validation_status", "UNVERIFIED"))
+        if isinstance(details, dict)
+        else "UNVERIFIED"
+    )
     if value not in _PHYSICAL_STATUSES:
         value = "UNVERIFIED"
     if provenance == "fixture" and value in {"PASSED", "FAILED"}:
@@ -305,9 +296,7 @@ def _normalize_findings(
     evidence_source: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     evidence_by_id = {
-        str(item.get("evidence_id")): item
-        for item in evidence
-        if item.get("evidence_id")
+        str(item.get("evidence_id")): item for item in evidence if item.get("evidence_id")
     }
     normalized: list[dict[str, Any]] = []
     coverage: list[dict[str, Any]] = []
@@ -353,9 +342,7 @@ def _normalize_findings(
                 "available_without_root": not bool(finding.get("root_required")),
                 "available_with_root": True,
                 "requires_frida": frida_required,
-                "implementation_status": str(
-                    details.get("implementation_status", "IMPLEMENTED")
-                ),
+                "implementation_status": str(details.get("implementation_status", "IMPLEMENTED")),
                 "physical_validation_status": physical_status,
                 "finding_status": str(finding.get("status", "inconclusive")),
             }
@@ -419,9 +406,7 @@ def _experiment_csv(
             "false_positive": details.get("false_positive", ""),
             "false_negative": details.get("false_negative", ""),
             "cleanup_success": report["cleanup"]["success"],
-            "physical_validation_status": finding.get(
-                "device_validation_status", "UNVERIFIED"
-            ),
+            "physical_validation_status": finding.get("device_validation_status", "UNVERIFIED"),
         }
         writer.writerow({name: _csv_cell(row[name]) for name in _EXPERIMENT_FIELDS})
     return buffer.getvalue()
@@ -468,10 +453,7 @@ class ReportService:
         provenance = _fixture_or_physical(environment, evidence)
         root_available = _capability_available(device, "ANDROID_ROOT")
         root_metadata = _capability_metadata(device, "ANDROID_ROOT")
-        root_mode = str(
-            root_metadata.get("root_mode")
-            or ("su_root" if root_available else "none")
-        )
+        root_mode = str(root_metadata.get("root_mode") or ("su_root" if root_available else "none"))
         frida_state = _optional_json(paths.frida_dir / "state.json", self.paths.root)
         private_storage = _optional_json(
             paths.redacted_dir / "storage" / "private-storage.json", self.paths.root
@@ -512,7 +494,8 @@ class ReportService:
         rule_ids = {str(item.get("rule_id")) for item in findings}
         suppressed_findings = [item for item in findings if _is_aggregate_alias(item, rule_ids)]
         security_rules = [
-            item for item in findings
+            item
+            for item in findings
             if not _is_runtime_check(item) and item not in suppressed_findings
         ]
         runtime_checks = [item for item in findings if _is_runtime_check(item)]
@@ -528,16 +511,8 @@ class ReportService:
         )
         app_timings = app.get("phase_timings", {}) if isinstance(app, dict) else {}
         scan_timings = {
-            **(
-                app_timings
-                if isinstance(app_timings, dict)
-                else {}
-            ),
-            **(
-                scan.get("phase_timings", {})
-                if isinstance(scan, dict)
-                else {}
-            ),
+            **(app_timings if isinstance(app_timings, dict) else {}),
+            **(scan.get("phase_timings", {}) if isinstance(scan, dict) else {}),
         }
         scan_steps = scan.get("dynamic_steps", {}) if isinstance(scan, dict) else {}
         app_steps = app.get("steps", {}) if isinstance(app, dict) else {}
@@ -551,6 +526,10 @@ class ReportService:
             "logcat": ("logcat", "Bounded target-process logcat."),
             "private_storage": ("storage", "Bounded private-storage analysis."),
             "frida": ("frida_start", "Frida observer lifecycle."),
+            "autonomous_exploration": (
+                "exploration",
+                "Bounded package-scoped UI exploration.",
+            ),
             "runtime_observation": ("runtime_observation", "Runtime event observation."),
             "traffic": ("traffic", "Scoped traffic capture."),
             "report": ("report", "Report generation."),
@@ -565,6 +544,10 @@ class ReportService:
             "logcat": ("target_logcat",),
             "private_storage": ("private_storage_",),
             "frida": ("frida_",),
+            "autonomous_exploration": (
+                "autonomous_exploration_",
+                "autonomous_interaction_",
+            ),
             "runtime_observation": ("frida_events", "target_logcat"),
             "traffic": ("traffic_",),
             "report": ("report_", "experiment_results_csv"),
@@ -573,6 +556,7 @@ class ReportService:
             planned = scan_profile == "full" or module not in {
                 "private_storage",
                 "frida",
+                "autonomous_exploration",
                 "runtime_observation",
                 "traffic",
             }
@@ -581,23 +565,31 @@ class ReportService:
                 "manifest": "aapt2_manifest",
                 "signature": "apksigner",
             }.get(module)
-            executed = (app_step is not None and app_steps.get(app_step) == "completed") or (
-                timing_key in scan_timings
-            ) or (
-                module == "frida" and scan_steps.get("frida_observation") not in {None, "skipped"}
-            ) or (
-                module == "report"
+            executed = (
+                (app_step is not None and app_steps.get(app_step) == "completed")
+                or (timing_key in scan_timings)
+                or (
+                    module == "frida"
+                    and scan_steps.get("frida_observation") not in {None, "skipped"}
+                )
+                or (
+                    module == "autonomous_exploration"
+                    and scan_steps.get("autonomous_exploration") not in {None, "skipped"}
+                )
+                or (module == "report")
             )
             skipped_step = {
                 "traffic": "traffic_capture",
                 "frida": "frida_observation",
+                "autonomous_exploration": "autonomous_exploration",
                 "private_storage": "private_storage",
                 "logcat": "target_logcat",
             }.get(module, "")
-            skipped = scan_steps.get(skipped_step) == "skipped" or (
-                app_step is not None
-                and app_steps.get(app_step) in {"skipped", "error"}
+            step_result = scan_steps.get(skipped_step)
+            skipped = step_result == "skipped" or (
+                app_step is not None and app_steps.get(app_step) in {"skipped", "error"}
             )
+            failed = step_result in {"error", "start_failed", "stop_failed"}
             limitation_values = []
             if isinstance(app, dict) and isinstance(app.get("limitations"), list):
                 limitation_values.extend(str(item) for item in app["limitations"])
@@ -612,6 +604,7 @@ class ReportService:
                 "logcat": ("logcat",),
                 "private_storage": ("storage",),
                 "frida": ("frida",),
+                "autonomous_exploration": ("exploration",),
                 "traffic": ("traffic", "proxy"),
             }
             evidence_count = (
@@ -637,7 +630,7 @@ class ReportService:
                     ),
                     None,
                 )
-                if skipped
+                if skipped or failed
                 else None
             )
             modules.append(
@@ -648,6 +641,8 @@ class ReportService:
                     "result": (
                         "not_planned"
                         if not planned
+                        else "error"
+                        if failed
                         else "skipped"
                         if skipped
                         else "completed"
@@ -663,8 +658,7 @@ class ReportService:
                 }
             )
         security_findings = [
-            item for item in security_rules
-            if str(item.get("status")) in {"confirmed", "potential"}
+            item for item in security_rules if str(item.get("status")) in {"confirmed", "potential"}
         ]
         root_used_by_findings = _capability_used_by_security_findings(security_rules, "root_used")
         frida_used_by_findings = _capability_used_by_security_findings(security_rules, "frida_used")
@@ -705,15 +699,24 @@ class ReportService:
         security_rules_evaluated = len(security_rules)
         total_checks_executed = security_rules_evaluated + runtime_checks_executed
         wall_clock = scan.get("wall_clock_duration_ms") if isinstance(scan, dict) else None
+        duration_keys = {
+            "preflight",
+            "apk_acquisition",
+            "manifest",
+            "signature",
+            "rule_evaluation",
+            "logcat",
+            "storage",
+            "frida_startup",
+            "traffic_startup",
+            "runtime_analysis",
+            "report",
+        }
+        duration_keys.add("exploration" if "exploration" in scan_timings else "runtime_interaction")
         module_duration_sum = sum(
             float(value)
             for key, value in scan_timings.items()
-            if key in {
-                "preflight", "apk_acquisition", "manifest", "signature",
-                "rule_evaluation", "logcat", "storage", "frida_startup",
-                "traffic_startup", "runtime_interaction", "runtime_analysis", "report",
-            }
-            and isinstance(value, (int, float))
+            if key in duration_keys and isinstance(value, (int, float))
         )
         module_findings = {
             "static_rules": sum(
@@ -727,18 +730,28 @@ class ReportService:
         traffic_state = _optional_json(paths.traffic_dir / "state.json", self.paths.root) or {}
         for module in modules:
             module_name = str(module.get("module"))
-            module["evidence"] = sum(
-                1 for item in usable_evidence
-                if str(item.get("evidence_type", "")).startswith(
-                    module_evidence_prefixes.get(module_name, ())
+            module["evidence"] = (
+                sum(
+                    1
+                    for item in usable_evidence
+                    if str(item.get("evidence_type", "")).startswith(
+                        module_evidence_prefixes.get(module_name, ())
+                    )
                 )
-            ) if module.get("executed") else 0
+                if module.get("executed")
+                else 0
+            )
             module["event_item_count"] = (
                 sum(int(item.get("event_count", 0)) for item in observations)
                 if module_name in {"frida", "runtime_observation"}
-                else int(traffic_state.get("flow_count", 0)) if module_name == "traffic"
+                else int(traffic_state.get("flow_count", 0))
+                if module_name == "traffic"
                 else len((private_storage or {}).get("observations", []))
                 if module_name == "private_storage"
+                else int(
+                    ((scan or {}).get("autonomous_exploration") or {}).get("actions_executed", 0)
+                )
+                if module_name == "autonomous_exploration"
                 else 0
             )
             module["findings_produced"] = module_findings.get(module_name, 0)

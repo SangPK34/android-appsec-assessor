@@ -41,7 +41,7 @@
         <input type="hidden" name="action_token" value="{{ action_token }}"><input type="hidden" name="profile" value="quick"><button class="button" type="submit">Quick Scan</button>
       </form>
       <form method="post" action="/sessions/{{ detail.session.session_id }}/scan" hx-post="/sessions/{{ detail.session.session_id }}/scan" hx-target="body" hx-select="body" hx-swap="outerHTML" hx-indicator="closest .panel" hx-disabled-elt="find button">
-        <input type="hidden" name="action_token" value="{{ action_token }}"><input type="hidden" name="profile" value="full"><button class="button" type="submit">Full Assessment</button>
+        <input type="hidden" name="action_token" value="{{ action_token }}"><input type="hidden" name="profile" value="full"><input type="hidden" name="autonomous" value="true"><label>Max runtime <input name="max_runtime" type="number" min="1" max="300" value="45"></label><small>Autonomous exploration: enabled</small><button class="button" type="submit">Full Assessment</button>
       </form>
       <form method="post" action="/sessions/{{ detail.session.session_id }}/runtime/stop" hx-post="/sessions/{{ detail.session.session_id }}/runtime/stop" hx-swap="none" hx-disabled-elt="find button">
         <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Stop and analyze</button>

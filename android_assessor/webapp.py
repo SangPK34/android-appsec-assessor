@@ -378,6 +378,8 @@ def create_app(
         session_id: str,
         submitted_token: Annotated[str, Form(alias="action_token")],
         profile: Annotated[str, Form()] = "quick",
+        max_runtime: Annotated[int | None, Form()] = None,
+        autonomous: Annotated[str | None, Form()] = None,
     ) -> Response:
         verify_action_token(submitted_token)
         is_hx_request = request.headers.get("HX-Request", "").casefold() == "true"
@@ -395,10 +397,14 @@ def create_app(
             return "unknown", "unknown"
 
         try:
-            if profile == "quick":
-                service.scan_session(session_id)
-            else:
-                service.scan_session(session_id, profile=profile)
+            service.scan_session(
+                session_id,
+                profile=profile,
+                runtime_seconds=max_runtime,
+                autonomous=autonomous.casefold() not in {"0", "false", "off"}
+                if autonomous is not None
+                else None,
+            )
         except (AndroidAssessorError, OSError, ValueError) as exc:
             safe_error = expected_error(exc)
             device, package = scan_context()
@@ -421,11 +427,7 @@ def create_app(
                 session_id,
                 error=message,
                 status_code=(
-                    200
-                    if is_hx_request
-                    else 409
-                    if isinstance(exc, DeviceBusyError)
-                    else 400
+                    200 if is_hx_request else 409 if isinstance(exc, DeviceBusyError) else 400
                 ),
             )
         except Exception:

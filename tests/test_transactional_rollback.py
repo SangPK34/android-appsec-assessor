@@ -199,9 +199,48 @@ def test_traffic_start_rolls_back_each_partial_mutation(
     assert repository.load(session_id).pending_cleanup is False
 
 
+def test_traffic_uses_lazy_upstream_and_exact_host_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _repository, session_id, _adb, process, executable = prepared_service(
+        tmp_path,
+        "launch",
+    )
+    service.paths.scope_file.write_text(
+        "devices: [ABC123]\n"
+        "packages: [com.example.app]\n"
+        "api_hosts: [10.0.2.2]\n"
+        "allowed_actions: [traffic_capture]\n",
+        encoding="utf-8",
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "android_assessor.traffic.resolve_binary",
+        lambda *_args, **_kwargs: BinaryResolution(executable, "test"),
+    )
+    monkeypatch.setattr(
+        "android_assessor.traffic.subprocess.Popen",
+        lambda command, **_kwargs: commands.append(command) or process,
+    )
+    monkeypatch.setattr(
+        TrafficCaptureService,
+        "_wait_ready",
+        staticmethod(lambda *_args, **_kwargs: None),
+    )
+
+    with pytest.raises(AdbError):
+        service.start(session_id)
+
+    assert "connection_strategy=lazy" in commands[0]
+    assert "android_assessor_allowed_hosts=10.0.2.2" in commands[0]
+
+
+@pytest.mark.parametrize("frida_stop_error", [False, True])
 def test_scan_stops_started_resources_when_wait_is_interrupted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    frida_stop_error: bool,
 ) -> None:
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
@@ -259,6 +298,8 @@ def test_scan_stops_started_resources_when_wait_is_interrupted(
         def stop(self, session_id: str) -> SimpleNamespace:
             del session_id
             calls.append("frida_stop")
+            if frida_stop_error:
+                raise RuntimeError("synthetic Frida stop failure")
             return SimpleNamespace(status="stopped")
 
     monkeypatch.setattr("android_assessor.services.scan_service.TrafficCaptureService", Traffic)

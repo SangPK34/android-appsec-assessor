@@ -1,6 +1,46 @@
 schema_version: 1
 application: com.htbridge.pivaa
 purpose: "Validation reference for emulator assessments; not a production rule configuration."
+benchmark_runs:
+  baseline_no_interaction:
+    interaction_mode: none
+    wall_clock_duration_ms: 54137
+    ui_states_visited: 1
+    activities_visited: 1
+    actions_executed: 0
+    runtime_categories: [logging, storage, tls]
+    runtime_events: 18
+    security_rules_evaluated: 10
+    security_findings: 3
+    benchmark_cases_exercised: [debug_test_configuration, backup_policy, exported_components]
+  autonomous_explorer:
+    interaction_mode: bounded_package_scoped_adb
+    max_runtime_seconds: 45
+    wall_clock_duration_ms: 51897
+    ui_states_visited: 7
+    activities_visited: 3
+    actions_executed: 12
+    actions_succeeded: 10
+    adb_commands: 63
+    ui_dumps: 16
+    duplicate_actions_avoided: 7
+    termination_reason: max_runtime
+    runtime_categories: [crypto, logging, storage, tls, webview]
+    runtime_events: 147
+    security_rules_evaluated: 10
+    security_findings: 3
+    benchmark_cases_exercised:
+      - debug_test_configuration
+      - backup_policy
+      - exported_components
+      - crypto_behavior
+      - webview_behavior
+      - logging
+      - private_storage
+    notes:
+      - "The autonomous run executed AES/CBC and retained WebView/storage/logging observations; it did not fabricate an ECB finding when that path was not reached."
+      - "Embedded requests to a host outside scope were blocked locally before upstream dispatch."
+      - "Counts are validation measurements, not production thresholds or package-specific rule logic."
 cases:
   - category: debug_test_configuration
     ground_truth_evidence: manifest.debuggable_or_test_only
@@ -42,8 +82,8 @@ cases:
     ground_truth_evidence: frida.crypto.transformation_and_execution_metadata
     eligible_framework_rule: CRYPTO-ECB
     expected_minimum_status: confirmed
-    observed_status: confirmed
-    reason_for_mismatch: null
+    observed_status: pass
+    reason_for_mismatch: "The bounded run executed AES/CBC; the eligible ECB path was not reached."
   - category: webview_behavior
     ground_truth_evidence: frida.webview.events
     eligible_framework_rule: ASL-RUNTIME-WEBVIEW

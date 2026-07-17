@@ -190,7 +190,8 @@ class TrafficCaptureService:
         canary: str | None = None,
     ) -> TrafficCaptureState:
         record = self.repository.load(session_id)
-        load_scope(self.paths).require_device_package(
+        scope = load_scope(self.paths)
+        scope.require_device_package(
             record.serial,
             record.package,
             action="traffic_capture",
@@ -241,6 +242,8 @@ class TrafficCaptureService:
             "--set",
             "block_global=false",
             "--set",
+            "connection_strategy=lazy",
+            "--set",
             f"confdir={confdir}",
             "-w",
             str(flow_path),
@@ -248,6 +251,8 @@ class TrafficCaptureService:
             str(addon),
             "--set",
             f"android_assessor_events={events_path}",
+            "--set",
+            "android_assessor_allowed_hosts=" + ",".join(sorted(scope.api_hosts)),
         ]
         if canary is not None:
             command.extend(("--set", f"android_assessor_canary={canary}"))

@@ -16,6 +16,7 @@ from .capabilities import CapabilityDetector
 from .device import DeviceSelectionStore
 from .environment import collect_environment, required_failures, write_environment_report
 from .errors import AndroidAssessorError
+from .explorer import ExplorerConfig
 from .logging_utils import configure_logging
 from .models import EnvironmentReport
 from .paths import ProjectPaths
@@ -85,6 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--session", dest="session_id")
     scan.add_argument("--profile", choices=[item.value for item in ScanProfile], default="quick")
     scan.add_argument("--runtime-seconds", type=int, default=None)
+    scan.add_argument(
+        "--autonomous",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable bounded package-scoped UI exploration for a full assessment.",
+    )
+    scan.add_argument("--max-runtime", type=int, default=None)
+    scan.add_argument("--max-actions", type=int, default=100)
+    scan.add_argument("--max-states", type=int, default=40)
+    scan.add_argument("--plateau-seconds", type=int, default=8)
+    scan.add_argument("--seed", type=int, default=1337)
     scan.add_argument("--json", action="store_true", dest="as_json")
     scan.add_argument("--output", type=Path)
 
@@ -289,17 +301,45 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
     if bool(args.package) == bool(args.session_id):
         raise AndroidAssessorError("Provide exactly one of --package or --session.")
     service = ScanService(context)
+    if args.runtime_seconds is not None and args.max_runtime is not None:
+        raise AndroidAssessorError("Use only one of --runtime-seconds or --max-runtime.")
+    max_runtime = args.max_runtime if args.max_runtime is not None else args.runtime_seconds
+    if max_runtime == 0 and args.autonomous is True:
+        raise AndroidAssessorError("--autonomous requires a runtime greater than zero.")
+    autonomous = False if max_runtime == 0 and args.autonomous is None else args.autonomous
+    explorer_config = None
+    if (
+        args.profile == ScanProfile.FULL.value
+        and autonomous is not False
+        and max_runtime != 0
+    ):
+        explorer_config = ExplorerConfig(
+            max_runtime_seconds=(
+                max_runtime
+                if max_runtime is not None
+                else ScanService.DEFAULT_AUTONOMOUS_RUNTIME_SECONDS
+            ),
+            max_actions=args.max_actions,
+            max_states=args.max_states,
+            plateau_seconds=args.plateau_seconds,
+            seed=args.seed,
+        )
     if args.session_id:
         result = service.scan_session(
             args.session_id,
             profile=args.profile,
-            runtime_seconds=args.runtime_seconds,
+            runtime_seconds=max_runtime,
+            autonomous=autonomous,
+            explorer_config=explorer_config,
         )
     else:
         result = service.scan(
             package=args.package,
             serial=args.serial,
             profile=args.profile,
+            runtime_seconds=max_runtime,
+            autonomous=autonomous,
+            explorer_config=explorer_config,
         )
     payload = result.to_dict()
     _write_output(payload, args.output, context.paths)
@@ -357,9 +397,7 @@ def _run_session(args: argparse.Namespace, context: AppContext) -> int:
             _print_session(payload)
         return 0
     if args.session_command == "list":
-        records = [
-            record.to_dict(show_serial=args.show_serial) for record in repository.list()
-        ]
+        records = [record.to_dict(show_serial=args.show_serial) for record in repository.list()]
         if args.as_json:
             print(json.dumps(records, ensure_ascii=False, indent=2))
         elif not records:

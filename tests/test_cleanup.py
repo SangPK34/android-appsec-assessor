@@ -324,3 +324,30 @@ def test_cleanup_service_holds_device_lock_for_entire_workflow(
 
     assert not worker.is_alive()
     assert errors == []
+
+
+def test_cleanup_success_survives_unexpected_report_generation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, repository, session_id = prepared_session(tmp_path)
+
+    class Context:
+        def __init__(self) -> None:
+            self.paths = paths
+
+        def adb_client(self, **_kwargs: object) -> FakeAdb:
+            return FakeAdb()
+
+    monkeypatch.setattr(
+        "android_assessor.report.ReportService.generate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("render failed")),
+    )
+
+    cleanup = CleanupService(
+        Context(),  # type: ignore[arg-type]
+        repository,
+    ).cleanup(session_id)
+
+    assert cleanup.success is True
+    assert repository.load(session_id).status is SessionStatus.CLEANED

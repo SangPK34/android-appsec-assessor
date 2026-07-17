@@ -17,6 +17,8 @@ class FakeWebBackend:
         self.cleaned_sessions: list[str] = []
         self.scan_sessions: list[str] = []
         self.scan_profiles: list[str] = []
+        self.scan_runtime_seconds: list[int | None] = []
+        self.scan_autonomous: list[bool | None] = []
         self.runtime_stops: list[str] = []
         self.scan_failure: Exception | None = None
         self.repair_starts = 0
@@ -167,9 +169,18 @@ class FakeWebBackend:
             "report_available": False,
         }
 
-    def scan_session(self, session_id: str, profile: str = "quick") -> dict[str, Any]:
+    def scan_session(
+        self,
+        session_id: str,
+        profile: str = "quick",
+        *,
+        runtime_seconds: int | None = None,
+        autonomous: bool | None = None,
+    ) -> dict[str, Any]:
         self.scan_sessions.append(session_id)
         self.scan_profiles.append(profile)
+        self.scan_runtime_seconds.append(runtime_seconds)
+        self.scan_autonomous.append(autonomous)
         if self.scan_failure is not None:
             raise self.scan_failure
         return {"session_id": session_id, "status": "completed"}
@@ -304,6 +315,8 @@ def test_scan_success_uses_single_backend_call_and_htmx_redirect() -> None:
     assert response.headers["hx-redirect"] == f"/sessions/{session_id}?notice=Quick+scan+completed."
     assert backend.scan_sessions == [session_id]
     assert backend.scan_profiles == ["quick"]
+    assert backend.scan_runtime_seconds == [None]
+    assert backend.scan_autonomous == [None]
 
 
 def test_full_assessment_profile_is_forwarded_once() -> None:
@@ -315,6 +328,8 @@ def test_full_assessment_profile_is_forwarded_once() -> None:
         data={
             "action_token": client.app.state.action_token,
             "profile": "full",
+            "max_runtime": "37",
+            "autonomous": "true",
         },
         headers={"HX-Request": "true"},
     )
@@ -322,6 +337,8 @@ def test_full_assessment_profile_is_forwarded_once() -> None:
     assert response.status_code == 204
     assert backend.scan_sessions == [session_id]
     assert backend.scan_profiles == ["full"]
+    assert backend.scan_runtime_seconds == [37]
+    assert backend.scan_autonomous == [True]
 
 
 def test_runtime_stop_is_token_protected_and_idempotently_forwarded() -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from ..app_context import AppContext
 from ..cleanup import CleanupExecutor, CleanupResult
 from ..device_lock import DeviceLock
@@ -9,6 +11,8 @@ from ..errors import AndroidAssessorError
 from ..frida_controller import FridaController
 from ..session import SessionRepository
 from ..traffic import TrafficCaptureService
+
+LOGGER = logging.getLogger(__name__)
 
 
 class CleanupService:
@@ -64,4 +68,9 @@ class CleanupService:
                 ReportService(self.paths, self.repository).generate(result.session_id)
             except (AndroidAssessorError, OSError, ValueError):
                 pass
+            except Exception:
+                LOGGER.exception(
+                    "Cleanup succeeded but final report generation failed for session %s.",
+                    result.session_id,
+                )
         return result
