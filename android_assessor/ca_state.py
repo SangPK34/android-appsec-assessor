@@ -85,6 +85,14 @@ class CaOwnershipLedger:
         return payload
 
 
+class CaApplyRollbackError(CleanupError):
+    """An apply failed and owned state remains for stale-session recovery."""
+
+    def __init__(self, message: str, recovery_ledger: CaOwnershipLedger) -> None:
+        super().__init__(message)
+        self.recovery_ledger = recovery_ledger
+
+
 @dataclass(frozen=True, slots=True)
 class CaCleanupPlan:
     decision: CaCleanupDecision
@@ -181,29 +189,45 @@ class CaStateManager:
                 ownership_state=CaOwnershipState.PRE_EXISTING,
                 applied_fingerprint_sha256=previous,
             )
-        self.backend.install_ca(
-            serial,
-            store=ledger.store.value,
-            certificate_id=ledger.certificate_id,
-            fingerprint_sha256=ledger.target_fingerprint_sha256,
-        )
-        current = self.backend.read_ca_fingerprint(
-            serial,
-            store=ledger.store.value,
-            certificate_id=ledger.certificate_id,
-        )
-        if (
-            current is None
-            or normalize_ca_fingerprint(current) != ledger.target_fingerprint_sha256
-        ):
-            raise CleanupError("Installed CA fingerprint could not be verified.")
-        return replace(
+        recovery_ledger = replace(
             ledger,
             applied_state=CaAppliedState.APPLIED,
             ownership_state=CaOwnershipState.FRAMEWORK_OWNED,
             applied_fingerprint_sha256=ledger.target_fingerprint_sha256,
             applied_at=_now(),
         )
+        try:
+            self.backend.install_ca(
+                serial,
+                store=ledger.store.value,
+                certificate_id=ledger.certificate_id,
+                fingerprint_sha256=ledger.target_fingerprint_sha256,
+            )
+            current = self.backend.read_ca_fingerprint(
+                serial,
+                store=ledger.store.value,
+                certificate_id=ledger.certificate_id,
+            )
+            if (
+                current is None
+                or normalize_ca_fingerprint(current)
+                != ledger.target_fingerprint_sha256
+            ):
+                raise CleanupError("Installed CA fingerprint could not be verified.")
+        except (AndroidAssessorError, ValueError) as exc:
+            try:
+                plan = self.plan_cleanup(serial, recovery_ledger)
+                if plan.decision is CaCleanupDecision.REMOVE_OWNED:
+                    self.cleanup(serial, recovery_ledger)
+                elif plan.decision is not CaCleanupDecision.ALREADY_ABSENT:
+                    raise CleanupConflictError(plan.reason)
+            except (AndroidAssessorError, ValueError) as rollback_exc:
+                raise CaApplyRollbackError(
+                    "CA apply failed and rollback requires stale-session recovery.",
+                    recovery_ledger,
+                ) from rollback_exc
+            raise CleanupError("CA apply failed and its owned mutation was rolled back.") from exc
+        return recovery_ledger
 
     def plan_cleanup(self, serial: str, ledger: CaOwnershipLedger) -> CaCleanupPlan:
         if ledger.snapshot.state is CaSnapshotState.CAPTURE_FAILED:

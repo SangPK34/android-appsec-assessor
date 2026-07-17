@@ -6,6 +6,7 @@ from android_assessor.ca_state import (
     IMPLEMENTATION_STATUS,
     PHYSICAL_VALIDATION_STATUS,
     CaAppliedState,
+    CaApplyRollbackError,
     CaCleanupDecision,
     CaOwnershipState,
     CaSnapshotState,
@@ -13,7 +14,7 @@ from android_assessor.ca_state import (
     CaStore,
     normalize_ca_fingerprint,
 )
-from android_assessor.errors import CleanupConflictError, CleanupError
+from android_assessor.errors import AdbError, CleanupConflictError, CleanupError
 from tests.fakes import FakeAndroidBackend, load_fixture
 
 SESSION_ID = "20260717-120000-abcdef"
@@ -168,6 +169,68 @@ def test_cleanup_refuses_when_current_ca_state_cannot_be_verified(
     with pytest.raises(CleanupConflictError, match="could not be verified"):
         manager.cleanup(SERIAL, ledger)
     assert not any(name == "remove_ca" for name, _ in backend.operations)
+
+
+def test_fault_after_ca_install_is_rolled_back_immediately(
+    ca_fixture: dict[str, object],
+) -> None:
+    certificate_id, _, _ = _values(ca_fixture)
+    backend = FakeAndroidBackend(fail_after_mutation=1)
+    manager = CaStateManager(backend)
+
+    with pytest.raises(CleanupError, match="owned mutation was rolled back"):
+        manager.apply(SERIAL, _snapshot(backend, ca_fixture))
+
+    assert (CaStore.USER.value, certificate_id) not in backend.ca_certificates
+    assert [name for name, _ in backend.operations if name.endswith("_ca")] == [
+        "read_ca",
+        "install_ca",
+        "read_ca",
+        "read_ca",
+        "remove_ca",
+        "read_ca",
+    ]
+
+
+class RollbackBlockedBackend(FakeAndroidBackend):
+    rollback_blocked: bool = True
+
+    def remove_ca(
+        self,
+        serial: str,
+        *,
+        store: str,
+        certificate_id: str,
+        expected_fingerprint_sha256: str,
+    ) -> bool:
+        if self.rollback_blocked:
+            raise AdbError("Injected CA rollback failure.")
+        return super().remove_ca(
+            serial,
+            store=store,
+            certificate_id=certificate_id,
+            expected_fingerprint_sha256=expected_fingerprint_sha256,
+        )
+
+
+def test_failed_ca_rollback_exposes_recovery_ledger(
+    ca_fixture: dict[str, object],
+) -> None:
+    certificate_id, target, _ = _values(ca_fixture)
+    backend = RollbackBlockedBackend(fail_after_mutation=1)
+    manager = CaStateManager(backend)
+
+    with pytest.raises(CaApplyRollbackError) as captured:
+        manager.apply(SERIAL, _snapshot(backend, ca_fixture))
+
+    recovery = captured.value.recovery_ledger
+    assert recovery.ownership_state is CaOwnershipState.FRAMEWORK_OWNED
+    assert recovery.applied_fingerprint_sha256 == target
+    assert backend.ca_certificates[(CaStore.USER.value, certificate_id)] == target
+
+    backend.rollback_blocked = False
+    cleaned = manager.cleanup(SERIAL, recovery)
+    assert cleaned.applied_state is CaAppliedState.REMOVED
 
 
 @pytest.mark.parametrize(

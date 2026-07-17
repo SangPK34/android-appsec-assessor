@@ -8,12 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from android_assessor.adb import AdbDevice, ReverseMapping, validate_serial
-from android_assessor.errors import AdbError, FridaError, ProxyError
+from android_assessor.errors import (
+    AdbError,
+    AndroidAssessorError,
+    FridaError,
+    ProxyError,
+)
 from android_assessor.subprocess_utils import CommandResult
 from android_assessor.validation import validate_managed_remote_path
 
 
-class FaultInjected(RuntimeError):
+class FaultInjected(AndroidAssessorError):
     pass
 
 
