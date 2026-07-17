@@ -17,6 +17,7 @@ from .paths import ProjectPaths
 from .redaction import redact_text
 from .session import SessionRepository
 from .storage import read_json_object, require_under_root
+from .tls_analysis import TlsBehaviorAnalyzer
 from .traffic import load_traffic_events
 
 
@@ -252,35 +253,25 @@ class RuleEngine:
             )
 
         if definition.evaluator == "tls_interception":
-            https_ids = {
-                str(item.get("flow_id"))
-                for item in attributed_traffic
-                if item.get("event") == "request" and item.get("scheme") == "https"
-            }
-            completed = any(
-                item.get("event") == "response" and str(item.get("flow_id")) in https_ids
-                for item in attributed_traffic
-            )
-            frida_tls = any(item.get("event") == "ssl_context_init" for item in frida)
-            if completed:
-                status = FindingStatus.CONFIRMED
-            elif https_ids or frida_tls:
-                status = FindingStatus.POTENTIAL
-            else:
-                status = FindingStatus.INCONCLUSIVE
+            tls = TlsBehaviorAnalyzer.from_events(traffic, frida)
+            frida_tls = tls.evidence.trust_manager_observed or tls.evidence.pinning_observed
             ids = tuple(
                 dict.fromkeys((*evidence("traffic_events"), *evidence("frida_events")))
             )
             return (
-                status,
+                tls.finding_status,
                 "instrumentation" if frida_tls else "dynamic",
                 {
-                    "https_request_count": len(https_ids),
-                    "https_response_observed": completed,
-                    "frida_ssl_context_observed": frida_tls,
-                    "interpretation": (
-                        "Observed trust behavior is not automatically an application vulnerability."
+                    "tls_behavior_state": tls.state.value,
+                    "target_request_count": tls.evidence.target_request_count,
+                    "canary_request_count": tls.evidence.canary_request_count,
+                    "canary_response_count": tls.evidence.canary_response_count,
+                    "unattributed_request_count": (
+                        tls.evidence.unattributed_request_count
                     ),
+                    "pinning_observed": tls.evidence.pinning_observed,
+                    "trust_manager_observed": tls.evidence.trust_manager_observed,
+                    "interpretation": tls.rationale,
                 },
                 ids,
                 bool(context["root_used"] and frida_tls),

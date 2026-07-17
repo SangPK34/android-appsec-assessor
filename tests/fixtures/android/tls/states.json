@@ -1,0 +1,14 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "scenarios": {
+    "mitm_accepted": {"target_request_count": 1, "canary_request_count": 1, "canary_response_count": 1},
+    "mitm_rejected": {"target_request_count": 1, "canary_request_count": 1, "canary_response_count": 0, "explicit_certificate_rejection": true},
+    "pinning_observed": {"target_request_count": 1, "canary_request_count": 1, "pinning_observed": true},
+    "trust_manager_observed": {"target_request_count": 1, "trust_manager_observed": true},
+    "no_traffic": {},
+    "network_error": {"network_error_observed": true},
+    "unattributed_traffic": {"unattributed_request_count": 2},
+    "inconclusive": {"target_request_count": 1}
+  }
+}
