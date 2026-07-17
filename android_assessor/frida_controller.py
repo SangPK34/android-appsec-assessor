@@ -515,7 +515,10 @@ class FridaController:
             record.package,
             action="frida_observe",
         )
-        if record.status is not SessionStatus.ACTIVE:
+        if record.status not in {
+            SessionStatus.ACTIVE,
+            SessionStatus.CLEANUP_REQUIRED,
+        }:
             raise SessionError("Frida observation requires an active session.")
         existing = self.load_state(record.session_id)
         if existing and existing.status in {"running", "stop_failed"}:

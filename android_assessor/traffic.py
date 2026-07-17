@@ -162,7 +162,10 @@ class TrafficCaptureService:
             record.package,
             action="traffic_capture",
         )
-        if record.status is not SessionStatus.ACTIVE:
+        if record.status not in {
+            SessionStatus.ACTIVE,
+            SessionStatus.CLEANUP_REQUIRED,
+        }:
             raise SessionError("Traffic capture requires an active session.")
         existing = self.load_state(record.session_id)
         if existing and existing.status in {"running", "stop_failed"}:

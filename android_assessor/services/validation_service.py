@@ -361,7 +361,10 @@ class ValidationService:
             record.package,
             action="controlled_validation",
         )
-        if record.status is not SessionStatus.ACTIVE:
+        if record.status not in {
+            SessionStatus.ACTIVE,
+            SessionStatus.CLEANUP_REQUIRED,
+        }:
             raise SessionError("Controlled validation requires an active session.")
         self.repository.require_modifying_session_slot(record.serial, record.session_id)
         with DeviceLock(

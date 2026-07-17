@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from android_assessor.errors import SessionError
+from android_assessor.errors import ProxyError, SessionError
 from android_assessor.frida_controller import FridaController
 from android_assessor.paths import ProjectPaths
 from android_assessor.services.validation_service import ValidationService
-from android_assessor.session import SessionRepository
+from android_assessor.session import CleanupActionType, SessionRepository
 from android_assessor.traffic import TrafficCaptureService
 
 
@@ -64,5 +64,21 @@ def test_validation_refuses_inactive_session_before_adb(tmp_path: Path) -> None:
             session_id,
             "finding-asl-mvp-002",
         )
+
+    assert context.adb_calls == 0
+
+
+def test_cleanup_required_state_remains_open_for_same_session_workflow(
+    tmp_path: Path,
+) -> None:
+    context, repository, session_id = inactive_session(tmp_path)
+    repository.record_cleanup_action(
+        session_id,
+        CleanupActionType.STOP_HOST_PROCESS,
+        {"role": "fixture", "identity": {}},
+    )
+
+    with pytest.raises(ProxyError, match="original state was not captured"):
+        TrafficCaptureService(context, repository).start(session_id)  # type: ignore[arg-type]
 
     assert context.adb_calls == 0
