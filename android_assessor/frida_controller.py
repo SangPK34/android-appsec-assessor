@@ -508,7 +508,13 @@ class FridaController:
             + (f": {last_error}" if last_error else ".")
         )
 
-    def start(self, session_id: str, *, spawn: bool = False) -> FridaObservationState:
+    def start(
+        self,
+        session_id: str,
+        *,
+        spawn: bool = False,
+        canary: str | None = None,
+    ) -> FridaObservationState:
         record = self.repository.load(session_id)
         load_scope(self.paths).require_device_package(
             record.serial,
@@ -531,6 +537,7 @@ class FridaController:
                 session_hook,
                 session_id=record.session_id,
                 package=record.package,
+                canary=canary,
                 project_root=paths.root,
             )
         except (OSError, ValueError) as exc:

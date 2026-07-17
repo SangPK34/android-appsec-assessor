@@ -8,7 +8,7 @@
 const OBSERVER_VERSION = '0.5.1';
 const OBSERVER_SESSION_ID = '__ANDROID_ASSESSOR_SESSION_ID__';
 const TARGET_PACKAGE = '__ANDROID_ASSESSOR_PACKAGE__';
-const CANARY_PREFIX = 'THESIS_CANARY_';
+const OBSERVER_CANARY = '__ANDROID_ASSESSOR_CANARY__';
 
 function safeId(value) {
     return String(value).replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 128);
@@ -28,7 +28,7 @@ function containsCanary(value, depth) {
     }
     try {
         if (typeof value === 'string') {
-            return value.indexOf(CANARY_PREFIX) !== -1;
+            return OBSERVER_CANARY.length > 0 && value.indexOf(OBSERVER_CANARY) !== -1;
         }
         if (Array.isArray(value)) {
             return value.some(function (item) { return containsCanary(item, depth + 1); });
@@ -41,7 +41,7 @@ function containsCanary(value, depth) {
                 }
                 text += String.fromCharCode(value[index] & 0xff);
             }
-            return text.indexOf(CANARY_PREFIX) !== -1;
+            return OBSERVER_CANARY.length > 0 && text.indexOf(OBSERVER_CANARY) !== -1;
         }
         return false;
     } catch (ignored) {

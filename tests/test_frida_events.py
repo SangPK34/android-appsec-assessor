@@ -10,6 +10,7 @@ import pytest
 
 from android_assessor.frida_controller import FridaController
 from android_assessor.frida_events import (
+    CANARY_PLACEHOLDER,
     PACKAGE_PLACEHOLDER,
     SESSION_PLACEHOLDER,
     FridaHandshakeStatus,
@@ -24,6 +25,7 @@ from tests.fakes import FIXTURE_ROOT
 
 SESSION_ID = "fixture-session"
 PACKAGE = "com.example.rootedlab"
+CANARY = "THESIS_CANARY_20260717T100000Z_abcdef123456"
 
 
 def fixture_events() -> str:
@@ -165,7 +167,9 @@ def test_frida_version_state_model(
     assert state.to_dict()["compatibility"] == expected.value
 
 
-def test_observer_hook_staging_injects_only_session_and_target(tmp_path: Path) -> None:
+def test_observer_hook_staging_injects_session_target_and_exact_canary(
+    tmp_path: Path,
+) -> None:
     template = Path(__file__).resolve().parent.parent / "hooks" / "basic_observer.js"
     destination = tmp_path / "session" / "basic_observer.js"
 
@@ -174,15 +178,37 @@ def test_observer_hook_staging_injects_only_session_and_target(tmp_path: Path) -
         destination,
         session_id=SESSION_ID,
         package=PACKAGE,
+        canary=CANARY,
         project_root=tmp_path,
     )
 
     source = destination.read_text(encoding="utf-8")
     assert SESSION_PLACEHOLDER not in source
     assert PACKAGE_PLACEHOLDER not in source
+    assert CANARY_PLACEHOLDER not in source
     assert SESSION_ID in source
     assert PACKAGE in source
+    assert CANARY in source
+    assert "CANARY_PREFIX" not in source
     assert digest == hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def test_observer_hook_staging_without_canary_disables_matching(tmp_path: Path) -> None:
+    template = Path(__file__).resolve().parent.parent / "hooks" / "basic_observer.js"
+    destination = tmp_path / "session" / "basic_observer.js"
+
+    stage_observer_hook(
+        template,
+        destination,
+        session_id=SESSION_ID,
+        package=PACKAGE,
+        project_root=tmp_path,
+    )
+
+    source = destination.read_text(encoding="utf-8")
+    assert "const OBSERVER_CANARY = '';" in source
+    assert "OBSERVER_CANARY.length > 0" in source
+    assert "CANARY_PREFIX" not in source
 
 
 def test_observer_hook_has_no_hardcoded_target_and_compiles() -> None:
@@ -191,11 +217,26 @@ def test_observer_hook_has_no_hardcoded_target_and_compiles() -> None:
 
     assert source.count(SESSION_PLACEHOLDER) == 1
     assert source.count(PACKAGE_PLACEHOLDER) == 1
+    assert source.count(CANARY_PLACEHOLDER) == 1
     assert "com.example" not in source
     assert "universal bypass" not in source.casefold()
     compiled = frida.Compiler().build(str(hook), project_root=str(hook.parent.parent))
     assert isinstance(compiled, str)
     assert compiled
+
+
+def test_observer_hook_rejects_non_session_canary(tmp_path: Path) -> None:
+    template = Path(__file__).resolve().parent.parent / "hooks" / "basic_observer.js"
+
+    with pytest.raises(ValueError, match="canary"):
+        stage_observer_hook(
+            template,
+            tmp_path / "observer.js",
+            session_id=SESSION_ID,
+            package=PACKAGE,
+            canary="THESIS_CANARY_stale-or-injected",
+            project_root=tmp_path,
+        )
 
 
 class FakeProcess:

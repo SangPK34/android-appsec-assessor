@@ -19,7 +19,9 @@ from .validation import validate_package_name
 OBSERVER_VERSION = "0.5.1"
 SESSION_PLACEHOLDER = "__ANDROID_ASSESSOR_SESSION_ID__"
 PACKAGE_PLACEHOLDER = "__ANDROID_ASSESSOR_PACKAGE__"
+CANARY_PLACEHOLDER = "__ANDROID_ASSESSOR_CANARY__"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_CANARY = re.compile(r"^THESIS_CANARY_\d{8}T\d{6}Z_[a-f0-9]{12}$")
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _SAFE_METADATA = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
@@ -299,16 +301,25 @@ def stage_observer_hook(
     *,
     session_id: str,
     package: str,
+    canary: str | None = None,
     project_root: Path,
 ) -> str:
     selected_session = _safe_id(session_id, "session_id")
     selected_package = validate_package_name(package)
+    if canary is not None and not _CANARY.fullmatch(canary):
+        raise ValueError("Observer canary has an invalid format.")
+    selected_canary = canary or ""
     source = template_path.read_text(encoding="utf-8")
-    if source.count(SESSION_PLACEHOLDER) != 1 or source.count(PACKAGE_PLACEHOLDER) != 1:
+    if (
+        source.count(SESSION_PLACEHOLDER) != 1
+        or source.count(PACKAGE_PLACEHOLDER) != 1
+        or source.count(CANARY_PLACEHOLDER) != 1
+    ):
         raise ValueError("Observer hook placeholders are missing or duplicated.")
     staged = source.replace(SESSION_PLACEHOLDER, selected_session).replace(
         PACKAGE_PLACEHOLDER,
         selected_package,
     )
+    staged = staged.replace(CANARY_PLACEHOLDER, selected_canary)
     write_text_atomic(destination, staged, root=project_root)
     return hashlib.sha256(staged.encode("utf-8")).hexdigest()
