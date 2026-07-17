@@ -23,6 +23,7 @@ XMLTREE = """N: android=http://schemas.android.com/apk/res/android
       A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.example.lab.INTERNAL" (Raw: "com.example.lab.INTERNAL")
       A: http://schemas.android.com/apk/res/android:protectionLevel(0x01010009)=(type 0x10)0x2
     E: application (line=5)
+      A: http://schemas.android.com/apk/res/android:permission(0x01010006)="com.example.lab.INTERNAL" (Raw: "com.example.lab.INTERNAL")
       A: http://schemas.android.com/apk/res/android:debuggable(0x0101000f)=(type 0x12)0xffffffff
       A: http://schemas.android.com/apk/res/android:testOnly(0x01010272)=(type 0x12)0x0
       A: http://schemas.android.com/apk/res/android:usesCleartextTraffic(0x010104ec)=(type 0x12)0xffffffff
@@ -78,6 +79,7 @@ def test_manifest_parser_extracts_flags_components_permissions_and_deep_links() 
     assert inspection.uses_cleartext_traffic is True
     assert inspection.network_security_config == "@0x7f130001"
     assert inspection.allow_backup is False
+    assert inspection.application_permission == "com.example.lab.INTERNAL"
     assert inspection.permissions[0].name == "android.permission.INTERNET"
     assert inspection.custom_permissions[0].name == "com.example.lab.INTERNAL"
     assert inspection.custom_permissions[0].protection_level == "2"

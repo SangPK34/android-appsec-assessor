@@ -15,6 +15,7 @@ from .evidence import EvidenceRepository, sha256_file
 from .findings import FindingRepository
 from .paths import ProjectPaths
 from .redaction import redact_report_data
+from .rule_catalog import merge_root_coverage
 from .session import SessionRepository
 from .storage import read_json_object, write_json_atomic, write_text_atomic
 
@@ -313,6 +314,7 @@ class ReportService:
             frida_available=frida_available,
             provenance=provenance,
         )
+        coverage = merge_root_coverage(coverage)
         device_info = (
             device.get("device", {})
             if isinstance(device, dict) and isinstance(device.get("device"), dict)

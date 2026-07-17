@@ -8,10 +8,13 @@
     "allow_backup": true,
     "uses_cleartext_traffic": true,
     "application_permission": "com.example.rootedlab.INTERNAL",
+    "custom_permissions": [
+      {"name": "com.example.rootedlab.INTERNAL", "protection_level": "signature"}
+    ],
     "components": [
-      {"type": "activity", "name": ".CanaryActivity", "exported": true, "permission": null},
-      {"type": "receiver", "name": ".LabReceiver", "exported": true, "permission": "com.example.rootedlab.INTERNAL"},
-      {"type": "provider", "name": ".LabProvider", "exported": true, "read_permission": null, "write_permission": null}
+      {"component_type": "activity", "name": "com.example.rootedlab.CanaryActivity", "effective_exported": true, "enabled": true, "permission": null, "intent_filters": []},
+      {"component_type": "receiver", "name": "com.example.rootedlab.LabReceiver", "effective_exported": true, "enabled": true, "permission": "com.example.rootedlab.INTERNAL", "intent_filters": []},
+      {"component_type": "provider", "name": "com.example.rootedlab.LabProvider", "effective_exported": true, "enabled": true, "permission": null, "read_permission": null, "write_permission": null, "intent_filters": []}
     ]
   }
 }

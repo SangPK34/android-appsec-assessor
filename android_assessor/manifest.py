@@ -126,6 +126,7 @@ class ManifestInspection:
     uses_cleartext_traffic: bool | None
     network_security_config: str | None
     allow_backup: bool | None
+    application_permission: str | None
     permissions: tuple[PermissionUse, ...]
     custom_permissions: tuple[CustomPermission, ...]
     components: tuple[ComponentInfo, ...]
@@ -139,6 +140,7 @@ class ManifestInspection:
             "uses_cleartext_traffic": self.uses_cleartext_traffic,
             "network_security_config": self.network_security_config,
             "allow_backup": self.allow_backup,
+            "application_permission": self.application_permission,
             "permissions": [item.to_dict() for item in self.permissions],
             "custom_permissions": [item.to_dict() for item in self.custom_permissions],
             "components": [item.to_dict() for item in self.components],
@@ -328,6 +330,7 @@ def inspect_manifest_tree(
             uses_cleartext_traffic=None,
             network_security_config=None,
             allow_backup=None,
+            application_permission=None,
             permissions=tuple(permissions),
             custom_permissions=custom_permissions,
             components=(),
@@ -391,6 +394,7 @@ def inspect_manifest_tree(
         uses_cleartext_traffic=_bool_attribute(application, "usesCleartextTraffic"),
         network_security_config=_text_attribute(application, "networkSecurityConfig"),
         allow_backup=_bool_attribute(application, "allowBackup"),
+        application_permission=_text_attribute(application, "permission"),
         permissions=tuple(permissions),
         custom_permissions=custom_permissions,
         components=tuple(components),

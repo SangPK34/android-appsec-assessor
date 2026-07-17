@@ -163,7 +163,7 @@ def test_root_coverage_and_experiment_csv_are_bounded_and_hashed(tmp_path: Path)
         session_id,
         [
             _finding(
-                "CRYPTO-001",
+                "ASL-ROOT-CRYPTO",
                 root_required=True,
                 root_used=True,
                 frida_used=True,
@@ -180,17 +180,21 @@ def test_root_coverage_and_experiment_csv_are_bounded_and_hashed(tmp_path: Path)
         )
     )
 
-    assert report["root_vs_non_root_coverage"] == [
-        {
-            "test_id": "CRYPTO-001",
-            "available_without_root": False,
-            "available_with_root": True,
-            "requires_frida": True,
-            "implementation_status": "IMPLEMENTED",
-            "physical_validation_status": "UNVERIFIED",
-            "finding_status": "confirmed",
-        }
-    ]
+    coverage = {
+        item["test_id"]: item for item in report["root_vs_non_root_coverage"]
+    }
+    assert len(coverage) == 11
+    assert coverage["ASL-ROOT-CRYPTO"] == {
+        "test_id": "ASL-ROOT-CRYPTO",
+        "title": "Runtime cryptographic boundary observations",
+        "available_without_root": False,
+        "available_with_root": True,
+        "requires_frida": True,
+        "implementation_status": "IMPLEMENTED_UNVERIFIED",
+        "physical_validation_status": "UNVERIFIED",
+        "finding_status": "confirmed",
+    }
+    assert coverage["ASL-ROOT-STORAGE"]["finding_status"] == "skipped"
     assert len(rows) == 1
     assert rows[0]["fixture_or_physical"] == "fixture"
     assert rows[0]["environment_type"] == "simulated"
@@ -202,7 +206,7 @@ def test_root_coverage_and_experiment_csv_are_bounded_and_hashed(tmp_path: Path)
     assert report["report_artifacts"]["experiment_results_csv"]["sha256"] == digest
     html = session_paths.report_html.read_text(encoding="utf-8")
     assert "Root vs non-root coverage" in html
-    assert "CRYPTO-001" in html
+    assert "ASL-ROOT-CRYPTO" in html
 
     evidence_index = json.loads(session_paths.evidence_index.read_text(encoding="utf-8"))
     report_types = {

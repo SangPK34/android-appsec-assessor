@@ -231,13 +231,14 @@ class RuleEngine:
             if manifest is None:
                 return FindingStatus.SKIPPED, "static", {}, (), False, False
             exposed = []
+            application_permission = manifest.get("application_permission")
             for component in manifest.get("components", []):
                 if component.get("effective_exported") is not True:
                     continue
                 protected = any(
                     component.get(name)
                     for name in ("permission", "read_permission", "write_permission")
-                )
+                ) or bool(application_permission)
                 if not protected and not self._is_launcher(component):
                     exposed.append(
                         {

@@ -7,6 +7,8 @@
     "test_only": false,
     "allow_backup": false,
     "uses_cleartext_traffic": false,
+    "application_permission": null,
+    "custom_permissions": [],
     "components": []
   }
 }
