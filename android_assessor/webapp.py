@@ -470,6 +470,24 @@ def create_app(
         notice = f"Validation: {validation.get('status', 'completed')}."
         return action_redirect(request, f"/sessions/{session_id}", notice)
 
+    @app.post("/sessions/{session_id}/runtime/stop")
+    def stop_runtime(
+        request: Request,
+        session_id: str,
+        submitted_token: Annotated[str, Form(alias="action_token")],
+    ) -> Response:
+        verify_action_token(submitted_token)
+        try:
+            service.request_runtime_stop(session_id)
+        except (AndroidAssessorError, OSError, ValueError) as exc:
+            return render_session_detail(
+                request,
+                session_id,
+                error=expected_error(exc),
+                status_code=409 if isinstance(exc, DeviceBusyError) else 400,
+            )
+        return action_redirect(request, f"/sessions/{session_id}", "Runtime analysis requested.")
+
     @app.post("/sessions/{session_id}/traffic/start")
     def start_traffic(
         request: Request,

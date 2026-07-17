@@ -17,6 +17,7 @@ class FakeWebBackend:
         self.cleaned_sessions: list[str] = []
         self.scan_sessions: list[str] = []
         self.scan_profiles: list[str] = []
+        self.runtime_stops: list[str] = []
         self.scan_failure: Exception | None = None
         self.repair_starts = 0
 
@@ -173,6 +174,10 @@ class FakeWebBackend:
             raise self.scan_failure
         return {"session_id": session_id, "status": "completed"}
 
+    def request_runtime_stop(self, session_id: str) -> dict[str, Any]:
+        self.runtime_stops.append(session_id)
+        return {"session_id": session_id, "stop_requested": True}
+
     def cleanup_session(self, session_id: str) -> dict[str, Any]:
         self.cleaned_sessions.append(session_id)
         return {"success": True, "session_id": session_id}
@@ -317,6 +322,19 @@ def test_full_assessment_profile_is_forwarded_once() -> None:
     assert response.status_code == 204
     assert backend.scan_sessions == [session_id]
     assert backend.scan_profiles == ["full"]
+
+
+def test_runtime_stop_is_token_protected_and_idempotently_forwarded() -> None:
+    client, backend = make_client()
+    session_id = "20260717-021530-a8f4c2"
+    for _ in range(2):
+        response = client.post(
+            f"/sessions/{session_id}/runtime/stop",
+            data={"action_token": client.app.state.action_token},
+            headers={"HX-Request": "true"},
+        )
+        assert response.status_code == 204
+    assert backend.runtime_stops == [session_id, session_id]
 
 
 @pytest.mark.parametrize(

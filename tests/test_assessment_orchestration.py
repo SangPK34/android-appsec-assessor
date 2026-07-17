@@ -11,11 +11,16 @@ from android_assessor.evidence import EvidenceRepository
 from android_assessor.findings import FindingStatus
 from android_assessor.paths import ProjectPaths
 from android_assessor.redaction import redact_report_data
-from android_assessor.report import _capability_used_by_security_findings, _environment_type
+from android_assessor.report import (
+    ReportService,
+    _capability_used_by_security_findings,
+    _environment_type,
+    _is_aggregate_alias,
+)
 from android_assessor.rules import RuleEngine
 from android_assessor.services.scan_service import ScanProfile, ScanService
 from android_assessor.session import SessionRepository
-from android_assessor.storage import write_json_atomic
+from android_assessor.storage import read_json_object, write_json_atomic
 
 
 def _rule_session(tmp_path: Path) -> tuple[ProjectPaths, SessionRepository, str]:
@@ -151,6 +156,9 @@ def test_scan_profile_starts_only_planned_controllers(
     assert calls == expected_dynamic_calls
     assert result.profile == profile.value
     assert "rule_evaluation" in result.phase_timings
+    scan = read_json_object(repository.paths_for(record.session_id).scan_json, root=paths.root)
+    assert scan["runtime_termination"] in {"completed_no_wait", "not_started"}
+    assert "runtime_analysis" in result.phase_timings
 
 
 def test_crypto_analyzer_output_is_consumed_by_rule_engine(tmp_path: Path) -> None:
@@ -234,3 +242,59 @@ def test_observation_only_capabilities_are_not_security_finding_usage() -> None:
     assert redact_report_data(
         {"root_used_in_session": True, "frida_used_in_session": True}
     ) == {"root_used_in_session": True, "frida_used_in_session": True}
+
+
+def test_report_summary_separates_security_checks_and_runtime_observations(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    (paths.root / "templates").mkdir()
+    copyfile(
+        Path(__file__).resolve().parent.parent / "templates" / "report.html.j2",
+        paths.root / "templates" / "report.html.j2",
+    )
+    RuleEngine(paths, repository).evaluate(session_id)
+    report = ReportService(paths, repository).generate(session_id)
+    summary = report["summary"]
+    assert summary["total_checks_executed"] == (
+        summary["security_rules_evaluated"] + summary["runtime_checks_executed"]
+    )
+    assert summary["security_findings_total"] == sum(
+        1
+        for item in report["findings"]
+        if item["status"] in {"confirmed", "potential"}
+    )
+    assert all(item["rule_id"].startswith("ASL-RUNTIME-") is False for item in report["findings"])
+    assert all(item["observation_status"] in {
+        "observed", "not_observed", "insufficient_activity", "skipped", "error"
+    } for item in report["runtime_checks"])
+
+
+def test_runtime_stop_request_is_idempotent_marker(tmp_path: Path) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    write_json_atomic(
+        repository.paths_for(session_id).scan_json,
+        {"profile": "full", "status": "running"},
+        root=paths.root,
+    )
+    service = ScanService(SimpleNamespace(paths=paths), repository)  # type: ignore[arg-type]
+    assert service.request_runtime_stop(session_id)["stop_requested"] is True
+    assert service.request_runtime_stop(session_id)["stop_requested"] is True
+    assert read_json_object(
+        repository.paths_for(session_id).runtime_control_json,
+        root=paths.root,
+    )["stop_requested"] is True
+    repository.paths_for(session_id).runtime_control_json.write_text(
+        '{"stop_requested": true}', encoding="utf-8-sig"
+    )
+    assert service._runtime_stop_requested(session_id) is True
+
+
+def test_exported_component_aggregate_is_suppressed_when_specific_rules_run() -> None:
+    rule_ids = {
+        "ASL-MVP-004",
+        "ASL-MANIFEST-EXPORTED-ACTIVITY",
+        "ASL-MANIFEST-EXPORTED-RECEIVER",
+    }
+    assert _is_aggregate_alias({"rule_id": "ASL-MVP-004"}, rule_ids) is True
+    assert _is_aggregate_alias({"rule_id": "ASL-MVP-004"}, {"ASL-MVP-004"}) is False

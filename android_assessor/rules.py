@@ -347,7 +347,20 @@ class RuleEngine:
                 return (
                     FindingStatus.INCONCLUSIVE,
                     "instrumentation",
-                    {"observation_only": definition.observation_only},
+                    {
+                        "observation_only": definition.observation_only,
+                        "observed_algorithms": sorted(
+                            {
+                                str(item.get("algorithm", ""))
+                                for item in frida
+                                if item.get("category") == "crypto"
+                            }
+                        ),
+                        "missing_evidence": ["matching configured crypto operation"],
+                        "reason": (
+                            "No configured weak-algorithm operation matched runtime evidence."
+                        ),
+                    },
                     evidence("frida_events"),
                     False,
                     bool(frida),
@@ -390,7 +403,11 @@ class RuleEngine:
                     root_events,
                     expected_root_present=bool(context["root_available"]),
                 )
-                details = {**result.to_dict(), "observation_only": True}
+                details = {
+                    **result.to_dict(),
+                    "observation_only": True,
+                    "observation_status": "observed" if root_events else "not_observed",
+                }
                 return (
                     FindingStatus.PASS if root_events else FindingStatus.INCONCLUSIVE,
                     "instrumentation",
@@ -403,7 +420,11 @@ class RuleEngine:
             return (
                 status,
                 "instrumentation",
-                {"event_count": len(observed), "observation_only": True},
+                {
+                    "event_count": len(observed),
+                    "observation_only": True,
+                    "observation_status": "observed" if observed else "not_observed",
+                },
                 evidence("frida_events"),
                 False,
                 bool(observed),
@@ -415,7 +436,7 @@ class RuleEngine:
                 return (
                     FindingStatus.SKIPPED,
                     "root_assisted",
-                    {"observation_only": True},
+                    {"observation_only": True, "observation_status": "skipped"},
                     (),
                     True,
                     False,
@@ -430,6 +451,7 @@ class RuleEngine:
                     "observation_count": len(observations),
                     "finding_eligible_count": len(eligible),
                     "observation_only": True,
+                    "observation_status": "observed" if observations else "not_observed",
                     "root_mode": storage.get("root_mode"),
                 },
                 evidence("private_storage_metadata"),

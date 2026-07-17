@@ -21,10 +21,14 @@
   <h2>Executive summary</h2>
   <p>Package <code>{{ report.session.package }}</code> on {{ report.device.device.model or 'unknown device' if report.device else 'unknown device' }}.</p>
   <table>
-    <tr><th>Rules evaluated</th><th>Confirmed</th><th>Potential</th><th>Pass</th><th>Inconclusive</th><th>Skipped</th><th>Error</th></tr>
-    <tr><td>{{ report.summary.total }}</td><td>{{ report.summary.confirmed }}</td><td>{{ report.summary.potential }}</td><td>{{ report.summary.pass }}</td><td>{{ report.summary.inconclusive }}</td><td>{{ report.summary.skipped }}</td><td>{{ report.summary.error }}</td></tr>
+    <tr><th>Security rules evaluated</th><th>Security findings</th><th>Runtime checks</th><th>Runtime observations</th><th>Total checks</th></tr>
+    <tr><td>{{ report.summary.security_rules_evaluated }}</td><td>{{ report.summary.security_findings_total }}</td><td>{{ report.summary.runtime_checks_executed }}</td><td>{{ report.summary.runtime_observations_total }}</td><td>{{ report.summary.total_checks_executed }}</td></tr>
   </table>
-  <p>Security findings: {{ report.summary.security_findings }} · Runtime observations: {{ report.summary.runtime_observations }} · Duration: {{ report.summary.assessment_duration_ms }} ms.</p>
+  <table>
+    <tr><th>Confirmed</th><th>Potential</th><th>Pass</th><th>Inconclusive</th><th>Skipped</th><th>Error</th></tr>
+    <tr><td>{{ report.summary.confirmed }}</td><td>{{ report.summary.potential }}</td><td>{{ report.summary.pass }}</td><td>{{ report.summary.inconclusive }}</td><td>{{ report.summary.skipped }}</td><td>{{ report.summary.error }}</td></tr>
+  </table>
+  <p>Wall-clock: {{ report.summary.wall_clock_duration_ms or report.summary.assessment_duration_ms }} ms · module duration sum: {{ report.summary.sum_of_module_durations_ms }} ms · report={{ report.report_state }}.</p>
 
   <h2>Scope and runtime</h2>
   <table>
@@ -39,18 +43,20 @@
     <tr><th>Frida used by findings</th><td>{{ report.frida_used_by_findings }}</td></tr>
     <tr><th>Environment type</th><td>{{ report.experiment.environment_type }}</td></tr>
     <tr><th>Evidence source</th><td>{{ report.evidence_source }}</td></tr>
-    <tr><th>Device validation</th><td>{{ report.device_validation_status }}</td></tr>
+    <tr><th>Emulator validation</th><td>{{ report.experiment.emulator_validation }}</td></tr>
+    <tr><th>Physical-device validation</th><td>{{ report.experiment.physical_device_validation }}</td></tr>
     <tr><th>Cleanup</th><td>{{ report.cleanup.status }}; success={{ report.cleanup.success }}; pending={{ report.cleanup.pending }}</td></tr>
   </table>
 
   <h2>Module execution coverage</h2>
   <table>
-    <thead><tr><th>Module</th><th>Planned</th><th>Executed</th><th>Result</th><th>Duration</th><th>Skip reason</th></tr></thead>
-    <tbody>{% for item in report.module_execution_coverage %}<tr><td>{{ item.module }}</td><td>{{ item.planned }}</td><td>{{ item.executed }}</td><td>{{ item.result }}</td><td>{{ item.duration_ms or '-' }} ms</td><td>{{ item.skip_reason or '-' }}</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>Module</th><th>Planned</th><th>Executed</th><th>Result</th><th>Wall duration</th><th>Evidence</th><th>Events/items</th><th>Findings</th><th>Skip/no-data reason</th></tr></thead>
+    <tbody>{% for item in report.module_execution_coverage %}<tr><td>{{ item.module }}</td><td>{{ item.planned }}</td><td>{{ item.executed }}</td><td>{{ item.result }}</td><td>{{ item.duration_ms or '-' }} ms</td><td>{{ item.evidence }}</td><td>{{ item.event_item_count }}</td><td>{{ item.findings_produced }}</td><td>{{ item.skip_reason or '-' }}</td></tr>{% endfor %}</tbody>
   </table>
 
-  <h2>Runtime observations</h2>
-  {% if report.runtime_observations %}<table><thead><tr><th>Rule</th><th>Status</th><th>Title</th><th>Evidence</th></tr></thead><tbody>{% for finding in report.runtime_observations %}<tr><td><code>{{ finding.rule_id }}</code></td><td>{{ finding.status }}</td><td>{{ finding.title }}</td><td>{% for evidence_id in finding.evidence_ids %}<code>{{ evidence_id }}</code> {% endfor %}</td></tr>{% endfor %}</tbody></table>{% else %}<p>No runtime observation rule output was recorded.</p>{% endif %}
+  <h2>Runtime checks and observations</h2>
+  {% if report.runtime_checks %}<table><thead><tr><th>Rule</th><th>Observation status</th><th>Events/items</th><th>Security finding</th><th>Reason</th></tr></thead><tbody>{% for item in report.runtime_checks %}<tr><td><code>{{ item.rule_id }}</code></td><td>{{ item.observation_status }}</td><td>{{ item.details.event_count or item.details.observation_count or 0 }}</td><td>no</td><td>{{ item.reason }}</td></tr>{% endfor %}</tbody></table>{% endif %}
+  {% if report.runtime_observations %}<table><thead><tr><th>Category</th><th>Method</th><th>Status</th><th>Events</th><th>Finding link</th></tr></thead><tbody>{% for item in report.runtime_observations %}<tr><td>{{ item.category }}</td><td>{{ item.method }}</td><td>{{ item.status }}</td><td>{{ item.event_count }}</td><td>{{ item.finding_id or '-' }}</td></tr>{% endfor %}</tbody></table>{% else %}<p>No runtime event was recorded.</p>{% endif %}
 
   <h2>Findings and coverage</h2>
   <table>
@@ -69,6 +75,7 @@
     {% endfor %}
     </tbody>
   </table>
+  {% if report.suppressed_findings %}<p class="meta">Aggregate/alias rows suppressed from finding totals: {% for item in report.suppressed_findings %}<code>{{ item.rule_id }}</code> {% endfor %}</p>{% endif %}
 
   <h2>Root vs non-root coverage</h2>
   <table>

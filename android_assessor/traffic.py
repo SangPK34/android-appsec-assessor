@@ -58,6 +58,10 @@ class TrafficCaptureState:
     ca_path: str
     evidence_registered: bool = False
     error: str | None = None
+    result: str = "completed"
+    flow_count: int = 0
+    attributed_flow_count: int = 0
+    usable_evidence_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -77,6 +81,19 @@ def load_traffic_events(path: Path) -> list[dict[str, Any]]:
     except (OSError, json.JSONDecodeError) as exc:
         raise ProxyError(f"Could not parse traffic events: {exc}") from exc
     return events
+
+
+def summarize_traffic_events(
+    events: list[dict[str, Any]], usable_evidence_count: int = 0
+) -> tuple[int, int, str]:
+    requests = [item for item in events if item.get("event") == "request"]
+    attributed = sum(
+        1
+        for item in requests
+        if str(item.get("attribution", "")) in {"target", "validation_canary"}
+    )
+    result = "completed" if requests or usable_evidence_count else "completed_no_data"
+    return len(requests), attributed, result
 
 
 def _redact_jsonl(value: str) -> str:
@@ -144,6 +161,8 @@ class TrafficCaptureService:
             "stop_failed",
         }:
             raise SessionError("Traffic state identity or status is invalid.")
+        if state.result not in {"running", "completed", "completed_no_data", "skipped", "error"}:
+            raise SessionError("Traffic state result is invalid.")
         if isinstance(state.port, bool) or not isinstance(state.port, int):
             raise SessionError("Traffic state port is invalid.")
         if not 1 <= state.port <= 65535 or not isinstance(state.process_identity, dict):
@@ -329,6 +348,7 @@ class TrafficCaptureService:
                     flow_path=flow_path.relative_to(paths.root).as_posix(),
                     events_path=events_path.relative_to(paths.root).as_posix(),
                     ca_path=(confdir / "mitmproxy-ca-cert.cer").relative_to(paths.root).as_posix(),
+                    result="running",
                 )
                 write_json_atomic(
                     self._state_path(record.session_id),
@@ -485,6 +505,10 @@ class TrafficCaptureService:
                     )
 
             evidence_registered = state.evidence_registered
+            flow_count = state.flow_count
+            attributed_flow_count = state.attributed_flow_count
+            usable_evidence_count = state.usable_evidence_count
+            result = state.result
             if not evidence_registered:
                 try:
                     raw_stdout = paths.raw_dir / "traffic" / "mitmdump.stdout.log"
@@ -507,6 +531,9 @@ class TrafficCaptureService:
                             ),
                             root=self.paths.root,
                         )
+                    events = load_traffic_events(event_file)
+                    flow_count, attributed_flow_count, result = summarize_traffic_events(events)
+                    usable_evidence_count = 0
                     for source, destination in (
                         (raw_stdout, redacted_stdout),
                         (raw_stderr, redacted_stderr),
@@ -564,7 +591,7 @@ class TrafficCaptureService:
                         ),
                     ):
                         target = paths.root / relative
-                        if target.is_file():
+                        if target.is_file() and target.stat().st_size > 0:
                             self.evidence.register_file(
                                 record.session_id,
                                 target,
@@ -574,6 +601,8 @@ class TrafficCaptureService:
                                 sensitive=sensitive,
                                 redacted=redacted,
                             )
+                            usable_evidence_count += 1
+                    _, _, result = summarize_traffic_events(events, usable_evidence_count)
                     evidence_registered = True
                 except (AndroidAssessorError, OSError, ValueError) as exc:
                     errors.append(redact_text(str(exc))[:500])
@@ -583,6 +612,10 @@ class TrafficCaptureService:
                     "status": "stopped" if not errors else "stop_failed",
                     "stopped_at": datetime.now(UTC).isoformat(),
                     "evidence_registered": evidence_registered,
+                    "result": result if not errors else "error",
+                    "flow_count": flow_count,
+                    "attributed_flow_count": attributed_flow_count,
+                    "usable_evidence_count": usable_evidence_count,
                     "error": "; ".join(errors) if errors else None,
                 }
             )

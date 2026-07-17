@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -19,7 +21,7 @@ from ..report import ReportService
 from ..rules import RuleEngine
 from ..scope import load_scope
 from ..session import SessionRecord, SessionRepository
-from ..storage import write_json_atomic
+from ..storage import read_json_object, write_json_atomic
 from ..traffic import TrafficCaptureService
 from .app_inspection_service import AppInspectionService
 
@@ -60,6 +62,10 @@ class ScanProfile(StrEnum):
 
 
 class ScanService:
+    DEFAULT_RUNTIME_SECONDS = 30
+    MIN_RUNTIME_SECONDS = 0
+    MAX_RUNTIME_SECONDS = 300
+
     def __init__(
         self,
         context: AppContext,
@@ -113,6 +119,38 @@ class ScanService:
                 runtime_seconds=runtime_seconds,
             )
 
+    def request_runtime_stop(self, session_id: str) -> dict[str, Any]:
+        """Request a running full assessment to flush and analyze early."""
+        record = self.repository.load(session_id)
+        paths = self.repository.paths_for(record.session_id)
+        scan = (
+            read_json_object(paths.scan_json, root=self.paths.root)
+            if paths.scan_json.is_file()
+            else {}
+        )
+        if scan.get("profile") != ScanProfile.FULL.value:
+            raise AndroidAssessorError("Runtime stop is only available for Full Assessment.")
+        write_json_atomic(
+            paths.runtime_control_json,
+            {"stop_requested": True, "requested_at": time.time()},
+            root=self.paths.root,
+        )
+        self.repository.append_event(record.session_id, "runtime_stop_requested", {})
+        return {"session_id": record.session_id, "stop_requested": True}
+
+    def _runtime_stop_requested(self, session_id: str) -> bool:
+        path = self.repository.paths_for(session_id).runtime_control_json
+        if not path.is_file():
+            return False
+        try:
+            return bool(read_json_object(path, root=self.paths.root).get("stop_requested"))
+        except (AndroidAssessorError, OSError, ValueError):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                return bool(payload.get("stop_requested"))
+            except (OSError, ValueError, TypeError):
+                return False
+
     def _scan_session_locked(
         self,
         record: SessionRecord,
@@ -132,6 +170,22 @@ class ScanService:
             "report": "pending",
         }
         phase_timings: dict[str, float] = {}
+        wall_started = time.perf_counter()
+        runtime_termination = "not_started"
+        runtime_started_at: str | None = None
+        paths.runtime_control_json.unlink(missing_ok=True)
+        write_json_atomic(
+            paths.scan_json,
+            {
+                "schema_version": 1,
+                "session_id": record.session_id,
+                "status": "running",
+                "dynamic_steps": steps,
+                "profile": profile.value,
+                "phase_timings": {},
+            },
+            root=self.paths.root,
+        )
 
         def timed(name: str, started: float) -> None:
             phase_timings[name] = round((time.perf_counter() - started) * 1000, 2)
@@ -161,7 +215,8 @@ class ScanService:
                     limitations.append(
                         f"Traffic capture skipped: {redact_text(str(exc))[:300]}"
                     )
-                timed("traffic", traffic_started_at)
+                timed("traffic_startup", traffic_started_at)
+                phase_timings["traffic"] = phase_timings["traffic_startup"]
 
                 frida_started_at = time.perf_counter()
                 try:
@@ -174,7 +229,8 @@ class ScanService:
                     limitations.append(
                         f"Frida observation skipped: {redact_text(str(exc))[:300]}"
                     )
-                timed("frida_start", frida_started_at)
+                timed("frida_startup", frida_started_at)
+                phase_timings["frida_start"] = phase_timings["frida_startup"]
 
             if not launched:
                 try:
@@ -188,14 +244,28 @@ class ScanService:
             if launched or traffic_started or frida_started:
                 runtime_started = time.perf_counter()
                 wait_seconds = runtime_seconds if runtime_seconds is not None else (
-                    5 if profile is ScanProfile.FULL else 0
+                    self.DEFAULT_RUNTIME_SECONDS if profile is ScanProfile.FULL else 0
                 )
-                if wait_seconds < 0 or wait_seconds > 300:
-                    raise ValueError("runtime_seconds must be between 0 and 300.")
-                if wait_seconds:
-                    time.sleep(wait_seconds)
-                timed("runtime_observation", runtime_started)
+                if not self.MIN_RUNTIME_SECONDS <= wait_seconds <= self.MAX_RUNTIME_SECONDS:
+                    raise ValueError(
+                        "runtime_seconds must be between "
+                        f"{self.MIN_RUNTIME_SECONDS} and {self.MAX_RUNTIME_SECONDS}."
+                    )
+                runtime_started_at = datetime.now(UTC).isoformat()
+                deadline = time.monotonic() + wait_seconds
+                while time.monotonic() < deadline:
+                    if self._runtime_stop_requested(record.session_id):
+                        runtime_termination = "stop_requested"
+                        break
+                    time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+                else:
+                    runtime_termination = "timeout" if wait_seconds else "completed_no_wait"
+                timed("runtime_interaction", runtime_started)
+                phase_timings["runtime_observation"] = phase_timings["runtime_interaction"]
+            else:
+                runtime_termination = "not_started"
         finally:
+            analysis_started = time.perf_counter()
             if frida_started:
                 try:
                     stopped = frida.stop(record.session_id)
@@ -214,6 +284,29 @@ class ScanService:
                     limitations.append(
                         f"Traffic stop failed: {redact_text(str(exc))[:300]}"
                     )
+            timed("runtime_analysis", analysis_started)
+
+        runtime_phases = []
+        if runtime_started_at is not None:
+            frida_mode = None
+            try:
+                state_path = paths.frida_dir / "state.json"
+                if state_path.is_file():
+                    frida_mode = read_json_object(state_path, root=self.paths.root).get("mode")
+            except (AndroidAssessorError, OSError, ValueError):
+                frida_mode = None
+            runtime_phases.append(
+                {
+                    "name": "runtime_interaction",
+                    "mode": "automatic_startup_and_window",
+                    "start_time": runtime_started_at,
+                    "duration_ms": phase_timings.get("runtime_interaction"),
+                    "event_count": None,
+                    "categories": [],
+                    "effective_frida_mode": frida_mode,
+                    "termination_reason": runtime_termination,
+                }
+            )
 
         if profile is ScanProfile.FULL:
             storage_started = time.perf_counter()
@@ -256,6 +349,11 @@ class ScanService:
                 "limitations": limitations,
                 "profile": profile.value,
                 "phase_timings": phase_timings,
+                "runtime_termination": runtime_termination,
+                "runtime_started_at": runtime_started_at,
+                "wall_clock_duration_ms": round((time.perf_counter() - wall_started) * 1000, 2),
+                "parallel_phases": [],
+                "runtime_phases": runtime_phases,
             },
             root=self.paths.root,
         )
@@ -276,8 +374,19 @@ class ScanService:
                     "limitations": limitations,
                     "profile": profile.value,
                     "phase_timings": phase_timings,
+                    "runtime_termination": runtime_termination,
+                    "runtime_started_at": runtime_started_at,
+                    "wall_clock_duration_ms": round((time.perf_counter() - wall_started) * 1000, 2),
+                    "parallel_phases": [],
+                    "runtime_phases": runtime_phases,
                 },
                 root=self.paths.root,
+            )
+            # Re-render once with the measured report phase so coverage timing
+            # describes the final artifact rather than a missing placeholder.
+            ReportService(self.paths, self.repository).generate(
+                record.session_id,
+                limitations=limitations,
             )
         except (AndroidAssessorError, OSError, ValueError):
             steps["report"] = "error"
@@ -289,6 +398,7 @@ class ScanService:
                     "status": "error",
                     "dynamic_steps": steps,
                     "limitations": limitations,
+                    "runtime_termination": runtime_termination,
                 },
                 root=self.paths.root,
             )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -133,9 +134,94 @@ def _capability_used_by_security_findings(
 ) -> bool:
     return any(
         bool(item.get(capability_key))
+        and str(item.get("status", "confirmed")) in {"confirmed", "potential"}
         and not bool((item.get("details") or {}).get("observation_only"))
         for item in findings
     )
+
+
+def _is_runtime_check(finding: dict[str, Any]) -> bool:
+    details = finding.get("details")
+    return bool(isinstance(details, dict) and details.get("observation_only")) or str(
+        finding.get("rule_id", "")
+    ).startswith("ASL-RUNTIME-")
+
+
+def _is_aggregate_alias(finding: dict[str, Any], rule_ids: set[str]) -> bool:
+    return str(finding.get("rule_id", "")) == "ASL-MVP-004" and bool(
+        rule_ids & {
+            "ASL-MANIFEST-EXPORTED-ACTIVITY",
+            "ASL-MANIFEST-EXPORTED-RECEIVER",
+            "ASL-MANIFEST-EXPORTED-PROVIDER",
+        }
+    )
+
+
+def _observation_status(finding: dict[str, Any]) -> str:
+    details = finding.get("details") if isinstance(finding.get("details"), dict) else {}
+    explicit = str(details.get("observation_status", ""))
+    if explicit in {"observed", "not_observed", "insufficient_activity", "skipped", "error"}:
+        return explicit
+    if str(finding.get("status")) == "error":
+        return "error"
+    if str(finding.get("status")) == "skipped":
+        return "skipped"
+    count = details.get("event_count", details.get("observation_count", 0))
+    if isinstance(count, int) and count > 0:
+        return "observed"
+    if details.get("root_check_present") or details.get("root_check_executed"):
+        return "observed"
+    return "not_observed"
+
+
+def _runtime_event_rows(
+    findings: list[dict[str, Any]], evidence: list[dict[str, Any]], root: Path
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for item in evidence:
+        if item.get("evidence_type") != "frida_events":
+            continue
+        path = root / str(item.get("relative_path", ""))
+        if not path.is_file() or path.stat().st_size == 0:
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                value = json.loads(line)
+                if isinstance(value, dict) and value.get("category") not in {None, "lifecycle"}:
+                    events.append(value)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for event in events:
+        key = (str(event.get("category", "unknown")), str(event.get("method", "event")))
+        grouped.setdefault(key, []).append(event)
+    rows: list[dict[str, Any]] = []
+    for (category, method), values in sorted(grouped.items()):
+        source_ids = [
+            str(item.get("evidence_id"))
+            for item in evidence
+            if item.get("evidence_type") == "frida_events"
+        ]
+        finding_id = next(
+            (
+                str(item.get("finding_id"))
+                for item in findings
+                if str(item.get("rule_id")) == "CRYPTO-ECB"
+                and category == "crypto"
+            ),
+            None,
+        )
+        rows.append(
+            {
+                "category": category,
+                "method": method,
+                "status": "observed",
+                "event_count": len(values),
+                "evidence_ids": source_ids,
+                "finding_id": finding_id,
+            }
+        )
+    return rows
 
 
 def _root_coverage_aliases(
@@ -370,10 +456,6 @@ class ReportService:
             name: 0
             for name in ("confirmed", "potential", "pass", "inconclusive", "skipped", "error")
         }
-        for finding in findings:
-            status = str(finding["status"])
-            if status in counts:
-                counts[status] += 1
         app = _optional_json(paths.app_json, self.paths.root)
         scan = _optional_json(paths.scan_json, self.paths.root)
         recorded_limitations = list(limitations or [])
@@ -412,6 +494,13 @@ class ReportService:
             if environment_type == "emulator"
             else "physical_device"
         )
+        usable_evidence = []
+        for item in evidence:
+            relative = item.get("relative_path")
+            target = paths.root / str(relative) if relative else None
+            if target is None or not target.is_file() or target.stat().st_size > 0:
+                usable_evidence.append(item)
+        evidence = usable_evidence
         findings, coverage = _normalize_findings(
             findings,
             evidence,
@@ -420,6 +509,17 @@ class ReportService:
             provenance=provenance,
             evidence_source=report_evidence_source,
         )
+        rule_ids = {str(item.get("rule_id")) for item in findings}
+        suppressed_findings = [item for item in findings if _is_aggregate_alias(item, rule_ids)]
+        security_rules = [
+            item for item in findings
+            if not _is_runtime_check(item) and item not in suppressed_findings
+        ]
+        runtime_checks = [item for item in findings if _is_runtime_check(item)]
+        for finding in security_rules:
+            status = str(finding.get("status"))
+            if status in counts:
+                counts[status] += 1
         coverage = merge_root_coverage(_root_coverage_aliases(coverage, findings))
         device_info = (
             device.get("device", {})
@@ -556,28 +656,104 @@ class ReportService:
                     ),
                     "duration_ms": scan_timings.get(timing_key),
                     "evidence": evidence_count,
+                    "event_item_count": 0,
+                    "findings_produced": 0,
                     "skip_reason": skip_reason,
                     "description": description,
                 }
             )
         security_findings = [
-            item for item in findings
-            if not bool((item.get("details") or {}).get("observation_only"))
+            item for item in security_rules
+            if str(item.get("status")) in {"confirmed", "potential"}
         ]
-        root_used_by_findings = _capability_used_by_security_findings(findings, "root_used")
-        frida_used_by_findings = _capability_used_by_security_findings(findings, "frida_used")
-        observations = [
-            item
-            for item in findings
-            if bool((item.get("details") or {}).get("observation_only"))
-            or str(item.get("rule_id", "")).startswith("CRYPTO-")
-        ]
+        root_used_by_findings = _capability_used_by_security_findings(security_rules, "root_used")
+        frida_used_by_findings = _capability_used_by_security_findings(security_rules, "frida_used")
+        runtime_checks_payload = []
+        for item in runtime_checks:
+            observation_status = _observation_status(item)
+            runtime_checks_payload.append(
+                {
+                    **item,
+                    "finding_status": item.get("status"),
+                    "status": observation_status,
+                    "observation_status": observation_status,
+                    "security_finding_produced": False,
+                    "reason": (
+                        "Runtime event observed; this row is not a vulnerability finding."
+                        if observation_status == "observed"
+                        else "No qualifying runtime event was observed in the bounded window."
+                    ),
+                }
+            )
+        observations = _runtime_event_rows(findings, evidence, paths.root)
+        runtime_phases = []
+        if isinstance(scan, dict) and isinstance(scan.get("runtime_phases"), list):
+            for phase in scan["runtime_phases"]:
+                if isinstance(phase, dict):
+                    runtime_phases.append(
+                        {
+                            **phase,
+                            "event_count": sum(
+                                int(item.get("event_count", 0)) for item in observations
+                            ),
+                            "categories": sorted(
+                                {str(item.get("category")) for item in observations}
+                            ),
+                        }
+                    )
+        runtime_checks_executed = len(runtime_checks_payload)
+        security_rules_evaluated = len(security_rules)
+        total_checks_executed = security_rules_evaluated + runtime_checks_executed
+        wall_clock = scan.get("wall_clock_duration_ms") if isinstance(scan, dict) else None
+        module_duration_sum = sum(
+            float(value)
+            for key, value in scan_timings.items()
+            if key in {
+                "preflight", "apk_acquisition", "manifest", "signature",
+                "rule_evaluation", "logcat", "storage", "frida_startup",
+                "traffic_startup", "runtime_interaction", "runtime_analysis", "report",
+            }
+            and isinstance(value, (int, float))
+        )
+        module_findings = {
+            "static_rules": sum(
+                1
+                for item in security_findings
+                if not bool(item.get("frida_used")) and not bool(item.get("root_used"))
+            ),
+            "frida": sum(1 for item in security_findings if bool(item.get("frida_used"))),
+            "private_storage": sum(1 for item in security_findings if bool(item.get("root_used"))),
+        }
+        traffic_state = _optional_json(paths.traffic_dir / "state.json", self.paths.root) or {}
+        for module in modules:
+            module_name = str(module.get("module"))
+            module["evidence"] = sum(
+                1 for item in usable_evidence
+                if str(item.get("evidence_type", "")).startswith(
+                    module_evidence_prefixes.get(module_name, ())
+                )
+            ) if module.get("executed") else 0
+            module["event_item_count"] = (
+                sum(int(item.get("event_count", 0)) for item in observations)
+                if module_name in {"frida", "runtime_observation"}
+                else int(traffic_state.get("flow_count", 0)) if module_name == "traffic"
+                else len((private_storage or {}).get("observations", []))
+                if module_name == "private_storage"
+                else 0
+            )
+            module["findings_produced"] = module_findings.get(module_name, 0)
+            if module_name == "traffic" and traffic_state.get("result") == "completed_no_data":
+                module["result"] = "completed_no_data"
+                module["skip_reason"] = "No request flows were captured in the scoped window."
         experiment = {
             "fixture_or_physical": provenance,
             "environment_type": environment_type,
             "eligible_for_empirical_metrics": provenance == "physical",
         }
         if provenance != "fixture":
+            experiment["emulator_validation"] = (
+                "VERIFIED" if environment_type == "emulator" else "UNVERIFIED"
+            )
             experiment["physical_device_validation"] = "UNVERIFIED"
         payload: dict[str, Any] = {
             "schema_version": 2,
@@ -590,20 +766,33 @@ class ReportService:
             "traffic": _optional_json(paths.traffic_dir / "state.json", self.paths.root),
             "frida": _optional_json(paths.frida_dir / "state.json", self.paths.root),
             "private_storage": private_storage,
-            "findings": findings,
-            "evidence": evidence,
+            "findings": security_rules,
+            "all_findings": findings,
+            "suppressed_findings": suppressed_findings,
+            "runtime_checks": runtime_checks_payload,
+            "evidence": usable_evidence,
             "summary": {
-                "total": len(findings),
+                "total": total_checks_executed,
+                "security_rules_evaluated": security_rules_evaluated,
+                "security_findings_total": len(security_findings),
+                "runtime_checks_executed": runtime_checks_executed,
+                "runtime_observations_total": len(observations),
+                "total_checks_executed": total_checks_executed,
                 **counts,
                 "other": 0,
                 "security_findings": len(security_findings),
                 "runtime_observations": len(observations),
                 "modules_executed": sum(1 for item in modules if item["executed"]),
                 "modules_skipped": sum(1 for item in modules if item["result"] == "skipped"),
-                "assessment_duration_ms": sum(
-                    float(value)
-                    for value in scan_timings.values()
-                    if isinstance(value, (int, float))
+                "assessment_duration_ms": (
+                    float(wall_clock)
+                    if isinstance(wall_clock, (int, float))
+                    else module_duration_sum
+                ),
+                "wall_clock_duration_ms": wall_clock,
+                "sum_of_module_durations_ms": module_duration_sum,
+                "parallel_phases": (
+                    scan.get("parallel_phases", []) if isinstance(scan, dict) else []
                 ),
             },
             "root_used": root_used_in_session,
@@ -619,8 +808,9 @@ class ReportService:
             "frida_available": frida_available,
             "frida_required": any(bool(item.get("frida_required")) for item in findings),
             "device_validation_status": _aggregate_physical_status(coverage),
-            "evidence_source": "none" if not evidence else report_evidence_source,
+            "evidence_source": "none" if not usable_evidence else report_evidence_source,
             "runtime_observations": observations,
+            "runtime_phases": runtime_phases,
             "module_execution_coverage": modules,
             "module_timing": scan_timings,
             "root_vs_non_root_coverage": coverage,
@@ -630,6 +820,11 @@ class ReportService:
                 "success": record.cleanup_success,
                 "pending": record.pending_cleanup,
             },
+            "report_state": (
+                "final"
+                if record.cleanup_success is True and not record.pending_cleanup
+                else "preliminary"
+            ),
             "limitations": list(dict.fromkeys(recorded_limitations)),
         }
         payload = redact_report_data(payload)

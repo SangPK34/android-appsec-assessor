@@ -50,8 +50,18 @@ class CleanupService:
             pass
         refreshed = self.repository.load(record.session_id)
         command_log = self.repository.paths_for(refreshed.session_id).commands_jsonl
-        return CleanupExecutor(
+        result = CleanupExecutor(
             self.paths,
             self.repository,
             self.context.adb_client(command_log=command_log),
         ).cleanup(refreshed.session_id)
+        if result.success:
+            # Finalize the machine-readable/HTML report only after cleanup has
+            # persisted its terminal status, so it cannot claim cleanup is pending.
+            from ..report import ReportService
+
+            try:
+                ReportService(self.paths, self.repository).generate(result.session_id)
+            except (AndroidAssessorError, OSError, ValueError):
+                pass
+        return result

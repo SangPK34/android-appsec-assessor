@@ -43,6 +43,9 @@
       <form method="post" action="/sessions/{{ detail.session.session_id }}/scan" hx-post="/sessions/{{ detail.session.session_id }}/scan" hx-target="body" hx-select="body" hx-swap="outerHTML" hx-indicator="closest .panel" hx-disabled-elt="find button">
         <input type="hidden" name="action_token" value="{{ action_token }}"><input type="hidden" name="profile" value="full"><button class="button" type="submit">Full Assessment</button>
       </form>
+      <form method="post" action="/sessions/{{ detail.session.session_id }}/runtime/stop" hx-post="/sessions/{{ detail.session.session_id }}/runtime/stop" hx-swap="none" hx-disabled-elt="find button">
+        <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Stop and analyze</button>
+      </form>
       {% if not detail.traffic or detail.traffic.status != 'running' %}
       <form method="post" action="/sessions/{{ detail.session.session_id }}/traffic/start" hx-post="/sessions/{{ detail.session.session_id }}/traffic/start" hx-swap="none">
         <input type="hidden" name="action_token" value="{{ action_token }}"><button class="button secondary" type="submit">Start traffic</button>
@@ -77,6 +80,7 @@
     <div class="facts manifest-facts">
       <div><dt>Traffic</dt><dd><span class="status {{ detail.traffic.status if detail.traffic else 'skipped' }}">{{ detail.traffic.status if detail.traffic else 'not started' }}</span>{% if detail.traffic and detail.traffic.error %}<small>{{ detail.traffic.error }}</small>{% endif %}</dd></div>
       <div><dt>Observer</dt><dd><span class="status {{ detail.frida.status if detail.frida else 'skipped' }}">{{ 'ready' if detail.frida and detail.frida.status == 'running' else detail.frida.status if detail.frida else 'not started' }}</span>{% if detail.frida %}<small>started={{ detail.frida.started_at or '—' }} · events={{ detail.frida.runtime_event_count or 0 }} · mode={{ detail.frida.mode or '—' }}</small>{% endif %}{% if detail.runtime_categories %}<small>categories={{ detail.runtime_categories|join(', ') }}</small>{% endif %}{% if detail.frida and detail.frida.error %}<small>{{ detail.frida.error }}</small>{% endif %}</dd></div>
+      <div><dt>Runtime phase</dt><dd>{{ detail.scan.runtime_termination if detail.scan else 'not started' }}{% if detail.scan and detail.scan.runtime_started_at %}<small>started={{ detail.scan.runtime_started_at }}</small>{% endif %}</dd></div>
     </div>
   </section>
 
@@ -106,6 +110,14 @@
     <div class="empty-state"><h3>Chưa chạy rules</h3><p>Chọn Quick Scan hoặc Full Assessment để tạo findings và report.</p></div>
     {% endif %}
   </section>
+
+  {% if detail.runtime_checks or detail.runtime_observations %}
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Runtime observations</h2><p>Observation status không phải security finding status.</p></div></div>
+    {% if detail.runtime_checks %}<div class="facts manifest-facts">{% for item in detail.runtime_checks %}<div><dt>{{ item.rule_id }}</dt><dd><span class="status {{ item.observation_status }}">{{ item.observation_status }}</span><small>{{ item.reason }}</small></dd></div>{% endfor %}</div>{% endif %}
+    {% if detail.runtime_observations %}<div class="table-wrap"><table><thead><tr><th>Category</th><th>Method</th><th>Status</th><th>Events</th></tr></thead><tbody>{% for item in detail.runtime_observations %}<tr><td>{{ item.category }}</td><td>{{ item.method }}</td><td>{{ item.status }}</td><td>{{ item.event_count }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
+  </section>
+  {% endif %}
 
   {% if detail.scan and detail.scan.limitations %}<div class="callout warning">{% for item in detail.scan.limitations %}<div>{{ item }}</div>{% endfor %}</div>{% endif %}
   {% else %}

@@ -54,6 +54,8 @@ class WebBackendProtocol(Protocol):
 
     def scan_session(self, session_id: str, profile: str = "quick") -> dict[str, Any]: ...
 
+    def request_runtime_stop(self, session_id: str) -> dict[str, Any]: ...
+
     def validate_finding(self, session_id: str, finding_id: str) -> dict[str, Any]: ...
 
     def start_traffic(self, session_id: str) -> dict[str, Any]: ...
@@ -268,6 +270,9 @@ class WebBackend:
         evidence_state = self._optional_session_json(paths.evidence_index) or {}
         evidence_values = evidence_state.get("evidence", [])
         report = self._optional_session_json(paths.report_json) or {}
+        report_findings = report.get("findings")
+        if isinstance(report_findings, list):
+            findings = report_findings
         observations = report.get("runtime_observations", [])
         runtime_categories = sorted(
             {
@@ -289,6 +294,8 @@ class WebBackend:
             else 0,
             "report_available": paths.report_html.is_file(),
             "runtime_categories": runtime_categories,
+            "runtime_checks": report.get("runtime_checks", []),
+            "runtime_observations": observations if isinstance(observations, list) else [],
         }
 
     def scan_session(self, session_id: str, profile: str = "quick") -> dict[str, Any]:
@@ -296,6 +303,9 @@ class WebBackend:
             session_id,
             profile=profile,
         ).to_dict()
+
+    def request_runtime_stop(self, session_id: str) -> dict[str, Any]:
+        return ScanService(self.context, self.repository).request_runtime_stop(session_id)
 
     def validate_finding(self, session_id: str, finding_id: str) -> dict[str, Any]:
         return ValidationService(self.context, self.repository).validate(

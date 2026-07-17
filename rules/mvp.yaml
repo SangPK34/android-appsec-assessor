@@ -133,7 +133,7 @@ rules:
     title: ECB mode observed at runtime
     category: crypto
     description: Evaluates runtime crypto metadata for ECB mode.
-    severity: high
+    severity: medium
     confidence: high
     validation_type: instrumented_validation
     observation_only: false
