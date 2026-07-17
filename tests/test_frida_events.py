@@ -246,6 +246,159 @@ class FakeProcess:
         return self.returncode
 
 
+def loading_event(*, pid: int = 4242, package: str = PACKAGE) -> str:
+    return json.dumps(
+        {
+            "timestamp": "2026-07-17T10:00:00+00:00",
+            "session_id": SESSION_ID,
+            "package": package,
+            "pid": pid,
+            "thread_id": 1,
+            "hook_id": "observer.lifecycle",
+            "category": "lifecycle",
+            "method": "observer_loading",
+            "arguments_redacted": [],
+            "return_value_redacted": None,
+            "canary_match": False,
+            "observer_version": "0.5.1",
+        }
+    )
+
+
+def test_controller_spawn_loading_gate_returns_attributed_pid(tmp_path: Path) -> None:
+    events = tmp_path / "observer.jsonl"
+    events.write_text(loading_event(pid=7331), encoding="utf-8")
+
+    assert (
+        FridaController._wait_observer_loading(
+            FakeProcess(),  # type: ignore[arg-type]
+            events,
+            session_id=SESSION_ID,
+            package=PACKAGE,
+            timeout=0.1,
+        )
+        == 7331
+    )
+
+
+def test_controller_spawn_loading_gate_rejects_timeout_and_early_exit(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing.jsonl"
+    with pytest.raises(Exception, match="script load"):
+        FridaController._wait_observer_loading(
+            FakeProcess(),  # type: ignore[arg-type]
+            missing,
+            session_id=SESSION_ID,
+            package=PACKAGE,
+            timeout=0,
+        )
+
+    exited = SimpleNamespace(poll=lambda: 3, returncode=3)
+    with pytest.raises(Exception, match="before the observer script loaded"):
+        FridaController._wait_observer_loading(
+            exited,  # type: ignore[arg-type]
+            missing,
+            session_id=SESSION_ID,
+            package=PACKAGE,
+            timeout=0.1,
+        )
+
+
+def test_controller_spawn_command_pauses_before_resume_and_attach_does_not(
+    tmp_path: Path,
+) -> None:
+    hook = tmp_path / "observer.js"
+    events = tmp_path / "events.jsonl"
+
+    spawn = FridaController._observer_command(
+        "frida.exe",
+        "fixture-device",
+        PACKAGE,
+        hook,
+        events,
+        mode="spawn",
+    )
+    attach = FridaController._observer_command(
+        "frida.exe",
+        "fixture-device",
+        PACKAGE,
+        hook,
+        events,
+        mode="attach",
+    )
+
+    assert spawn[spawn.index("-f") + 1] == PACKAGE
+    assert "--pause" in spawn
+    assert attach[attach.index("-N") + 1] == PACKAGE
+    assert "--pause" not in attach
+
+
+class SpawnPidAdb:
+    def __init__(self, output: str, *, timed_out: bool = False) -> None:
+        self.output = output
+        self.timed_out = timed_out
+
+    def shell(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=self.output,
+            timed_out=self.timed_out,
+            exit_code=0,
+        )
+
+
+def test_controller_spawn_pid_must_match_target_package() -> None:
+    FridaController._require_spawn_pid(
+        SpawnPidAdb("7331 7332"),
+        "fixture-device",
+        PACKAGE,
+        7331,
+    )
+
+    with pytest.raises(Exception, match="does not match"):
+        FridaController._require_spawn_pid(
+            SpawnPidAdb("7332"),
+            "fixture-device",
+            PACKAGE,
+            7331,
+        )
+
+
+def test_controller_spawn_resume_dispatches_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resumed: list[int] = []
+    device = SimpleNamespace(resume=lambda pid: resumed.append(pid))
+    devices: list[tuple[str, int]] = []
+
+    def get_device(serial: str, *, timeout: int) -> SimpleNamespace:
+        devices.append((serial, timeout))
+        return device
+
+    monkeypatch.setattr(frida, "get_device", get_device)
+
+    FridaController._resume_spawned_process("fixture-device", 7331)
+
+    assert devices == [("fixture-device", 5)]
+    assert resumed == [7331]
+
+
+def test_controller_failed_spawn_cleanup_force_stops_target_once() -> None:
+    calls: list[tuple[str, str]] = []
+    adb = SimpleNamespace(
+        force_stop_package=lambda serial, package: calls.append((serial, package))
+    )
+
+    cleaned = FridaController._cleanup_failed_spawn(
+        adb,
+        "fixture-device",
+        PACKAGE,
+    )
+
+    assert cleaned is True
+    assert calls == [("fixture-device", PACKAGE)]
+
+
 def test_controller_handshake_gate_accepts_normalized_fixture(tmp_path: Path) -> None:
     events = tmp_path / "observer.jsonl"
     events.write_text(fixture_events(), encoding="utf-8")

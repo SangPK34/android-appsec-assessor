@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import subprocess
@@ -122,6 +123,48 @@ class FridaController:
         return self.repository.paths_for(session_id).frida_dir / "state.json"
 
     @staticmethod
+    def _wait_observer_loading(
+        process: subprocess.Popen[bytes],
+        events_path: Path,
+        *,
+        session_id: str,
+        package: str,
+        timeout: float = 10,
+    ) -> int:
+        deadline = time.monotonic() + timeout
+        last_errors: tuple[str, ...] = ()
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise FridaError(
+                    "Frida client exited before the observer script loaded "
+                    f"with code {process.returncode}."
+                )
+            if events_path.is_file():
+                parsed = parse_frida_jsonl(
+                    events_path.read_text(encoding="utf-8", errors="replace"),
+                    expected_session_id=session_id,
+                    expected_package=package,
+                    source="frida",
+                    environment="physical",
+                )
+                last_errors = parsed.errors
+                loading = [
+                    event
+                    for event in parsed.events
+                    if event.category == "lifecycle"
+                    and event.method == "observer_loading"
+                ]
+                if len(loading) == 1:
+                    return loading[0].pid
+                if len(loading) > 1:
+                    raise FridaError("Observer script load attribution is ambiguous.")
+            time.sleep(0.2)
+        detail = f" Last parser error: {last_errors[-1]}" if last_errors else ""
+        raise FridaError(
+            f"Observer script load was not received within {timeout:g}s.{detail}"
+        )
+
+    @staticmethod
     def _wait_observer_handshake(
         process: subprocess.Popen[bytes],
         events_path: Path,
@@ -151,6 +194,79 @@ class FridaController:
             time.sleep(0.2)
         detail = f" Last parser error: {last_errors[-1]}" if last_errors else ""
         raise FridaError(f"Observer handshake was not received within {timeout:g}s.{detail}")
+
+    @staticmethod
+    def _observer_command(
+        client: str,
+        serial: str,
+        package: str,
+        hook: Path,
+        events_path: Path,
+        *,
+        mode: str,
+    ) -> list[str]:
+        target_args = ["-f", package] if mode == "spawn" else ["-N", package]
+        command = [
+            client,
+            "-D",
+            serial,
+            *target_args,
+            "-l",
+            str(hook),
+            "--no-auto-reload",
+            "-q",
+            "-t",
+            "inf",
+            "-o",
+            str(events_path),
+            "--exit-on-error",
+        ]
+        if mode == "spawn":
+            command.append("--pause")
+        return command
+
+    @staticmethod
+    def _require_spawn_pid(
+        adb: Any,
+        serial: str,
+        package: str,
+        pid: int,
+    ) -> None:
+        result = adb.shell(
+            serial,
+            ("pidof", package),
+            timeout=10,
+            check=False,
+            operation="verifying the Frida-spawned target process",
+        )
+        current_pids = {
+            int(value)
+            for value in result.stdout.split()
+            if value.isdecimal() and int(value) > 0
+        }
+        if result.timed_out or result.exit_code != 0 or pid not in current_pids:
+            raise FridaError("Frida spawned a PID that does not match the target package.")
+
+    @staticmethod
+    def _resume_spawned_process(serial: str, pid: int) -> None:
+        try:
+            frida_api = importlib.import_module("frida")
+        except ImportError as exc:
+            raise FridaError("Frida Python bindings are missing.") from exc
+        try:
+            device = frida_api.get_device(serial, timeout=5)
+            device.resume(pid)
+        except (frida_api.Error, OSError) as exc:
+            message = redact_text(str(exc))[:300]
+            raise FridaError(f"Could not resume the Frida-spawned process: {message}") from exc
+
+    @staticmethod
+    def _cleanup_failed_spawn(adb: Any, serial: str, package: str) -> bool:
+        try:
+            adb.force_stop_package(serial, package)
+        except AndroidAssessorError:
+            return False
+        return True
 
     @staticmethod
     def _version(output: str) -> str | None:
@@ -619,27 +735,20 @@ class FridaController:
                 events = redacted_frida / f"observer-{stamp}.jsonl"
                 stdout_path = raw_frida / f"observer-{stamp}.stdout.log"
                 stderr_path = raw_frida / f"observer-{stamp}.stderr.log"
-                target_args = (
-                    ["-f", record.package]
-                    if mode == "spawn"
-                    else ["-N", record.package]
-                )
-                command = [
+                command = self._observer_command(
                     probe.client_path,
-                    "-D",
                     record.serial,
-                    *target_args,
-                    "-l",
-                    str(session_hook),
-                    "--no-auto-reload",
-                    "-q",
-                    "-t",
-                    "inf",
-                    "-o",
-                    str(raw_events),
-                    "--exit-on-error",
-                ]
+                    record.package,
+                    session_hook,
+                    raw_events,
+                    mode=mode,
+                )
                 flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                self.repository.append_event(
+                    record.session_id,
+                    "frida_observer_requested",
+                    {"mode": mode},
+                )
                 with stdout_path.open("ab") as stdout_handle, stderr_path.open(
                     "ab"
                 ) as stderr_handle:
@@ -654,11 +763,40 @@ class FridaController:
                         close_fds=True,
                     )
                 try:
+                    if mode == "spawn":
+                        target_pid = self._wait_observer_loading(
+                            process,
+                            raw_events,
+                            session_id=record.session_id,
+                            package=record.package,
+                        )
+                        self._require_spawn_pid(
+                            adb,
+                            record.serial,
+                            record.package,
+                            target_pid,
+                        )
+                        self.repository.append_event(
+                            record.session_id,
+                            "frida_observer_script_loaded",
+                            {"mode": mode, "target_pid": target_pid},
+                        )
+                        self._resume_spawned_process(record.serial, target_pid)
+                        self.repository.append_event(
+                            record.session_id,
+                            "frida_spawn_resumed",
+                            {"mode": mode, "target_pid": target_pid},
+                        )
                     self._wait_observer_handshake(
                         process,
                         raw_events,
                         session_id=record.session_id,
                         package=record.package,
+                    )
+                    self.repository.append_event(
+                        record.session_id,
+                        "frida_observer_handshake_valid",
+                        {"mode": mode},
                     )
                 except FridaError as exc:
                     detail = (
@@ -747,6 +885,8 @@ class FridaController:
                         except subprocess.TimeoutExpired:
                             process.kill()
                             process.wait(timeout=5)
+                if process is not None and mode == "spawn":
+                    self._cleanup_failed_spawn(adb, record.serial, record.package)
                 raise
 
     def _mark_action(
