@@ -50,32 +50,34 @@ Windows Host
 
 ## Yêu cầu hệ thống
 
-- Windows native 64-bit. `setup.cmd` kiểm tra môi trường Windows native và kiến trúc 64-bit; framework không cung cấp đường chạy cho Linux hoặc macOS.
-- Windows PowerShell (`powershell.exe`), được gọi bởi `setup.cmd` và `repair.cmd`.
+- Windows native 64-bit. `.\setup.cmd` kiểm tra môi trường Windows native và kiến trúc 64-bit; framework không cung cấp đường chạy cho Linux hoặc macOS.
+- Windows PowerShell (`powershell.exe`), được gọi bởi `.\setup.cmd` và `.\repair.cmd`.
 - Kết nối Internet qua HTTPS trong lần setup đầu tiên để tải các thành phần đã khóa phiên bản.
 - Thiết bị Android có USB debugging, đã cấp quyền ADB và kết nối qua USB hoặc transport ADB hợp lệ.
 - Android USB driver phù hợp với nhà sản xuất nếu Windows chưa nhận thiết bị. Framework không tự cài driver của hãng.
 - Quyền chấp nhận Android SDK License khi setup cần tải Android Platform Tools hoặc Build Tools.
 
-`setup.cmd` tự quản lý runtime và các tool portable trong thư mục dự án. Cấu hình khóa hiện bao gồm Python 3.12.10 x64, Python packages từ lock file, Android Platform Tools 37.0.0, scrcpy 4.0, Android Build Tools 37.0.0, Eclipse Temurin JRE 21.0.11+10, Frida Server 17.15.5 cho các ABI được hỗ trợ và HTMX 2.0.10. Không cần cài thủ công các thành phần này trước khi chạy setup.
+`.\setup.cmd` tải và quản lý runtime cùng các công cụ portable theo phiên bản và checksum được khai báo trong `config/tools.lock.json`; Python package được cài từ các lock file của dự án. Các thành phần được quản lý bao gồm Python, Android Platform Tools, scrcpy, Android Build Tools, Java, Frida Server cho các ABI được hỗ trợ và tài nguyên giao diện cần thiết. Không cần cài thủ công các thành phần này trước khi chạy setup.
 
 Root/Magisk, Frida client/server và quyền đọc dữ liệu ứng dụng là tùy chọn cho các kiểm tra tăng cường. Việc tự khởi động Frida Server trên Android yêu cầu capability root phù hợp.
+
+Khả năng thực hiện từng bài kiểm tra phụ thuộc vào phiên bản Android, ROM, quyền ADB, trạng thái root và khả năng tương thích của Frida. Các bài kiểm tra không đáp ứng capability cần thiết sẽ được phân loại riêng thay vì làm gián đoạn toàn bộ assessment session.
 
 ## Cài đặt nhanh
 
 ```powershell
 git clone https://github.com/SangPK34/android-appsec-assessor.git
 cd android-appsec-assessor
-setup.cmd
+.\setup.cmd
 ```
 
 Kiểm tra môi trường sau setup:
 
 ```powershell
-run.cmd check
+.\run.cmd check
 ```
 
-Nếu một thành phần đã cài bị thiếu hoặc không hợp lệ, chạy `repair.cmd` để thực hiện lại quy trình kiểm tra và sửa chữa theo manifest khóa phiên bản. Có thể thêm dependency dành cho phát triển bằng `setup.cmd -IncludeDev`.
+Nếu một thành phần đã cài bị thiếu hoặc không hợp lệ, chạy `.\repair.cmd` để thực hiện lại quy trình kiểm tra và sửa chữa theo manifest khóa phiên bản. Có thể thêm dependency dành cho phát triển bằng `.\setup.cmd -IncludeDev`.
 
 ## Cấu hình phạm vi
 
@@ -124,36 +126,36 @@ Thay các giá trị ví dụ bằng device, package và host mà bạn sở h�
 ### Web UI
 
 ```powershell
-start.cmd
+.\start.cmd
 ```
 
-Web UI lắng nghe mặc định tại [http://127.0.0.1:8765](http://127.0.0.1:8765). `start.cmd` kiểm tra setup, khởi động dịch vụ local và mở trình duyệt khi endpoint `/health` đã sẵn sàng. Các khu vực chính gồm Devices, Applications, Sessions và Environment.
+Web UI lắng nghe mặc định tại [http://127.0.0.1:8765](http://127.0.0.1:8765). `.\start.cmd` kiểm tra setup, khởi động dịch vụ local và mở trình duyệt khi endpoint `/health` đã sẵn sàng. Các khu vực chính gồm Devices, Applications, Sessions và Environment.
 
 ### CLI
 
 Xem toàn bộ parser và option:
 
 ```powershell
-run.cmd --help
+.\run.cmd --help
 ```
 
 Một số command thường dùng:
 
 ```powershell
-run.cmd check
-run.cmd self-test --json
-run.cmd devices
-run.cmd devices --show-serial
-run.cmd select-device --serial SERIAL
-run.cmd inspect-device --serial SERIAL --package PACKAGE
-run.cmd inspect-app --serial SERIAL --package PACKAGE
-run.cmd scan --serial SERIAL --package PACKAGE
-run.cmd session create --serial SERIAL --package PACKAGE
-run.cmd session list
-run.cmd session show --session SESSION_ID
-run.cmd report --session SESSION_ID
-run.cmd validate --session SESSION_ID --finding FINDING_ID
-run.cmd cleanup --session SESSION_ID
+.\run.cmd check
+.\run.cmd self-test --json
+.\run.cmd devices
+.\run.cmd devices --show-serial
+.\run.cmd select-device --serial SERIAL
+.\run.cmd inspect-device --serial SERIAL
+.\run.cmd inspect-app --serial SERIAL --package PACKAGE
+.\run.cmd scan --serial SERIAL --package PACKAGE
+.\run.cmd session create --serial SERIAL --package PACKAGE
+.\run.cmd session list
+.\run.cmd session show --session SESSION_ID
+.\run.cmd report --session SESSION_ID
+.\run.cmd validate --session SESSION_ID --finding FINDING_ID
+.\run.cmd cleanup --session SESSION_ID
 ```
 
 Các giá trị `SERIAL`, `PACKAGE`, `SESSION_ID` và `FINDING_ID` trong ví dụ là placeholder. Dùng `--json` cho các command hỗ trợ xuất dữ liệu máy đọc được; `--show-serial` chỉ nên dùng trong môi trường local được kiểm soát.
@@ -162,7 +164,7 @@ Các giá trị `SERIAL`, `PACKAGE`, `SESSION_ID` và `FINDING_ID` trong ví d�
 
 1. Kết nối thiết bị, bật USB debugging và chấp nhận quyền ADB.
 2. Khai báo device, package, host và action trong `config/scope.yaml`.
-3. Chạy `run.cmd check` để kiểm tra runtime và tool.
+3. Chạy `.\run.cmd check` để kiểm tra runtime và tool.
 4. Dùng `devices` và `select-device` để chọn thiết bị được phép.
 5. Chọn package rồi chạy inspection hoặc tạo assessment session bằng `inspect-app` hoặc `session create`.
 6. Chạy `scan` hoặc các thao tác traffic/Frida phù hợp với capability.
@@ -217,7 +219,7 @@ docs/              Tài liệu kỹ thuật và hướng dẫn chuyên sâu.
 pytest -q
 ruff check .
 python -m compileall android_assessor
-run.cmd check
+.\run.cmd check
 ```
 
 ## Sử dụng có trách nhiệm
@@ -225,7 +227,3 @@ run.cmd check
 Chỉ sử dụng framework với ứng dụng, thiết bị và hệ thống mà bạn sở hữu hoặc được phép kiểm thử. Các thao tác xác minh có thể thay đổi tạm thời proxy, process hoặc trạng thái ứng dụng; framework sử dụng session và cleanup ledger để quản lý các thay đổi này.
 
 Hãy giới hạn scope ở hệ thống lab, xem xét artifact raw trước khi chia sẻ và chạy cleanup sau khi hoàn tất workflow.
-
-## License
-
-Repository chưa kèm file `LICENSE`; chưa có tuyên bố giấy phép cho việc sử dụng hoặc phân phối. Hãy xác định giấy phép phù hợp trước khi phát hành hoặc tích hợp dự án vào sản phẩm khác.
