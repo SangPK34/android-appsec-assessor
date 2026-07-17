@@ -178,6 +178,17 @@ class CryptoAnalyzer:
                 ),
             )
         executed = tuple(item for item in values if item.executed)
+        if not executed:
+            return (
+                self._result(
+                    "CRYPTO-COVERAGE",
+                    "Crypto runtime execution unavailable",
+                    FindingStatus.INCONCLUSIVE,
+                    (),
+                    {"reason": "Normalized events did not prove a completed crypto operation."},
+                    values,
+                ),
+            )
         output: list[CryptoRuleResult] = []
         weak = tuple(
             item for item in executed if item.algorithm in self.policy.weak_algorithms
@@ -232,7 +243,11 @@ class CryptoAnalyzer:
                     values,
                 )
             )
-        static_iv = tuple(item for item in executed if item.iv_source == "constant")
+        static_iv = tuple(
+            item
+            for item in executed
+            if item.purpose == "encrypt" and item.iv_source == "constant"
+        )
         if static_iv:
             output.append(
                 self._result(
@@ -254,7 +269,11 @@ class CryptoAnalyzer:
             if item.purpose == "encrypt" and item.iv_sha256 is not None
         )
         reused_hashes = {digest for digest, count in iv_counts.items() if count > 1}
-        reused = tuple(item for item in executed if item.iv_sha256 in reused_hashes)
+        reused = tuple(
+            item
+            for item in executed
+            if item.purpose == "encrypt" and item.iv_sha256 in reused_hashes
+        )
         if reused:
             output.append(
                 self._result(
@@ -352,7 +371,7 @@ class CryptoAnalyzer:
             operation_ids=tuple(item.operation_id for item in matched_values),
             details=details,
             finding_eligible=not simulated,
-            physical_validation_status="UNVERIFIED" if simulated else "UNVERIFIED",
+            physical_validation_status="UNVERIFIED",
         )
 
 

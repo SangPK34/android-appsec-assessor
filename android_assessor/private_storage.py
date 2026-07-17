@@ -367,9 +367,7 @@ class PrivateStorageInspector:
                     artifact_paths=(artifact.relative_path,),
                     rationale="A requested synthetic canary was present in bounded content.",
                     finding_eligible=artifact.source != "fixture",
-                    physical_validation_status=(
-                        "UNVERIFIED" if artifact.source == "fixture" else "NOT_REQUIRED"
-                    ),
+                    physical_validation_status="UNVERIFIED",
                 )
             )
         unusual = [item.relative_path for item in artifacts if _permission_is_unusual(item)]

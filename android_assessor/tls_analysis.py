@@ -125,7 +125,11 @@ class TlsBehaviorAnalyzer:
             state=state,
             finding_status=status,
             confidence=confidence,
-            validation_type="instrumented_validation",
+            validation_type=(
+                "instrumented_validation"
+                if evidence.pinning_observed or evidence.trust_manager_observed
+                else "adb_assisted_validation"
+            ),
             rationale=rationale,
             evidence=evidence,
             finding_eligible=not simulated,

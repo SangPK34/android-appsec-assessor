@@ -91,6 +91,31 @@ def test_crypto_empty_runtime_coverage_is_inconclusive() -> None:
     assert results[0].finding_eligible is False
 
 
+def test_unexecuted_crypto_events_are_inconclusive_not_policy_pass() -> None:
+    operation = replace(
+        load_crypto_fixture(load_fixture("crypto/safe.json"))[0],
+        executed=False,
+    )
+
+    results = CryptoAnalyzer().analyze((operation,))
+
+    assert len(results) == 1
+    assert results[0].rule_id == "CRYPTO-COVERAGE"
+    assert results[0].status is FindingStatus.INCONCLUSIVE
+
+
+def test_constant_iv_used_only_for_decryption_is_not_static_iv_confirmation() -> None:
+    operation = replace(
+        load_crypto_fixture(load_fixture("crypto/safe.json"))[0],
+        purpose="decrypt",
+        iv_source="constant",
+    )
+
+    results = CryptoAnalyzer().analyze((operation,))
+
+    assert "CRYPTO-STATIC-IV" not in {item.rule_id for item in results}
+
+
 @pytest.mark.parametrize("forbidden", ("key", "key_material", "iv", "plaintext", "ciphertext"))
 def test_crypto_model_rejects_raw_secret_material(forbidden: str) -> None:
     value = {

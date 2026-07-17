@@ -56,6 +56,30 @@ def test_tls_fixture_state_matrix(
     assert result.physical_validation_status == "UNVERIFIED"
 
 
+def test_tls_validation_type_reflects_actual_instrumentation_dependency() -> None:
+    traffic_only = TlsBehaviorAnalyzer.analyze(
+        TlsEvidence(
+            target_request_count=1,
+            canary_request_count=1,
+            canary_response_count=1,
+            source="fixture",
+            environment="simulated",
+        )
+    )
+    instrumented = TlsBehaviorAnalyzer.analyze(
+        TlsEvidence(
+            target_request_count=1,
+            canary_request_count=1,
+            pinning_observed=True,
+            source="fixture",
+            environment="simulated",
+        )
+    )
+
+    assert traffic_only.validation_type == "adb_assisted_validation"
+    assert instrumented.validation_type == "instrumented_validation"
+
+
 def test_target_https_response_without_canary_is_not_confirmed() -> None:
     result = TlsBehaviorAnalyzer.from_events(
         [
