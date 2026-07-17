@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from android_assessor.errors import ConfigurationError, ScopeError
+from android_assessor.errors import ConfigurationError, ScopeError, SessionError
 from android_assessor.findings import FindingRecord, FindingRepository, FindingStatus
 from android_assessor.paths import ProjectPaths
 from android_assessor.scope import load_scope
@@ -187,6 +187,33 @@ def test_action_outside_scope_is_rejected_before_adb(tmp_path: Path) -> None:
             context,  # type: ignore[arg-type]
             repository,
         ).start(session_id)
+
+    assert context.adb_calls == 0
+
+
+def test_validation_request_limit_is_enforced_before_adb(tmp_path: Path) -> None:
+    paths, repository, session_id = active_session(tmp_path)
+    paths.scope_file.write_text(
+        "devices: [ABC123]\n"
+        "packages: [com.example.app]\n"
+        "api_hosts: []\n"
+        "allowed_actions: [controlled_validation]\n"
+        "limits: {max_validation_requests: 1}\n",
+        encoding="utf-8",
+    )
+    FindingRepository(paths, repository).save(session_id, [cleartext_finding()])
+    repository.append_event(
+        session_id,
+        "validation_attempt_started",
+        {"attempt": 1, "limit": 1},
+    )
+    context = NoAdbContext(paths)
+
+    with pytest.raises(SessionError, match="request limit"):
+        ValidationService(
+            context,  # type: ignore[arg-type]
+            repository,
+        ).validate(session_id, "finding-asl-mvp-002")
 
     assert context.adb_calls == 0
 

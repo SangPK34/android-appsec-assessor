@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import time
@@ -354,7 +355,8 @@ class ValidationService:
 
     def validate(self, session_id: str, finding_id: str) -> FindingRecord:
         record = self.repository.load(session_id)
-        load_scope(self.paths).require_device_package(
+        scope = load_scope(self.paths)
+        scope.require_device_package(
             record.serial,
             record.package,
             action="controlled_validation",
@@ -367,15 +369,47 @@ class ValidationService:
             session_id=record.session_id,
             timeout=0,
         ):
-            return self._validate_locked(session_id, finding_id)
+            return self._validate_locked(
+                session_id,
+                finding_id,
+                max_requests=scope.limits.max_validation_requests,
+            )
 
-    def _validate_locked(self, session_id: str, finding_id: str) -> FindingRecord:
+    def _reserve_validation_attempt(self, session_id: str, max_requests: int) -> None:
+        events_path = self.repository.paths_for(session_id).events_jsonl
+        attempts = 0
+        try:
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise ValueError("event is not an object")
+                attempts += value.get("event") == "validation_attempt_started"
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise SessionError("Validation attempt ledger could not be verified.") from exc
+        if attempts >= max_requests:
+            raise SessionError("Session validation request limit has been reached.")
+        self.repository.append_event(
+            session_id,
+            "validation_attempt_started",
+            {"attempt": attempts + 1, "limit": max_requests},
+        )
+
+    def _validate_locked(
+        self,
+        session_id: str,
+        finding_id: str,
+        *,
+        max_requests: int,
+    ) -> FindingRecord:
         finding = self.findings.get(session_id, finding_id)
         if not finding.validation_supported:
             raise SessionError("This finding does not support controlled validation.")
         definition = validation_for_rule(finding.rule_id)
         if definition is None or not definition.production_enabled:
             raise SessionError("This controlled validation is not enabled in production.")
+        self._reserve_validation_attempt(session_id, max_requests)
         canary = self._canary()
         if finding.rule_id == "ASL-MVP-002":
             validation = self._validate_cleartext(session_id, finding, canary)
