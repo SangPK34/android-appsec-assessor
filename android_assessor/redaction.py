@@ -229,7 +229,7 @@ def redact_arguments(
             output.append(REDACTED)
             redact_next = False
             continue
-        output.append(redact_text(argument))
+        output.append(redact_text_with_values(argument, sensitive_values))
         if argument.startswith("-") and is_sensitive_name(argument.lstrip("-")):
             redact_next = "=" not in argument
     return output

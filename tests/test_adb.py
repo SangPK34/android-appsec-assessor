@@ -13,7 +13,7 @@ from android_assessor.adb import (
     parse_reverse_list,
     validate_serial,
 )
-from android_assessor.errors import AdbError
+from android_assessor.errors import AdbError, AdbTimeoutError
 from android_assessor.subprocess_utils import CommandResult
 
 ADB_OUTPUT = """List of devices attached
@@ -174,3 +174,46 @@ def test_apk_pull_uses_explicit_serial_and_list_arguments(
 
     assert captured[1:5] == ["-s", "ABC123", "pull", "/data/app/example/base.apk"]
     assert captured[5] == str(destination.resolve())
+
+
+def test_checked_device_timeout_is_typed_and_forwards_sensitive_log_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "platform tools" / "adb.exe"
+    command_log = tmp_path / "session" / "commands.jsonl"
+    executable.parent.mkdir()
+    executable.touch()
+    captured: dict[str, object] = {}
+
+    def fake_run(arguments: object, **kwargs: object) -> CommandResult:
+        captured["arguments"] = arguments
+        captured.update(kwargs)
+        return CommandResult(
+            arguments=(),
+            exit_code=-1,
+            stdout="",
+            stderr="",
+            started_at="2026-07-18T00:00:00+00:00",
+            duration_ms=1000,
+            timed_out=True,
+        )
+
+    monkeypatch.setattr(adb_module, "run_command", fake_run)
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    client = AdbClient(executable, command_log=command_log)
+
+    with pytest.raises(AdbTimeoutError, match="entering bounded fixture input"):
+        client.shell(
+            "ABC123",
+            ("input", "text", canary),
+            timeout=1,
+            check=True,
+            operation="entering bounded fixture input",
+            sensitive_values=(canary,),
+        )
+
+    assert captured["command_log"] == command_log.resolve()
+    sensitive_values = captured["sensitive_values"]
+    assert isinstance(sensitive_values, tuple)
+    assert set(sensitive_values) == {"ABC123", canary}

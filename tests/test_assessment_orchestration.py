@@ -394,6 +394,14 @@ def test_full_assessment_exception_still_runs_owned_resource_cleanup(
         (
             ScanProfile.FULL,
             False,
+            True,
+            "action_failure_limit",
+            None,
+            ["traffic", "frida", "explorer", "storage"],
+        ),
+        (
+            ScanProfile.FULL,
+            False,
             False,
             "max_actions",
             None,
@@ -506,15 +514,35 @@ def test_scan_profile_starts_only_planned_controllers(
             config = _kwargs["config"]
             assert isinstance(config, ExplorerConfig)
             assert config.controlled_canary_delivery is controlled_canary
+            explorer_partial = explorer_termination == "action_failure_limit"
             result: dict[str, object] = {
-                "status": "completed",
+                "status": "partial" if explorer_partial else "completed",
                 "termination_reason": explorer_termination,
                 "runtime_categories": (),
-                "controlled_canary_inputs": 1 if controlled_canary else 0,
-                "to_dict": lambda: {"status": "completed", "states_visited": 2},
+                "controlled_canary_inputs": (
+                    1 if controlled_canary and not explorer_partial else 0
+                ),
+                "controlled_canary_deliveries": (
+                    1 if controlled_canary and not explorer_partial else 0
+                ),
+                "controlled_canary_attempts": 1 if explorer_partial else 0,
+                "controlled_canary_failures": 1 if explorer_partial else 0,
+                "actions_failed": 1 if explorer_partial else 0,
+                "observation_retries": 1 if explorer_partial else 0,
+                "state_refreshes": 1 if explorer_partial else 0,
+                "to_dict": lambda: {
+                    "status": "partial" if explorer_partial else "completed",
+                    "states_visited": 2,
+                },
             }
             if (
-                explorer_termination in {"max_runtime", "max_actions", "max_states"}
+                explorer_termination
+                in {
+                    "max_runtime",
+                    "max_actions",
+                    "max_states",
+                    "action_failure_limit",
+                }
                 or target_limit_reason is not None
             ):
                 result.update(
@@ -597,17 +625,19 @@ def test_scan_profile_starts_only_planned_controllers(
         profile is ScanProfile.FULL and not traffic_fails
     )
     assert scan["controlled_canary_requested"] is controlled_canary
-    assert scan["controlled_canary_executed"] is (
-        controlled_canary and not traffic_fails
+    controlled_canary_completed = (
+        controlled_canary
+        and not traffic_fails
+        and explorer_termination != "action_failure_limit"
     )
+    assert scan["controlled_canary_executed"] is controlled_canary_completed
     assert result.controlled_canary_requested is controlled_canary
-    assert result.controlled_canary_executed is (
-        controlled_canary and not traffic_fails
-    )
+    assert result.controlled_canary_executed is controlled_canary_completed
     assert scan["runtime_termination"] in {
         "coverage_plateau",
         "completed_no_wait",
         "max_actions",
+        "action_failure_limit",
         "not_started",
     }
     explorer_executed = profile is ScanProfile.FULL and not traffic_fails
@@ -619,7 +649,13 @@ def test_scan_profile_starts_only_planned_controllers(
         if item.startswith("Autonomous exploration coverage was bounded:")
     ]
     expected_coverage_limitation = explorer_executed and (
-        explorer_termination in {"max_runtime", "max_actions", "max_states"}
+        explorer_termination
+        in {
+            "max_runtime",
+            "max_actions",
+            "max_states",
+            "action_failure_limit",
+        }
         or target_limit_reason
         in {"hard_limit", "insufficient_action_budget", "max_actions", "max_states"}
     )
@@ -632,6 +668,14 @@ def test_scan_profile_starts_only_planned_controllers(
         assert "targeted activity attempts=1" in limitation
         assert "targeted deep-link attempts=1" in limitation
         assert "org.private" not in limitation
+        if explorer_termination == "action_failure_limit":
+            assert "status=partial" in limitation
+            assert "failed_actions=1" in limitation
+    if controlled_canary and explorer_termination == "action_failure_limit":
+        assert scan["dynamic_steps"]["controlled_canary"] == "delivery_failed"
+        assert any(
+            "completion is unknown" in item for item in result.limitations
+        )
     assert "runtime_analysis" in result.phase_timings
     if profile is ScanProfile.FULL:
         propagated = [value for value in canaries.values() if value is not None]
@@ -1006,6 +1050,7 @@ def test_report_module_coverage_registers_explorer_without_double_counting_runti
     [
         ("quick", "skipped", False, "not_planned"),
         ("full", "error", True, "error"),
+        ("full", "partial", True, "partial"),
     ],
 )
 def test_report_explorer_coverage_respects_profile_and_failure(
@@ -1023,7 +1068,10 @@ def test_report_explorer_coverage_respects_profile_and_failure(
             "profile": profile,
             "dynamic_steps": {"autonomous_exploration": step},
             "phase_timings": {"exploration": 100} if step == "error" else {},
-            "limitations": ["Autonomous exploration failed: bounded test error."],
+            "limitations": [
+                "Autonomous exploration status="
+                f"{step}: bounded test termination preserved partial coverage."
+            ],
         },
         root=paths.root,
     )
@@ -1041,6 +1089,12 @@ def test_report_explorer_coverage_respects_profile_and_failure(
     )
     assert explorer["planned"] is expected_planned
     assert explorer["result"] == expected_result
+    if step == "partial":
+        assert explorer["executed"] is True
+        assert explorer["skip_reason"] == (
+            "Autonomous exploration status=partial: bounded test termination "
+            "preserved partial coverage."
+        )
 
 
 def test_report_explorer_coverage_uses_authoritative_scan_request_flags(

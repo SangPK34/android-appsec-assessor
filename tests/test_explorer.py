@@ -7,7 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from android_assessor.errors import AdbError, ScopeError
+from android_assessor.errors import AdbError, AdbTimeoutError, ScopeError
+from android_assessor.evidence import EvidenceRepository
 from android_assessor.explorer import (
     AdbExplorerBackend,
     AndroidExplorer,
@@ -320,6 +321,102 @@ class LoginBackend(FakeBackend):
             self.login_taps += 1
             self.categories.add("network")
             self.methods.add("http.request")
+
+
+class RecoveringCanaryTimeoutBackend(LoginBackend):
+    def __init__(self, canary: str) -> None:
+        super().__init__()
+        self.canary = canary
+        self.input_attempts: list[tuple[int, int, str]] = []
+        self.canary_timed_out = False
+        self.observation_timed_out = False
+        self.post_failure_actions = 0
+
+    def dump_ui(self) -> str:
+        if self.canary_timed_out and not self.observation_timed_out:
+            self._command()
+            self.ui_dump_count += 1
+            self.observation_timed_out = True
+            raise AdbTimeoutError("bounded UI refresh timed out")
+        return super().dump_ui()
+
+    def input_text(self, x: int, y: int, value: str) -> None:
+        self.input_attempts.append((x, y, value))
+        if value == self.canary:
+            self._command()
+            self.canary_timed_out = True
+            raise AdbTimeoutError(f"timed out while entering {value}")
+        super().input_text(x, y, value)
+
+    def swipe(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        if self.canary_timed_out:
+            self.post_failure_actions += 1
+        super().swipe(x1, y1, x2, y2)
+
+
+class SubmitTimeoutBackend(LoginBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_attempts = 0
+
+    def tap(self, x: int, y: int, *, long: bool = False) -> None:
+        if y >= 230:
+            self._command()
+            self.submit_attempts += 1
+            raise AdbTimeoutError("bounded submit action timed out")
+        super().tap(x, y, long=long)
+
+
+FAILURE_LIMIT_XML = _xml(
+    _node(
+        text="",
+        resource="org.lab.resilient:id/first_value",
+        bounds="[10,20][500,110]",
+        class_name="android.widget.EditText",
+        editable=True,
+        hint="First value",
+        package="org.lab.resilient",
+    ),
+    _node(
+        text="",
+        resource="org.lab.resilient:id/second_value",
+        bounds="[10,120][500,210]",
+        class_name="android.widget.EditText",
+        editable=True,
+        hint="Second value",
+        package="org.lab.resilient",
+    ),
+    _node(
+        text="",
+        resource="org.lab.resilient:id/third_value",
+        bounds="[10,220][500,310]",
+        class_name="android.widget.EditText",
+        editable=True,
+        hint="Third value",
+        package="org.lab.resilient",
+    ),
+)
+
+
+class ActionFailureLimitBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pid = 818
+        self.input_attempts: list[tuple[int, int, str]] = []
+
+    def dump_ui(self) -> str:
+        self._command()
+        self.ui_dump_count += 1
+        return FAILURE_LIMIT_XML
+
+    def current_activity(self) -> tuple[str | None, str | None]:
+        self._command()
+        return "org.lab.resilient", "org.lab.resilient.FormActivity"
+
+    def input_text(self, x: int, y: int, value: str) -> None:
+        self._command()
+        self.input_attempts.append((x, y, value))
+        raise AdbTimeoutError("bounded input action timed out")
 
 
 TERMINAL_XML = _xml(
@@ -765,11 +862,11 @@ def test_input_generation_uses_only_lab_values() -> None:
 
 
 def test_adb_input_dispatch_never_attempts_unverified_destructive_clear() -> None:
-    commands: list[tuple[str, ...]] = []
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
     class Adb:
-        def shell(self, _serial: str, arguments: tuple[str, ...], **_kwargs: object) -> object:
-            commands.append(arguments)
+        def shell(self, _serial: str, arguments: tuple[str, ...], **kwargs: object) -> object:
+            calls.append((arguments, kwargs))
             return SimpleNamespace(stdout="")
 
     backend = AdbExplorerBackend(
@@ -779,20 +876,156 @@ def test_adb_input_dispatch_never_attempts_unverified_destructive_clear() -> Non
         session_id="20260717-210000-abcdef",
         per_action_timeout=2,
     )
-    backend.input_text(10, 20, "test")
-    assert ("input", "text", "test") in commands
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    backend.input_text(10, 20, canary)
+    commands = [arguments for arguments, _kwargs in calls]
+    assert ("input", "text", canary) in commands
     assert not any(
         "KEYCODE_DEL" in command or "KEYCODE_MOVE_END" in command
         for command in commands
     )
+    input_call = next(call for call in calls if call[0][:2] == ("input", "text"))
+    assert input_call[0] == ("input", "text", canary)
+    assert input_call[1]["sensitive_values"] == (canary,)
+
+
+def test_adb_input_text_commands_share_one_logical_deadline() -> None:
+    now = [100.0]
+    timeouts: list[float] = []
+
+    class Adb:
+        def shell(
+            self,
+            _serial: str,
+            _arguments: tuple[str, ...],
+            **kwargs: object,
+        ) -> object:
+            timeouts.append(float(kwargs["timeout"]))
+            now[0] += 1.25
+            return SimpleNamespace(stdout="")
+
+    backend = AdbExplorerBackend(
+        Adb(),  # type: ignore[arg-type]
+        serial="FAKE_SERIAL",
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        per_action_timeout=2,
+    )
+    backend._monotonic = lambda: now[0]
+
+    backend.input_text(10, 20, "bounded")
+
+    assert timeouts == pytest.approx([2.0, 0.75])
+
+
+def test_adb_logical_deadline_stops_compound_input_before_second_dispatch() -> None:
+    now = [300.0]
+    calls: list[tuple[str, ...]] = []
+
+    class Adb:
+        def shell(
+            self,
+            _serial: str,
+            arguments: tuple[str, ...],
+            **_kwargs: object,
+        ) -> object:
+            calls.append(arguments)
+            now[0] += 2.1
+            return SimpleNamespace(stdout="")
+
+    backend = AdbExplorerBackend(
+        Adb(),  # type: ignore[arg-type]
+        serial="FAKE_SERIAL",
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        per_action_timeout=2,
+    )
+    backend._monotonic = lambda: now[0]
+
+    with pytest.raises(AdbTimeoutError, match="logical operation"):
+        backend.input_text(10, 20, "bounded")
+
+    assert calls == [("input", "tap", "10", "20")]
+
+
+def test_adb_ui_observation_commands_share_one_logical_deadline() -> None:
+    now = [200.0]
+    calls: list[tuple[tuple[str, ...], float]] = []
+
+    class Adb:
+        def shell(
+            self,
+            _serial: str,
+            arguments: tuple[str, ...],
+            **kwargs: object,
+        ) -> object:
+            calls.append((arguments, float(kwargs["timeout"])))
+            now[0] += 0.4
+            return SimpleNamespace(
+                stdout="<hierarchy />" if arguments[:1] == ("cat",) else ""
+            )
+
+    backend = AdbExplorerBackend(
+        Adb(),  # type: ignore[arg-type]
+        serial="FAKE_SERIAL",
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        per_action_timeout=2,
+    )
+    backend._monotonic = lambda: now[0]
+
+    assert backend.dump_ui() == "<hierarchy />"
+
+    assert [timeout for _arguments, timeout in calls] == pytest.approx(
+        [2.0, 1.6, 1.2]
+    )
+
+
+def test_adb_cleanup_failure_is_reported_and_retry_remains_idempotent() -> None:
+    responses = [
+        SimpleNamespace(stdout="", exit_code=-1, timed_out=True),
+        SimpleNamespace(stdout="", exit_code=0, timed_out=False),
+    ]
+    calls: list[tuple[str, ...]] = []
+
+    class Adb:
+        def shell(
+            self,
+            _serial: str,
+            arguments: tuple[str, ...],
+            **_kwargs: object,
+        ) -> object:
+            calls.append(arguments)
+            return responses.pop(0)
+
+    backend = AdbExplorerBackend(
+        Adb(),  # type: ignore[arg-type]
+        serial="FAKE_SERIAL",
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        per_action_timeout=2,
+    )
+    backend._workspace_ready = True
+
+    backend.cleanup()
+    assert backend.cleanup_failure_reason == "adb_timeout"
+    assert backend._workspace_ready is True
+
+    backend.cleanup()
+    assert backend.cleanup_failure_reason is None
+    assert backend._workspace_ready is False
+    assert calls == [
+        ("rm", "-rf", "--", backend.remote_dir),
+        ("rm", "-rf", "--", backend.remote_dir),
+    ]
 
 
 def test_adb_deep_link_dispatch_uses_argument_vector_without_remote_shell() -> None:
-    commands: list[tuple[str, ...]] = []
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
     class Adb:
-        def shell(self, _serial: str, arguments: tuple[str, ...], **_kwargs: object) -> object:
-            commands.append(arguments)
+        def shell(self, _serial: str, arguments: tuple[str, ...], **kwargs: object) -> object:
+            calls.append((arguments, kwargs))
             return SimpleNamespace(stdout="Status: ok")
 
     backend = AdbExplorerBackend(
@@ -805,7 +1038,7 @@ def test_adb_deep_link_dispatch_uses_argument_vector_without_remote_shell() -> N
     uri = "https://10.0.2.2/lab?asl=canary"
     backend.start_deep_link(uri)
 
-    assert commands == [
+    assert [arguments for arguments, _kwargs in calls] == [
         (
             "am",
             "start",
@@ -818,6 +1051,24 @@ def test_adb_deep_link_dispatch_uses_argument_vector_without_remote_shell() -> N
             "com.example.app",
         )
     ]
+    assert calls[0][1]["sensitive_values"] == (uri,)
+
+
+def test_adb_process_timeout_is_not_misclassified_as_process_exit() -> None:
+    class Adb:
+        def shell(self, *_args: object, **_kwargs: object) -> object:
+            return SimpleNamespace(stdout="", exit_code=-1, timed_out=True)
+
+    backend = AdbExplorerBackend(
+        Adb(),  # type: ignore[arg-type]
+        serial="FAKE_SERIAL",
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        per_action_timeout=2,
+    )
+
+    with pytest.raises(AdbTimeoutError, match="target process"):
+        backend.process_id()
 
 
 def test_external_dialog_dismissal_is_limited_to_permission_controller(
@@ -1171,10 +1422,58 @@ def test_explorer_leaving_package_is_a_structured_termination() -> None:
 
     result = explorer.run()
 
-    assert result.status == "completed"
+    assert result.status == "partial"
     assert result.termination_reason == "package_boundary"
     assert backend.cleanup_called is True
     assert any(item["event"] == "exploration_stopped" for item in explorer.trace)
+
+
+def test_process_state_timeout_after_action_does_not_fake_a_crash() -> None:
+    class ProcessStateTimeoutBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.action_dispatched = False
+
+        def dump_ui(self) -> str:
+            self._command()
+            self.ui_dump_count += 1
+            return _xml(
+                _node(
+                    text="Open",
+                    resource="com.example.app:id/open",
+                    bounds="[10,120][300,210]",
+                )
+            )
+
+        def current_activity(self) -> tuple[str | None, str | None]:
+            self._command()
+            if self.action_dispatched:
+                return None, None
+            return "com.example.app", "com.example.app.MainActivity"
+
+        def tap(self, x: int, y: int, *, long: bool = False) -> None:
+            self._command()
+            del x, y, long
+            self.action_dispatched = True
+
+        def process_id(self) -> int | None:
+            self._command()
+            if self.action_dispatched:
+                raise AdbTimeoutError("bounded process observation timed out")
+            return self.pid
+
+    backend = ProcessStateTimeoutBackend()
+    result, _, explorer = _run(backend)
+
+    assert result.status == "partial"
+    assert result.termination_reason == "process_state_unavailable"
+    assert result.crashes == 0
+    assert result.process_restarts == 0
+    assert backend.launches == 0
+    assert any(
+        item.get("reason") == "process_state_unavailable"
+        for item in explorer.trace
+    )
 
 
 def test_explorer_service_requires_strict_device_package_scope(tmp_path: Path) -> None:
@@ -1283,6 +1582,88 @@ def test_explorer_service_accepts_autonomous_action_without_controlled_validatio
     assert result.status == "completed"
 
 
+def test_explorer_service_persists_partial_progress_and_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = ProjectPaths(tmp_path / "lab")
+    paths.ensure_layout()
+    repository = SessionRepository(paths)
+    record = repository.initialize(serial="FAKE_SERIAL", package="com.example.app")
+    scope = ScopeConfig(
+        devices=frozenset({"FAKE_SERIAL"}),
+        packages=frozenset({"com.example.app"}),
+        api_hosts=frozenset({"10.0.2.2"}),
+        allowed_actions=frozenset({"inspect", "autonomous_exploration"}),
+    )
+
+    class Explorer:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.trace = [
+                {
+                    "event": "action_failed",
+                    "kind": "input",
+                    "reason": "adb_timeout",
+                    "replayed": False,
+                }
+            ]
+
+        def run(self) -> ExplorerResult:
+            return ExplorerResult(
+                session_id=record.session_id,
+                status="partial",
+                termination_reason="coverage_plateau",
+                duration_ms=1.0,
+                states_visited=2,
+                activities_visited=("com.example.app.MainActivity",),
+                actions_executed=4,
+                input_actions=0,
+                scroll_actions=1,
+                backtracks=0,
+                process_restarts=0,
+                crashes=0,
+                runtime_categories=("crypto",),
+                runtime_methods=1,
+                runtime_events=1,
+                activity_attempts=(),
+                deep_link_attempts=(),
+                actions_failed=1,
+                observation_retries=1,
+                state_refreshes=1,
+            )
+
+    monkeypatch.setattr("android_assessor.explorer.AndroidExplorer", Explorer)
+    result = ExplorerService(paths, repository).run(
+        record.session_id,
+        adb=object(),  # type: ignore[arg-type]
+        scope=scope,
+        config=ExplorerConfig(max_runtime_seconds=1),
+        feedback=lambda: RuntimeFeedback(),
+        stop_requested=lambda: False,
+    )
+
+    session_paths = repository.paths_for(record.session_id)
+    summary = json.loads(
+        (session_paths.redacted_dir / "explorer" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    events = session_paths.events_jsonl.read_text(encoding="utf-8")
+    evidence_types = {
+        item["evidence_type"]
+        for item in EvidenceRepository(paths, repository).list(record.session_id)
+    }
+
+    assert result.status == "partial"
+    assert summary["status"] == "partial"
+    assert summary["actions_failed"] == 1
+    assert "autonomous_exploration_partial" in events
+    assert evidence_types == {
+        "autonomous_interaction_trace",
+        "autonomous_exploration_summary",
+    }
+
+
 def test_explorer_service_requires_controlled_scope_for_canary_delivery(
     tmp_path: Path,
 ) -> None:
@@ -1354,7 +1735,7 @@ def test_form_aware_retry_fills_minimum_input_and_retries_once() -> None:
     assert "crypto" in result.runtime_categories
 
 
-def test_form_aware_retry_uses_exact_session_canary_without_tracing_value() -> None:
+def test_form_aware_retry_does_not_use_canary_without_controlled_scope() -> None:
     backend = FormRetryBackend()
     canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
     _result, _, explorer = _run(
@@ -1371,7 +1752,31 @@ def test_form_aware_retry_uses_exact_session_canary_without_tracing_value() -> N
         ),
     )
 
-    assert backend.inputs == [canary]
+    assert backend.inputs == ["test"]
+    assert canary not in json.dumps(explorer.trace)
+
+
+def test_form_retry_does_not_bypass_controlled_canary_form_compatibility() -> None:
+    backend = FormRetryBackend()
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    result, _, explorer = _run(
+        backend,
+        package="org.lab.form",
+        session_canary=canary,
+        config=ExplorerConfig(
+            max_runtime_seconds=10,
+            plateau_seconds=1,
+            max_states=5,
+            max_actions=10,
+            per_action_timeout_seconds=1,
+            controlled_canary_delivery=True,
+        ),
+    )
+
+    assert backend.inputs == ["test"]
+    assert result.controlled_canary_attempts == 0
+    assert result.controlled_canary_inputs == 0
+    assert result.controlled_canary_deliveries == 0
     assert canary not in json.dumps(explorer.trace)
 
 
@@ -1413,6 +1818,8 @@ def test_controlled_canary_refills_generic_auth_form_before_targeted_navigation(
     assert backend.inputs[-2:] == [canary, "123456"]
     assert len(backend.inputs) == 4
     assert result.controlled_canary_inputs == 1
+    assert result.controlled_canary_attempts == 2
+    assert result.controlled_canary_deliveries == 2
     assert backend.started_activities == ["org.lab.portal.OtherActivity"]
     assert backend.deep_links == [f"https://10.0.2.2/auth?asl={canary}"]
     assert len(result.activity_attempts) == 1
@@ -1449,8 +1856,200 @@ def test_default_exploration_never_uses_exact_canary_for_username() -> None:
 
     assert canary not in backend.inputs
     assert result.controlled_canary_inputs == 0
+    assert result.controlled_canary_deliveries == 0
     assert not any(
         item.get("event") == "controlled_canary_delivery"
+        for item in explorer.trace
+    )
+
+
+def test_token_labeled_input_never_uses_exact_canary_without_controlled_scope() -> None:
+    class TokenFieldBackend(FakeBackend):
+        def dump_ui(self) -> str:
+            self._command()
+            self.ui_dump_count += 1
+            return _xml(
+                _node(
+                    text="",
+                    resource="org.lab.token:id/session_token",
+                    class_name="android.widget.EditText",
+                    editable=True,
+                    hint="Token",
+                    package="org.lab.token",
+                )
+            )
+
+        def current_activity(self) -> tuple[str | None, str | None]:
+            self._command()
+            return "org.lab.token", "org.lab.token.MainActivity"
+
+    backend = TokenFieldBackend()
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    result, _, _ = _run(
+        backend,
+        package="org.lab.token",
+        session_canary=canary,
+        config=ExplorerConfig(
+            max_runtime_seconds=5,
+            plateau_seconds=1,
+            max_states=3,
+            max_actions=4,
+            per_action_timeout_seconds=1,
+        ),
+    )
+
+    assert backend.inputs == ["ASL_abcdef"]
+    assert canary not in backend.inputs
+    assert result.controlled_canary_inputs == 0
+    assert result.controlled_canary_deliveries == 0
+
+
+def test_input_timeout_is_not_replayed_and_preserves_partial_progress() -> None:
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    backend = RecoveringCanaryTimeoutBackend(canary)
+
+    result, _, explorer = _run(
+        backend,
+        package="org.lab.portal",
+        session_canary=canary,
+        config=ExplorerConfig(
+            max_runtime_seconds=10,
+            plateau_seconds=1,
+            max_states=5,
+            max_actions=12,
+            per_action_timeout_seconds=1,
+            controlled_canary_delivery=True,
+            max_observation_retries=1,
+            max_action_failures=3,
+        ),
+    )
+
+    canary_attempts = [item for item in backend.input_attempts if item[2] == canary]
+    assert len(canary_attempts) == 1
+    assert canary not in backend.inputs
+    assert backend.post_failure_actions > 0
+    assert result.status == "partial"
+    assert result.termination_reason != "action_failure_limit"
+    assert result.actions_failed == 1
+    assert result.actions_attempted == result.actions_executed + result.actions_failed
+    assert result.observation_retries == 1
+    assert result.state_refreshes >= 1
+    assert result.controlled_canary_attempts == 1
+    assert result.controlled_canary_failures == 1
+    assert result.controlled_canary_deliveries == 0
+    failure = next(item for item in explorer.trace if item.get("event") == "action_failed")
+    assert failure["reason"] == "adb_timeout"
+    assert not {"error", "message", "detail"} & failure.keys()
+    assert canary not in json.dumps(explorer.trace)
+
+
+def test_controlled_canary_submit_timeout_is_not_reported_as_delivery() -> None:
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    backend = SubmitTimeoutBackend()
+
+    result, _, explorer = _run(
+        backend,
+        package="org.lab.portal",
+        session_canary=canary,
+        config=ExplorerConfig(
+            max_runtime_seconds=10,
+            plateau_seconds=1,
+            max_states=5,
+            max_actions=12,
+            per_action_timeout_seconds=1,
+            controlled_canary_delivery=True,
+        ),
+    )
+
+    assert backend.submit_attempts == 1
+    assert result.status == "partial"
+    assert result.controlled_canary_attempts == 1
+    assert result.controlled_canary_inputs == 1
+    assert result.controlled_canary_deliveries == 0
+    assert result.controlled_canary_failures == 1
+    assert not any(
+        item.get("event") == "controlled_canary_delivery"
+        for item in explorer.trace
+    )
+
+
+def test_controlled_canary_form_is_not_partially_dispatched_without_action_quota() -> None:
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    backend = LoginBackend()
+
+    result, _, explorer = _run(
+        backend,
+        package="org.lab.portal",
+        session_canary=canary,
+        config=ExplorerConfig(
+            max_runtime_seconds=10,
+            plateau_seconds=1,
+            max_states=5,
+            max_actions=4,
+            per_action_timeout_seconds=1,
+            controlled_canary_delivery=True,
+        ),
+    )
+
+    assert canary not in backend.inputs
+    assert result.controlled_canary_attempts == 0
+    assert result.controlled_canary_inputs == 0
+    assert result.controlled_canary_deliveries == 0
+    assert result.controlled_canary_budget_skips == 1
+    assert any(
+        item.get("event") == "action_skipped"
+        and item.get("reason") == "controlled_canary_action_budget"
+        for item in explorer.trace
+    )
+
+
+def test_action_failure_limit_returns_partial_result_without_replaying_inputs() -> None:
+    backend = ActionFailureLimitBackend()
+
+    result, _, explorer = _run(
+        backend,
+        package="org.lab.resilient",
+        config=ExplorerConfig(
+            max_runtime_seconds=10,
+            plateau_seconds=1,
+            max_states=5,
+            max_actions=12,
+            per_action_timeout_seconds=1,
+            max_observation_retries=1,
+            max_action_failures=2,
+        ),
+    )
+
+    attempted_coordinates = [(x, y) for x, y, _value in backend.input_attempts]
+    assert len(attempted_coordinates) == 2
+    assert len(set(attempted_coordinates)) == 2
+    assert result.status == "partial"
+    assert result.termination_reason == "action_failure_limit"
+    assert result.actions_failed == 2
+    assert result.actions_attempted == 2
+    assert result.actions_executed == 0
+    assert backend.cleanup_called is True
+    assert sum(
+        item.get("event") == "action_failed" for item in explorer.trace
+    ) == 2
+
+
+def test_cleanup_timeout_preserves_explorer_result_and_records_failure() -> None:
+    class CleanupTimeoutBackend(FakeBackend):
+        def cleanup(self) -> None:
+            self.cleanup_called = True
+            raise AdbTimeoutError("bounded cleanup timeout")
+
+    backend = CleanupTimeoutBackend()
+    result, _, explorer = _run(backend)
+
+    assert backend.cleanup_called is True
+    assert result.status == "partial"
+    assert result.cleanup_status == "failed"
+    assert result.cleanup_failure_reason == "adb_timeout"
+    assert any(
+        item.get("event") == "cleanup_failed"
+        and item.get("reason") == "adb_timeout"
         for item in explorer.trace
     )
 
@@ -1718,7 +2317,45 @@ def test_activity_and_deep_link_discovery_enforce_allowlisted_hosts() -> None:
     )
 
 
-def test_allowlisted_deep_link_uses_exact_session_canary() -> None:
+def test_allowlisted_deep_link_uses_exact_session_canary_in_controlled_mode() -> None:
+    backend = FakeBackend()
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    result, _, explorer = _run(
+        backend,
+        session_canary=canary,
+        manifest={
+            "deep_links": [
+                {
+                    "component": "com.example.app.MainActivity",
+                    "scheme": "https",
+                    "host": "10.0.2.2",
+                    "path": "/lab",
+                }
+            ]
+        },
+        config=ExplorerConfig(
+            max_runtime_seconds=3,
+            plateau_seconds=1,
+            max_states=2,
+            max_actions=1,
+            per_action_timeout_seconds=1,
+            monkey_events=0,
+            controlled_canary_delivery=True,
+        ),
+    )
+
+    assert backend.deep_links == [f"https://10.0.2.2/lab?asl={canary}"]
+    assert result.controlled_canary_attempts == 1
+    assert result.controlled_canary_deliveries == 1
+    assert any(
+        item.get("event") == "controlled_canary_delivery"
+        and item.get("input_kind") == "deep_link_query"
+        for item in explorer.trace
+    )
+    assert canary not in json.dumps(explorer.trace)
+
+
+def test_allowlisted_deep_link_does_not_use_exact_canary_without_controlled_scope() -> None:
     backend = FakeBackend()
     canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
     _run(
@@ -1740,11 +2377,11 @@ def test_allowlisted_deep_link_uses_exact_session_canary() -> None:
             max_states=2,
             max_actions=1,
             per_action_timeout_seconds=1,
-            monkey_events=0,
         ),
     )
 
-    assert backend.deep_links == [f"https://10.0.2.2/lab?asl={canary}"]
+    assert backend.deep_links == ["https://10.0.2.2/lab?asl=canary"]
+    assert canary not in backend.deep_links[0]
 
 
 def test_deep_link_manifest_path_is_percent_encoded_before_dispatch() -> None:

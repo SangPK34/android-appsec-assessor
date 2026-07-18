@@ -530,6 +530,7 @@ def root_shell(
     check: bool,
     operation: str,
     probe: RootProbe | None = None,
+    sensitive_values: Sequence[str] = (),
 ) -> CommandResult:
     if not command or "\x00" in command or "\r" in command or "\n" in command:
         raise ValueError("Root shell command contains unsupported characters.")
@@ -549,4 +550,5 @@ def root_shell(
         timeout=timeout,
         check=check,
         operation=operation,
+        sensitive_values=sensitive_values,
     )

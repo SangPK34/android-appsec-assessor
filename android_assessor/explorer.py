@@ -8,7 +8,8 @@ import json
 import random
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -16,7 +17,7 @@ from urllib.parse import quote, urlencode, urlunsplit
 from xml.etree import ElementTree
 
 from .adb import AdbClient
-from .errors import AdbError, AndroidAssessorError
+from .errors import AdbError, AdbTimeoutError, AndroidAssessorError
 from .evidence import EvidenceRepository
 from .redaction import redact_text
 from .scope import ScopeConfig
@@ -148,6 +149,8 @@ class ExplorerConfig:
     max_actions: int = 100
     max_depth: int = 8
     per_action_timeout_seconds: int = 3
+    max_observation_retries: int = 1
+    max_action_failures: int = 3
     seed: int = 1337
     monkey_events: int = 0
     controlled_canary_delivery: bool = False
@@ -160,6 +163,8 @@ class ExplorerConfig:
             "max_actions": (self.max_actions, 1, 1000),
             "max_depth": (self.max_depth, 1, 30),
             "per_action_timeout_seconds": (self.per_action_timeout_seconds, 1, 30),
+            "max_observation_retries": (self.max_observation_retries, 0, 3),
+            "max_action_failures": (self.max_action_failures, 1, 20),
             "monkey_events": (self.monkey_events, 0, 50),
         }
         for name, (value, minimum, maximum) in bounds.items():
@@ -261,6 +266,15 @@ class ExplorerResult:
     exploring_ms: float = 0.0
     runtime_wait_ms: float = 0.0
     controlled_canary_inputs: int = 0
+    controlled_canary_deliveries: int = 0
+    actions_failed: int = 0
+    observation_retries: int = 0
+    state_refreshes: int = 0
+    controlled_canary_attempts: int = 0
+    controlled_canary_failures: int = 0
+    controlled_canary_budget_skips: int = 0
+    cleanup_status: str = "completed"
+    cleanup_failure_reason: str | None = None
     trace_path: str | None = None
     summary_path: str | None = None
 
@@ -358,6 +372,17 @@ def _is_input_placeholder(
 def _is_transient_ui_automation_error(error: BaseException) -> bool:
     message = str(error).casefold()
     return any(marker in message for marker in _UIAUTOMATION_TRANSIENT_ERRORS)
+
+
+def _failure_reason(error: BaseException) -> str:
+    """Return a stable redacted failure class for traces and reports."""
+    if isinstance(error, AdbTimeoutError):
+        return "adb_timeout"
+    if isinstance(error, AdbError):
+        return "adb_error"
+    if isinstance(error, OSError):
+        return "os_error"
+    return "invalid_observation"
 
 
 def _trace_label(value: str) -> str:
@@ -748,28 +773,54 @@ class AdbExplorerBackend:
         self._ui_dump_count = 0
         self._adb_operation_ms = 0.0
         self._deadline: float | None = None
+        self._logical_deadlines: list[float] = []
+        self._monotonic = time.monotonic
         self._workspace_ready = False
+        self._cleanup_failure_reason: str | None = None
 
     def set_runtime_budget(self, seconds: int) -> None:
-        self._deadline = time.monotonic() + seconds
+        self._deadline = self._monotonic() + seconds
+
+    @contextmanager
+    def logical_operation(self, timeout_seconds: float) -> Iterator[None]:
+        """Share one deadline across every ADB command in a logical operation."""
+        self._logical_deadlines.append(self._monotonic() + timeout_seconds)
+        try:
+            yield
+        finally:
+            self._logical_deadlines.pop()
 
     def _bounded_timeout(self, requested: int | float) -> float:
-        if self._deadline is None:
-            return float(requested)
-        remaining = self._deadline - time.monotonic()
-        if remaining <= 0:
-            raise _ExplorerDeadlineReached
-        return max(0.1, min(float(requested), remaining))
+        now = self._monotonic()
+        remaining_values = [float(requested)]
+        if self._deadline is not None:
+            runtime_remaining = self._deadline - now
+            if runtime_remaining <= 0:
+                raise _ExplorerDeadlineReached
+            remaining_values.append(runtime_remaining)
+        if self._logical_deadlines:
+            logical_remaining = min(self._logical_deadlines) - now
+            if logical_remaining <= 0:
+                raise AdbTimeoutError(
+                    "Explorer logical operation exceeded its bounded timeout."
+                )
+            remaining_values.append(logical_remaining)
+        return min(remaining_values)
 
     def _record_adb_start(self) -> float:
         self._adb_command_count += 1
-        return time.monotonic()
+        return self._monotonic()
 
     def _record_adb_end(self, started: float) -> None:
-        self._adb_operation_ms += (time.monotonic() - started) * 1000
+        self._adb_operation_ms += (self._monotonic() - started) * 1000
 
     def _shell(
-        self, arguments: Sequence[str], operation: str, *, timeout: int | None = None
+        self,
+        arguments: Sequence[str],
+        operation: str,
+        *,
+        timeout: int | float | None = None,
+        sensitive_values: Sequence[str] = (),
     ) -> str:
         started = self._record_adb_start()
         try:
@@ -779,6 +830,7 @@ class AdbExplorerBackend:
                 timeout=self._bounded_timeout(timeout or self.timeout),
                 check=True,
                 operation=operation,
+                sensitive_values=sensitive_values,
             )
         finally:
             self._record_adb_end(started)
@@ -798,6 +850,10 @@ class AdbExplorerBackend:
         )
 
     def dump_ui(self) -> str:
+        with self.logical_operation(self.timeout):
+            return self._dump_ui_bounded()
+
+    def _dump_ui_bounded(self) -> str:
         self._ui_dump_count += 1
         if not self._workspace_ready:
             self._shell(("mkdir", "-p", "--", self.remote_dir), "creating explorer workspace")
@@ -846,6 +902,10 @@ class AdbExplorerBackend:
             )
         finally:
             self._record_adb_end(started)
+        if result.timed_out:
+            raise AdbTimeoutError("ADB timed out while checking explorer target process.")
+        if result.exit_code not in {0, 1}:
+            raise AdbError("ADB failed while checking explorer target process.")
         return next((int(item) for item in result.stdout.split() if item.isdecimal()), None)
 
     def tap(self, x: int, y: int, *, long: bool = False) -> None:
@@ -860,8 +920,13 @@ class AdbExplorerBackend:
     def input_text(self, x: int, y: int, value: str) -> None:
         if not _SAFE_TEXT_PATTERN.fullmatch(value):
             raise AdbError("Generated explorer input contains unsupported characters.")
-        self.tap(x, y)
-        self._shell(("input", "text", value), "entering generated lab input")
+        with self.logical_operation(self.timeout):
+            self.tap(x, y)
+            self._shell(
+                ("input", "text", value),
+                "entering generated lab input",
+                sensitive_values=(value,),
+            )
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int) -> None:
         self._shell(
@@ -896,6 +961,7 @@ class AdbExplorerBackend:
             ),
             "opening an allowlisted application deep link",
             timeout=self.timeout,
+            sensitive_values=(uri,),
         )
         return output
 
@@ -1019,9 +1085,10 @@ class AdbExplorerBackend:
         )
 
     def cleanup(self) -> None:
+        self._cleanup_failure_reason = None
         started = self._record_adb_start()
         try:
-            self.adb.shell(
+            result = self.adb.shell(
                 self.serial,
                 ("rm", "-rf", "--", self.remote_dir),
                 timeout=10,
@@ -1030,7 +1097,17 @@ class AdbExplorerBackend:
             )
         finally:
             self._record_adb_end(started)
+        if bool(getattr(result, "timed_out", False)):
+            self._cleanup_failure_reason = "adb_timeout"
+            return
+        if int(getattr(result, "exit_code", 0)) != 0:
+            self._cleanup_failure_reason = "adb_error"
+            return
         self._workspace_ready = False
+
+    @property
+    def cleanup_failure_reason(self) -> str | None:
+        return self._cleanup_failure_reason
 
     def performance_metrics(self) -> Mapping[str, int | float]:
         return {
@@ -1076,6 +1153,7 @@ class AndroidExplorer:
         self.rng = random.Random(config.seed)
         self.trace: list[dict[str, Any]] = []
         self._ui_dump_count = 0
+        self._observation_retries = 0
         self._safety_skip_keys: set[tuple[str, str]] = set()
 
     def _trace(self, event: str, **details: Any) -> None:
@@ -1117,12 +1195,27 @@ class AndroidExplorer:
             activity=activity,
         )
 
+    @contextmanager
+    def _operation_budget(self) -> Iterator[None]:
+        logical_operation = getattr(self.backend, "logical_operation", None)
+        if callable(logical_operation):
+            with logical_operation(self.config.per_action_timeout_seconds):
+                yield
+            return
+        yield
+
     def _wait_for_ui(self, previous: str | None = None) -> UiState:
+        with self._operation_budget():
+            return self._wait_for_ui_until(previous)
+
+    def _wait_for_ui_until(self, previous: str | None = None) -> UiState:
         deadline = min(
             getattr(self, "_hard_deadline", float("inf")),
             self.clock() + self.config.per_action_timeout_seconds,
         )
         last: UiState | None = None
+        last_error: AndroidAssessorError | OSError | ValueError | None = None
+        failed_observations = 0
         stable_count = 0
         while self.clock() < deadline:
             try:
@@ -1145,7 +1238,17 @@ class AndroidExplorer:
                 except (AndroidAssessorError, OSError, ValueError):
                     pass
                 raise
-            except (AndroidAssessorError, OSError, ValueError):
+            except (AndroidAssessorError, OSError, ValueError) as exc:
+                last_error = exc
+                if failed_observations >= self.config.max_observation_retries:
+                    raise
+                failed_observations += 1
+                self._observation_retries += 1
+                self._trace(
+                    "observation_retry",
+                    reason=_failure_reason(exc),
+                    attempt=failed_observations,
+                )
                 try:
                     self.backend.dismiss_external_dialog()
                 except (AndroidAssessorError, OSError, ValueError):
@@ -1155,6 +1258,8 @@ class AndroidExplorer:
             return last
         if self.clock() >= getattr(self, "_hard_deadline", float("inf")):
             raise _ExplorerDeadlineReached
+        if last_error is not None:
+            raise last_error
         return self._capture()
 
     @staticmethod
@@ -1336,10 +1441,6 @@ class AndroidExplorer:
                 value = f"{self.session_canary}@example.test"
             elif input_kind == "url":
                 value = f"https://10.0.2.2/{self.session_canary}"
-        elif self.session_canary is not None and (
-            input_kind == "canary" or (prefer_canary and input_kind == "text")
-        ):
-            value = self.session_canary
         elif input_kind == "canary":
             value = f"ASL_{self.session_id[-6:]}"
         return input_kind, value
@@ -1405,8 +1506,14 @@ class AndroidExplorer:
                 )
                 continue
             authority = f"{host}:{port}" if port else host
+            canary_marker = (
+                self.session_canary
+                if self.config.controlled_canary_delivery
+                and self.session_canary is not None
+                else "canary"
+            )
             query = urlencode(
-                {"asl": self.session_canary or "canary"},
+                {"asl": canary_marker},
                 safe="",
             )
             uri = urlunsplit(
@@ -1440,36 +1547,90 @@ class AndroidExplorer:
         traced_skips: set[tuple[str, str, str]] = set()
         scrolled: set[str] = set()
         history: list[str] = []
-        actions_executed = input_actions = scroll_actions = backtracks = 0
-        controlled_canary_inputs = 0
+        actions_attempted = actions_executed = 0
+        input_actions = scroll_actions = backtracks = 0
+        controlled_canary_inputs = controlled_canary_deliveries = 0
+        controlled_canary_attempts = controlled_canary_failures = 0
+        controlled_canary_budget_skips = 0
+        action_failures = state_refreshes = 0
         actions_succeeded = duplicate_actions_avoided = form_retries = 0
         process_restarts = crashes = 0
         idle_seconds = idle_plateau_seconds = runtime_wait_seconds = 0.0
         monkey_used = False
         keyboard_open = False
         termination = "completed"
+        partial_result = False
         previous_pid: int | None = None
         feedback = RuntimeFeedback()
         activity_attempts: list[dict[str, Any]] = []
         deep_link_attempts: list[dict[str, Any]] = []
         pending_navigation: list[tuple[str, str, int]] = []
         controlled_form_pending = False
+        cleanup_failure_reason: str | None = None
 
         def reset_idle() -> None:
             nonlocal idle_plateau_seconds
             idle_plateau_seconds = 0.0
 
-        def enter_input(node: UiNode, state: UiState, *, source: str) -> None:
-            nonlocal actions_executed, actions_succeeded, input_actions, keyboard_open
+        def record_action_failure(
+            kind: str,
+            error: AdbError | OSError,
+            *,
+            source: str | None = None,
+        ) -> None:
+            nonlocal action_failures, partial_result
+            nonlocal controlled_canary_failures
+            is_controlled_canary = bool(
+                source and source.startswith("controlled_canary")
+            )
+            action_failures += 1
+            partial_result = True
+            if is_controlled_canary:
+                controlled_canary_failures += 1
+            self._trace(
+                "action_failed",
+                kind=kind,
+                source=source,
+                reason=_failure_reason(error),
+                outcome="unknown",
+                replayed=False,
+            )
+
+        def perform_action(
+            kind: str,
+            operation: Callable[[], None],
+            *,
+            source: str | None = None,
+        ) -> bool:
+            nonlocal actions_attempted, actions_executed
+            nonlocal controlled_canary_attempts
+            actions_attempted += 1
+            if source == "controlled_canary":
+                controlled_canary_attempts += 1
+            try:
+                with self._operation_budget():
+                    operation()
+            except (AdbError, OSError) as exc:
+                record_action_failure(kind, exc, source=source)
+                return False
+            actions_executed += 1
+            return True
+
+        def enter_input(node: UiNode, state: UiState, *, source: str) -> bool:
+            nonlocal actions_succeeded, input_actions, keyboard_open
             nonlocal controlled_canary_inputs
             input_kind, value = self._generated_input(
                 node,
-                prefer_canary=source in {"form_retry", "controlled_canary"},
+                prefer_canary=source == "controlled_canary",
             )
-            self.backend.input_text(*node.center, value)
+            if not perform_action(
+                "input",
+                lambda: self.backend.input_text(*node.center, value),
+                source=source,
+            ):
+                return False
             identity = _node_identity(node, state.activity)
             executed.add((state.fingerprint, identity))
-            actions_executed += 1
             actions_succeeded += 1
             input_actions += 1
             if source == "controlled_canary":
@@ -1483,6 +1644,7 @@ class AndroidExplorer:
                 resource_id=node.resource_id,
                 state=state.fingerprint,
             )
+            return True
 
         def block_pending_navigation(reason: str) -> None:
             for kind, _target, index in pending_navigation:
@@ -1490,6 +1652,92 @@ class AndroidExplorer:
                 attempts[index]["status"] = "blocked"
                 attempts[index]["reason"] = reason
             pending_navigation.clear()
+
+        def recover_action_failure() -> UiState | None:
+            nonlocal termination, state_refreshes, partial_result
+            if action_failures >= self.config.max_action_failures:
+                termination = "action_failure_limit"
+                block_pending_navigation(termination)
+                self._trace(
+                    "exploration_stopped",
+                    reason=termination,
+                    actions_failed=action_failures,
+                )
+                return None
+            try:
+                refreshed = self._wait_for_ui()
+            except (_ExplorerDeadlineReached, _ExplorerPackageBoundary):
+                raise
+            except (AndroidAssessorError, OSError, ValueError) as exc:
+                partial_result = True
+                termination = "action_recovery_failed"
+                block_pending_navigation(termination)
+                self._trace(
+                    "exploration_stopped",
+                    reason=termination,
+                    observation_reason=_failure_reason(exc),
+                )
+                return None
+            state_refreshes += 1
+            self._trace(
+                "state_refreshed",
+                reason="action_failure",
+                state=refreshed.fingerprint,
+            )
+            return refreshed
+
+        def observe_after_action(previous: str | None = None) -> UiState | None:
+            nonlocal termination, partial_result, crashes, process_restarts
+            nonlocal previous_pid
+            try:
+                return self._wait_for_ui(previous)
+            except _ExplorerDeadlineReached:
+                raise
+            except _ExplorerPackageBoundary:
+                try:
+                    with self._operation_budget():
+                        process_alive = self.backend.process_id() is not None
+                except (AdbError, OSError) as exc:
+                    partial_result = True
+                    termination = "process_state_unavailable"
+                    block_pending_navigation(termination)
+                    self._trace(
+                        "exploration_stopped",
+                        reason=termination,
+                        observation_reason=_failure_reason(exc),
+                    )
+                    return None
+                if process_alive:
+                    raise
+                try:
+                    crashes += 1
+                    with self._operation_budget():
+                        self.backend.launch()
+                        process_restarts += 1
+                        previous_pid = self.backend.process_id()
+                    return self._wait_for_ui()
+                except _ExplorerDeadlineReached:
+                    raise
+                except (AndroidAssessorError, OSError, ValueError) as exc:
+                    partial_result = True
+                    termination = "state_refresh_failed"
+                    block_pending_navigation(termination)
+                    self._trace(
+                        "exploration_stopped",
+                        reason=termination,
+                        observation_reason=_failure_reason(exc),
+                    )
+                    return None
+            except (AndroidAssessorError, OSError, ValueError) as exc:
+                partial_result = True
+                termination = "state_refresh_failed"
+                block_pending_navigation(termination)
+                self._trace(
+                    "exploration_stopped",
+                    reason=termination,
+                    observation_reason=_failure_reason(exc),
+                )
+                return None
 
         try:
             if not self.network_guard_active:
@@ -1500,10 +1748,11 @@ class AndroidExplorer:
                 raise AdbError(
                     "Autonomous exploration requires an active scoped traffic guard."
                 )
-            previous_pid = self.backend.process_id()
+            with self._operation_budget():
+                previous_pid = self.backend.process_id()
+                if previous_pid is None:
+                    self.backend.launch()
             feedback = self.feedback()
-            if previous_pid is None:
-                self.backend.launch()
             current = self._wait_for_ui()
             activity_attempts, activity_targets = self._activity_attempts(current.activity)
             deep_link_attempts, deep_link_targets = self._deep_link_attempts()
@@ -1532,7 +1781,7 @@ class AndroidExplorer:
                     termination = "max_runtime"
                     block_pending_navigation("insufficient_action_budget")
                     break
-                if actions_executed >= self.config.max_actions:
+                if actions_attempted >= self.config.max_actions:
                     termination = "max_actions"
                     block_pending_navigation("max_actions")
                     break
@@ -1573,44 +1822,117 @@ class AndroidExplorer:
                     kind, target, index = pending_navigation.pop(0)
                     attempts = activity_attempts if kind == "activity" else deep_link_attempts
                     previous = current.fingerprint
+                    navigation_action_failed = False
+                    controlled_navigation = bool(
+                        kind == "deep_link"
+                        and self.config.controlled_canary_delivery
+                        and self.session_canary is not None
+                    )
+                    actions_attempted += 1
+                    if controlled_navigation:
+                        controlled_canary_attempts += 1
                     try:
-                        output = (
-                            self.backend.start_activity(target)
-                            if kind == "activity"
-                            else self.backend.start_deep_link(target)
-                        )
+                        with self._operation_budget():
+                            output = (
+                                self.backend.start_activity(target)
+                                if kind == "activity"
+                                else self.backend.start_deep_link(target)
+                            )
                         status = "permission_denied" if "Permission Denial" in output else "opened"
                     except AndroidAssessorError as exc:
-                        status = (
-                            "permission_denied"
-                            if "permission" in str(exc).casefold()
-                            else "blocked"
+                        if "permission" in str(exc).casefold():
+                            status = "permission_denied"
+                        elif isinstance(exc, AdbError):
+                            status = "outcome_unknown"
+                            record_action_failure(
+                                kind,
+                                exc,
+                                source=(
+                                    "controlled_canary_deep_link"
+                                    if controlled_navigation
+                                    else None
+                                ),
+                            )
+                            navigation_action_failed = True
+                            attempts[index]["reason"] = _failure_reason(exc)
+                        else:
+                            status = "blocked"
+                            attempts[index]["reason"] = "policy_rejected"
+                    except OSError as exc:
+                        status = "outcome_unknown"
+                        record_action_failure(
+                            kind,
+                            exc,
+                            source=(
+                                "controlled_canary_deep_link"
+                                if controlled_navigation
+                                else None
+                            ),
                         )
-                    actions_executed += 1
+                        navigation_action_failed = True
+                        attempts[index]["reason"] = _failure_reason(exc)
+                    if not navigation_action_failed:
+                        actions_executed += 1
                     if status == "opened":
-                        try:
-                            candidate = self._wait_for_ui(previous)
-                        except (AndroidAssessorError, OSError, ValueError):
-                            if self.backend.process_id() is not None:
-                                status = "blocked"
-                                attempts[index]["reason"] = "ui_not_verified"
-                                candidate = current
-                            else:
-                                status = "crashed"
-                                crashes += 1
-                                self.backend.launch()
-                                process_restarts += 1
-                                previous_pid = self.backend.process_id()
-                                candidate = self._wait_for_ui()
-                        if status == "opened":
-                            if kind == "activity" and candidate.activity != target:
-                                status = "blocked"
-                                attempts[index]["reason"] = "activity_not_resumed"
-                            else:
-                                actions_succeeded += 1
-                                if candidate.fingerprint != previous:
-                                    history.append(previous)
-                                current = candidate
+                        candidate = observe_after_action(previous)
+                        if candidate is None:
+                            status = "outcome_unknown"
+                            attempts[index]["reason"] = termination
+                            attempts[index]["status"] = status
+                            self._trace(
+                                "targeted_navigation",
+                                kind=kind,
+                                component=attempts[index].get("component"),
+                                host=attempts[index].get("host"),
+                                status=status,
+                                reason=attempts[index].get("reason"),
+                            )
+                            break
+                        if kind == "activity" and candidate.activity != target:
+                            status = "blocked"
+                            attempts[index]["reason"] = "activity_not_resumed"
+                        else:
+                            actions_succeeded += 1
+                            if candidate.fingerprint != previous:
+                                history.append(previous)
+                            current = candidate
+                    elif navigation_action_failed:
+                        refreshed = recover_action_failure()
+                        if refreshed is None:
+                            attempts[index]["status"] = status
+                            self._trace(
+                                "targeted_navigation",
+                                kind=kind,
+                                component=attempts[index].get("component"),
+                                host=attempts[index].get("host"),
+                                status=status,
+                                reason=attempts[index].get("reason"),
+                            )
+                            break
+                        expected_activity = (
+                            target
+                            if kind == "activity"
+                            else attempts[index].get("component")
+                        )
+                        current = refreshed
+                        if expected_activity and current.activity == expected_activity:
+                            status = "opened"
+                            attempts[index]["reason"] = (
+                                "completion_observed_after_action_error"
+                            )
+                            actions_succeeded += 1
+                            if current.fingerprint != previous:
+                                history.append(previous)
+                    if controlled_navigation and status == "opened":
+                        controlled_canary_deliveries += 1
+                        self._trace(
+                            "controlled_canary_delivery",
+                            state=previous,
+                            action="deep_link",
+                            input_kind="deep_link_query",
+                            supporting_input=False,
+                            observation="completed",
+                        )
                     attempts[index]["status"] = status
                     self._trace(
                         "targeted_navigation",
@@ -1695,12 +2017,22 @@ class AndroidExplorer:
                 if action is not None:
                     reset_idle()
                     if keyboard_open and action.kind != "input":
-                        self.backend.hide_keyboard()
                         keyboard_open = False
-                        actions_executed += 1
+                        if not perform_action(
+                            "hide_keyboard",
+                            self.backend.hide_keyboard,
+                        ):
+                            refreshed = recover_action_failure()
+                            if refreshed is None:
+                                break
+                            current = refreshed
+                            continue
                         actions_succeeded += 1
                         self._trace("action", kind="hide_keyboard")
-                        current = self._wait_for_ui(current.fingerprint)
+                        observed = observe_after_action(current.fingerprint)
+                        if observed is None:
+                            break
+                        current = observed
                         continue
                     executed.add((current.fingerprint, action.identity))
                     if any(
@@ -1711,13 +2043,18 @@ class AndroidExplorer:
                             (current.fingerprint, _normalize_label(action.label))
                         )
                     previous = current.fingerprint
+                    controlled_delivery: tuple[str, bool] | None = None
                     if action.kind == "input":
                         node = next(
                             node
                             for node in current.nodes
                             if _node_identity(node, current.activity) == action.identity
                         )
-                        enter_input(node, current, source="traversal")
+                        if not enter_input(node, current, source="traversal"):
+                            refreshed = recover_action_failure()
+                            if refreshed is None:
+                                break
+                            current = refreshed
                         continue
                     else:
                         controlled_form: tuple[UiNode | None, UiNode | None] | None = None
@@ -1734,62 +2071,110 @@ class AndroidExplorer:
                                 supporting,
                             ):
                                 controlled_form = (carrier, supporting)
-                                controlled_form_pending = False
                         if (
                             self.session_canary is not None
                             and controlled_form is not None
-                            and self.config.max_actions - actions_executed >= 3
                         ):
                             carrier, supporting = controlled_form
-                            if carrier is not None:
-                                enter_input(carrier, current, source="controlled_canary")
+                            required_actions = 3 + (supporting is not None)
+                            remaining_actions = (
+                                self.config.max_actions - actions_attempted
+                            )
+                            controlled_form_pending = False
+                            if carrier is not None and remaining_actions >= required_actions:
+                                if not enter_input(
+                                    carrier,
+                                    current,
+                                    source="controlled_canary",
+                                ):
+                                    refreshed = recover_action_failure()
+                                    if refreshed is None:
+                                        break
+                                    current = refreshed
+                                    continue
                                 if (
                                     supporting is not None
-                                    and self.config.max_actions - actions_executed >= 3
+                                    and self.config.max_actions - actions_attempted >= 3
                                 ):
-                                    enter_input(
+                                    if not enter_input(
                                         supporting,
                                         current,
-                                        source="controlled_support",
-                                    )
+                                        source="controlled_canary_support",
+                                    ):
+                                        refreshed = recover_action_failure()
+                                        if refreshed is None:
+                                            break
+                                        current = refreshed
+                                        continue
                                 if (
                                     keyboard_open
-                                    and self.config.max_actions - actions_executed >= 2
+                                    and self.config.max_actions - actions_attempted >= 2
                                 ):
-                                    self.backend.hide_keyboard()
                                     keyboard_open = False
-                                    actions_executed += 1
+                                    if not perform_action(
+                                        "hide_keyboard",
+                                        self.backend.hide_keyboard,
+                                        source="controlled_canary_support",
+                                    ):
+                                        refreshed = recover_action_failure()
+                                        if refreshed is None:
+                                            break
+                                        current = refreshed
+                                        continue
                                     actions_succeeded += 1
+                                controlled_delivery = (
+                                    self._input_kind(carrier)[0],
+                                    supporting is not None,
+                                )
+                            elif carrier is not None:
+                                controlled_canary_budget_skips += 1
                                 self._trace(
-                                    "controlled_canary_delivery",
-                                    state=previous,
-                                    action=_trace_label(action.label),
-                                    input_kind=self._input_kind(carrier)[0],
-                                    supporting_input=supporting is not None,
+                                    "action_skipped",
+                                    reason="controlled_canary_action_budget",
+                                    required_actions=required_actions,
+                                    remaining_actions=remaining_actions,
                                 )
                         feedback_before = feedback
-                        self.backend.tap(
-                            action.x or 0,
-                            action.y or 0,
-                            long=action.kind == "long_tap",
-                        )
+                        if not perform_action(
+                            action.kind,
+                            lambda action=action: self.backend.tap(
+                                action.x or 0,
+                                action.y or 0,
+                                long=action.kind == "long_tap",
+                            ),
+                            source=(
+                                "controlled_canary_submit"
+                                if controlled_delivery is not None
+                                else None
+                            ),
+                        ):
+                            refreshed = recover_action_failure()
+                            if refreshed is None:
+                                break
+                            current = refreshed
+                            continue
                         self._trace(
                             "action",
                             kind=action.kind,
                             label=_trace_label(action.label),
                             state=previous,
                         )
-                    actions_executed += 1
-                    try:
-                        candidate = self._wait_for_ui(previous)
-                    except (AndroidAssessorError, OSError, ValueError):
-                        if self.backend.process_id() is not None:
-                            raise
-                        crashes += 1
-                        self.backend.launch()
-                        process_restarts += 1
-                        previous_pid = self.backend.process_id()
-                        candidate = self._wait_for_ui()
+                    candidate = observe_after_action(previous)
+                    if candidate is None:
+                        if controlled_delivery is not None:
+                            controlled_canary_failures += 1
+                        break
+                    if controlled_delivery is not None:
+                        controlled_canary_deliveries += 1
+                        input_kind, supporting_input = controlled_delivery
+                        self._trace(
+                            "controlled_canary_delivery",
+                            state=previous,
+                            action=_trace_label(action.label),
+                            input_kind=input_kind,
+                            supporting_input=supporting_input,
+                            observation="completed",
+                        )
                     feedback_after = self.feedback()
                     action_changed_state = candidate.fingerprint != previous
                     action_yielded = self._feedback_changed(feedback_before, feedback_after)
@@ -1805,7 +2190,7 @@ class AndroidExplorer:
                         and retry_key not in retried_actions
                         else []
                     )
-                    if nearby_inputs and actions_executed < self.config.max_actions:
+                    if nearby_inputs and actions_attempted < self.config.max_actions:
                         retried_actions.add(retry_key)
                         form_retries += 1
                         self._trace(
@@ -1814,24 +2199,52 @@ class AndroidExplorer:
                             action=_trace_label(action.label),
                             input_count=len(nearby_inputs),
                         )
+                        retry_input_failed = False
                         for node in nearby_inputs:
-                            if actions_executed >= self.config.max_actions:
+                            if actions_attempted >= self.config.max_actions:
                                 break
-                            enter_input(node, current, source="form_retry")
-                        if keyboard_open and actions_executed < self.config.max_actions:
-                            self.backend.hide_keyboard()
+                            if not enter_input(node, current, source="form_retry"):
+                                refreshed = recover_action_failure()
+                                if refreshed is not None:
+                                    current = refreshed
+                                retry_input_failed = True
+                                break
+                        if retry_input_failed:
+                            if refreshed is None:
+                                break
+                            continue
+                        if keyboard_open and actions_attempted < self.config.max_actions:
                             keyboard_open = False
-                            actions_executed += 1
+                            if not perform_action(
+                                "hide_keyboard",
+                                self.backend.hide_keyboard,
+                                source="form_retry",
+                            ):
+                                refreshed = recover_action_failure()
+                                if refreshed is None:
+                                    break
+                                current = refreshed
+                                continue
                             actions_succeeded += 1
-                        if actions_executed < self.config.max_actions:
+                        if actions_attempted < self.config.max_actions:
                             before_retry = self.feedback()
-                            self.backend.tap(
-                                action.x or 0,
-                                action.y or 0,
-                                long=action.kind == "long_tap",
-                            )
-                            actions_executed += 1
-                            retried_state = self._wait_for_ui(previous)
+                            if not perform_action(
+                                action.kind,
+                                lambda action=action: self.backend.tap(
+                                    action.x or 0,
+                                    action.y or 0,
+                                    long=action.kind == "long_tap",
+                                ),
+                                source="form_retry",
+                            ):
+                                refreshed = recover_action_failure()
+                                if refreshed is None:
+                                    break
+                                current = refreshed
+                                continue
+                            retried_state = observe_after_action(previous)
+                            if retried_state is None:
+                                break
                             after_retry = self.feedback()
                             if (
                                 retried_state.fingerprint != previous
@@ -1854,13 +2267,31 @@ class AndroidExplorer:
                     if scrollable is not None:
                         left, top, right, bottom = scrollable.bounds
                         x = (left + right) // 2
-                        self.backend.swipe(x, bottom - 40, x, top + 40)
+                        swipe_succeeded = perform_action(
+                            "scroll",
+                            lambda x=x, bottom=bottom, top=top: self.backend.swipe(
+                                x,
+                                bottom - 40,
+                                x,
+                                top + 40,
+                            ),
+                        )
                     else:
-                        self.backend.swipe(540, 1450, 540, 450)
-                    actions_executed += 1
+                        swipe_succeeded = perform_action(
+                            "scroll",
+                            lambda: self.backend.swipe(540, 1450, 540, 450),
+                        )
+                    if not swipe_succeeded:
+                        refreshed = recover_action_failure()
+                        if refreshed is None:
+                            break
+                        current = refreshed
+                        continue
                     scroll_actions += 1
                     self._trace("action", kind="scroll", state=current.fingerprint)
-                    candidate = self._wait_for_ui(current.fingerprint)
+                    candidate = observe_after_action(current.fingerprint)
+                    if candidate is None:
+                        break
                     if candidate.fingerprint != current.fingerprint:
                         actions_succeeded += 1
                     current = candidate
@@ -1869,12 +2300,18 @@ class AndroidExplorer:
                 if history:
                     reset_idle()
                     previous = current.fingerprint
-                    self.backend.back()
                     history.pop()
+                    if not perform_action("back", self.backend.back):
+                        refreshed = recover_action_failure()
+                        if refreshed is None:
+                            break
+                        current = refreshed
+                        continue
                     backtracks += 1
-                    actions_executed += 1
                     self._trace("action", kind="back")
-                    candidate = self._wait_for_ui()
+                    candidate = observe_after_action()
+                    if candidate is None:
+                        break
                     if candidate.fingerprint != previous:
                         actions_succeeded += 1
                     current = candidate
@@ -1913,19 +2350,46 @@ class AndroidExplorer:
                     )
                     continue
                 if (
-                    actions_executed > 0
+                    actions_attempted > 0
                     and idle_plateau_seconds >= self.config.plateau_seconds
                 ):
                     termination = "coverage_plateau"
                     break
 
-                pid = self.backend.process_id()
+                try:
+                    with self._operation_budget():
+                        pid = self.backend.process_id()
+                except (AdbError, OSError) as exc:
+                    partial_result = True
+                    termination = "process_state_unavailable"
+                    block_pending_navigation(termination)
+                    self._trace(
+                        "exploration_stopped",
+                        reason=termination,
+                        observation_reason=_failure_reason(exc),
+                    )
+                    break
                 if pid is None:
                     reset_idle()
                     crashes += 1
-                    self.backend.launch()
+                    try:
+                        with self._operation_budget():
+                            self.backend.launch()
+                    except (AdbError, OSError) as exc:
+                        partial_result = True
+                        termination = "process_restart_failed"
+                        block_pending_navigation(termination)
+                        self._trace(
+                            "exploration_stopped",
+                            reason=termination,
+                            observation_reason=_failure_reason(exc),
+                        )
+                        break
                     process_restarts += 1
-                    current = self._wait_for_ui()
+                    observed = observe_after_action()
+                    if observed is None:
+                        break
+                    current = observed
                 elif previous_pid is not None and pid != previous_pid:
                     reset_idle()
                     process_restarts += 1
@@ -1934,6 +2398,7 @@ class AndroidExplorer:
             termination = "max_runtime"
             block_pending_navigation("hard_limit")
         except _ExplorerPackageBoundary as exc:
+            partial_result = True
             termination = "package_boundary"
             block_pending_navigation("package_boundary")
             self._trace(
@@ -1943,7 +2408,23 @@ class AndroidExplorer:
                 observed_activity=exc.activity,
             )
         finally:
-            self.backend.cleanup()
+            try:
+                self.backend.cleanup()
+            except (AdbError, OSError) as exc:
+                cleanup_failure_reason = _failure_reason(exc)
+        backend_cleanup_failure = getattr(
+            self.backend,
+            "cleanup_failure_reason",
+            None,
+        )
+        if isinstance(backend_cleanup_failure, str):
+            cleanup_failure_reason = backend_cleanup_failure
+        if cleanup_failure_reason is not None:
+            partial_result = True
+            self._trace(
+                "cleanup_failed",
+                reason=cleanup_failure_reason,
+            )
         final_feedback = self.feedback()
         if self._feedback_changed(feedback, final_feedback):
             self._trace(
@@ -1961,7 +2442,7 @@ class AndroidExplorer:
         active_ms = max(0.0, duration_ms - idle_seconds * 1000)
         return ExplorerResult(
             session_id=self.session_id,
-            status="completed",
+            status="partial" if partial_result else "completed",
             termination_reason=termination,
             duration_ms=duration_ms,
             states_visited=len(visited),
@@ -1977,7 +2458,7 @@ class AndroidExplorer:
             runtime_events=feedback.event_count,
             activity_attempts=tuple(activity_attempts),
             deep_link_attempts=tuple(deep_link_attempts),
-            actions_attempted=actions_executed,
+            actions_attempted=actions_attempted,
             actions_succeeded=actions_succeeded,
             form_retries=form_retries,
             duplicate_actions_avoided=duplicate_actions_avoided,
@@ -1992,6 +2473,17 @@ class AndroidExplorer:
             exploring_ms=round(active_ms, 2),
             runtime_wait_ms=round(runtime_wait_seconds * 1000, 2),
             controlled_canary_inputs=controlled_canary_inputs,
+            controlled_canary_deliveries=controlled_canary_deliveries,
+            actions_failed=action_failures,
+            observation_retries=self._observation_retries,
+            state_refreshes=state_refreshes,
+            controlled_canary_attempts=controlled_canary_attempts,
+            controlled_canary_failures=controlled_canary_failures,
+            controlled_canary_budget_skips=controlled_canary_budget_skips,
+            cleanup_status=(
+                "failed" if cleanup_failure_reason is not None else "completed"
+            ),
+            cleanup_failure_reason=cleanup_failure_reason,
         )
 
 
@@ -2091,10 +2583,16 @@ class ExplorerService:
         )
         self.repository.append_event(
             record.session_id,
-            "autonomous_exploration_completed",
+            (
+                "autonomous_exploration_partial"
+                if result.status == "partial"
+                else "autonomous_exploration_completed"
+            ),
             {
+                "status": result.status,
                 "states_visited": result.states_visited,
                 "actions_executed": result.actions_executed,
+                "actions_failed": result.actions_failed,
                 "termination_reason": result.termination_reason,
                 "runtime_categories": list(result.runtime_categories),
             },

@@ -1,11 +1,263 @@
-schema_version: 2
+schema_version: 3
 statuses: [detected, partially_detected, observable_only, not_supported]
 detection_modes: [static, autonomous_runtime, controlled_validation, guided]
+class_statuses:
+  [partially_implemented, static_inventory_only, runtime_observation_only]
+class_outcomes:
+  [confirmed, potential, rejected_for_tested_route, inconclusive, not_exercised, out_of_scope]
 id_kinds:
   production_rule: IDs present in rules/mvp.yaml and evaluated by RuleEngine.
   analyzer_result: IDs emitted by an analyzer but not independently evaluated by RuleEngine.
   inventory_only: IDs identify evidence inventory and never imply a finding.
   planned: ASL-PLANNED-* IDs describe explicit unsupported or deferred coverage.
+
+# Umbrella-class coverage is deliberately separate from the per-rule registry below.
+# A class is not "implemented" merely because one of its rules can emit a finding.
+class_matrix:
+  - class: build_and_manifest_configuration
+    rule_ids: [ASL-MVP-001, ASL-MANIFEST-ALLOW-BACKUP]
+    detection_mode: [static]
+    runtime_observer: []
+    controlled_validator: []
+    current_implementation_status: partially_implemented
+    positive_fixture:
+      - tests/test_manifest_analysis.py::test_allow_backup_is_potential_not_confirmed
+    negative_fixture:
+      - tests/test_manifest_analysis.py::test_secure_manifest_passes_bounded_metadata_checks
+    lab_result:
+      outcome: confirmed
+      session_id: 20260718-213857-8de6f9
+      tested_scope: debuggable_build_flag
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: build_manifest_configuration
+    confirmation_threshold: A normalized manifest explicitly enables a security-relevant debug or test-only build flag.
+    rejection_requirement: The same normalized configuration field is explicitly disabled; absence alone is not a class-wide rejection.
+    known_gap: Backup policy is potential-only because configuration does not prove sensitive backup impact.
+    false_positive_controls: [normalized_manifest_value, route_scoped_outcome]
+    next_action: Add bounded backup-impact validation without reading another application's data.
+
+  - class: exported_components_and_ipc_boundaries
+    rule_ids:
+      - ASL-MVP-004
+      - ASL-MANIFEST-EXPORTED-ACTIVITY
+      - ASL-MANIFEST-EXPORTED-SERVICE
+      - ASL-MANIFEST-EXPORTED-RECEIVER
+      - ASL-MANIFEST-EXPORTED-PROVIDER
+      - ASL-MANIFEST-CUSTOM-PERMISSION
+      - ASL-MANIFEST-FILEPROVIDER-PATHS
+      - ASL-MANIFEST-DEEP-LINK-EXPOSURE
+    detection_mode: [static, autonomous_runtime, controlled_validation]
+    runtime_observer: [autonomous_explorer_targeted_navigation]
+    controlled_validator:
+      [exported_activity_canary, world_readable_storage_receiver_probe]
+    current_implementation_status: partially_implemented
+    positive_fixture:
+      - tests/test_exported_activity_validation.py::test_exported_activity_requires_observable_canary_impact
+    negative_fixture:
+      - tests/test_phase2_correlation.py::test_candidate_scoped_storage_validation_can_reject_one_candidate
+    lab_result:
+      outcome: potential
+      session_id: 20260718-191354-57d6af
+      tested_scope: receiver_route_reached_without_ipc_boundary_impact
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: exported_receiver_boundary
+    confirmation_threshold: A bounded external invocation reproduces a security-relevant effect with target-process or resulting-state evidence.
+    rejection_requirement: The exact candidate route is reached and the defined effect is absent in complete bounded evidence.
+    known_gap: Provider, Service, and generic Receiver boundaries lack production validators; launch success alone remains potential.
+    false_positive_controls: [effective_exported_state, permission_strength, exact_candidate_key, route_scoped_rejection]
+    next_action: Add a read-only quota-bounded exported Provider validator.
+
+  - class: sensitive_logging_and_exposed_data_sinks
+    rule_ids: [ASL-MVP-003, ASL-RUNTIME-LOGGING]
+    detection_mode: [autonomous_runtime, controlled_validation]
+    runtime_observer: [frida_sensitive_sink, pid_attributed_logcat, attributed_traffic]
+    controlled_validator: [sensitive_logging_canary]
+    current_implementation_status: partially_implemented
+    positive_fixture:
+      - tests/test_phase2_correlation.py::test_exact_canary_sensitive_sinks_require_a_clear_external_boundary
+    negative_fixture:
+      - tests/test_phase2_correlation.py::test_exact_canary_file_sink_requires_package_scoped_storage
+    lab_result:
+      outcome: confirmed
+      session_id: 20260718-213857-8de6f9
+      tested_scope: exact_canary_http_body_sink
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: sensitive_external_sink
+    confirmation_threshold: The exact session canary reaches a defined external sink with package, process, or traffic attribution.
+    rejection_requirement: A specific delivery route completes and complete attributed observation shows no canary at that sink.
+    known_gap: Generic logging events without the exact canary remain observation-only and route activation is uneven.
+    false_positive_controls: [exact_session_canary, target_attribution, external_boundary_required, raw_value_redaction]
+    next_action: Add route-scoped positive, negative, and not-reached tests around the production logging validator.
+
+  - class: local_and_external_storage
+    rule_ids:
+      - ASL-RUNTIME-STORAGE
+      - STORAGE-WORLD-READABLE
+      - STORAGE-WORLD-WRITABLE
+      - STORAGE-SENSITIVE-CANARY
+    detection_mode: [static, autonomous_runtime, controlled_validation]
+    runtime_observer: [root_private_storage_inventory, frida_storage_sink]
+    controlled_validator: [world_readable_storage_receiver_probe]
+    current_implementation_status: partially_implemented
+    positive_fixture:
+      - tests/test_private_storage.py::test_storage_requires_exact_current_session_canary_for_confirmation
+    negative_fixture:
+      - tests/test_private_storage.py::test_root_readability_alone_is_post_compromise_observation
+    lab_result:
+      outcome: rejected_for_tested_route
+      session_id: 20260718-191354-57d6af
+      tested_scope: one_receiver_world_readable_artifact_route
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: world_readable_storage_route
+    confirmation_threshold: The reached candidate produces an unsafe file mode or persists the exact session canary in the defined package-scoped location.
+    rejection_requirement: Complete post-action inventory rejects only the exact exercised candidate route.
+    known_gap: External/shared storage and world-writable candidates lack generic controlled validation.
+    false_positive_controls: [package_scoped_paths, exact_canary_match, resulting_mode_evidence, root_readability_is_not_a_finding]
+    next_action: Extend candidate-scoped validation to world-writable and external-storage routes.
+
+  - class: hardcoded_secrets_and_embedded_credentials
+    rule_ids: [ASL-STATIC-HARDCODED-SECRET]
+    detection_mode: [static]
+    runtime_observer: []
+    controlled_validator: []
+    current_implementation_status: static_inventory_only
+    positive_fixture:
+      - tests/test_static_apk_analysis.py::test_quoted_config_keys_are_detected_without_retaining_values
+    negative_fixture:
+      - tests/test_static_apk_analysis.py::test_placeholder_values_do_not_become_secret_candidates
+    lab_result:
+      outcome: not_exercised
+      session_id: 20260718-213857-8de6f9
+      tested_scope: bounded_static_inventory_only
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: hardcoded_secret_inventory
+    confirmation_threshold: The redacted candidate is used by an attributed crypto, network, or authentication sink, or is validated only against a fixture-owned local endpoint.
+    rejection_requirement: The exact candidate is classified as a public identifier, test/example value, or dependency-only value with no relevant application use-site.
+    known_gap: Candidates lack application-versus-dependency ownership, DEX use-sites, and runtime sink correlation.
+    false_positive_controls: [placeholder_filtering, typed_candidate_kind, value_hash_only, no_external_secret_validation]
+    next_action: Add const-string use-site provenance and dependency-noise fixtures before any confirmation path.
+
+  - class: cleartext_and_tls_trust_behavior
+    rule_ids: [ASL-MVP-002, ASL-MVP-005]
+    detection_mode: [static, autonomous_runtime, controlled_validation]
+    runtime_observer: [attributed_traffic, frida_tls_trust]
+    controlled_validator: [cleartext_canary]
+    current_implementation_status: partially_implemented
+    positive_fixture:
+      - tests/test_traffic_attribution.py::test_validation_canary_attribution_can_confirm_cleartext
+    negative_fixture:
+      - tests/test_tls_analysis.py::test_custom_tls_component_that_only_rejects_is_not_potential
+    lab_result:
+      outcome: confirmed
+      session_id: 20260718-213857-8de6f9
+      tested_scope: attributed_cleartext_canary_route
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: cleartext_canary_route
+    confirmation_threshold: Cleartext requires an attributed HTTP canary flow; TLS bypass requires a response through a controlled invalid-certificate route.
+    rejection_requirement: The exact controlled route is attempted and complete evidence shows cleartext absent or the invalid certificate rejected.
+    known_gap: No production invalid-certificate validator exists, so custom trust behavior remains potential or inconclusive.
+    false_positive_controls: [traffic_attribution, exact_canary, local_allowlisted_endpoint, generic_trust_event_not_confirmed]
+    next_action: Add a local invalid-certificate TLS canary validator after explorer stability.
+
+  - class: weak_cryptography
+    rule_ids:
+      - CRYPTO-ECB
+      - CRYPTO-WEAK-ALGORITHM
+      - CRYPTO-SHORT-KEY
+      - CRYPTO-ZERO-IV
+      - CRYPTO-REUSED-IV
+      - CRYPTO-WEAK-DIGEST
+      - CRYPTO-LOW-PBE-ITERATIONS
+      - CRYPTO-PREDICTABLE-RANDOM
+    detection_mode: [static, autonomous_runtime]
+    runtime_observer: [frida_crypto_operations]
+    controlled_validator: []
+    current_implementation_status: partially_implemented
+    positive_fixture:
+      - tests/test_crypto_analysis.py::test_crypto_fixture_detects_weak_ecb_static_reused_short_key_and_canary
+    negative_fixture:
+      - tests/test_crypto_analysis.py::test_crypto_safe_fixture_passes_without_false_positive
+    lab_result:
+      outcome: potential
+      session_id: 20260718-104753-447618
+      tested_scope: attributed_weak_digest_operations_without_sensitive_context
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: weak_crypto_operation
+    confirmation_threshold: An attributed completed operation has all rule-specific normalized metadata; digest and PBE also require security-sensitive context.
+    rejection_requirement: The reached operation has complete safe parameters; an unexecuted static candidate is not rejected.
+    known_gap: Activation is weak and static call-sites lack application-versus-dependency origin and reliable runtime correlation.
+    false_positive_controls: [completed_operation_required, normalized_metadata, per_flow_evaluation, sensitive_context_for_digest]
+    next_action: Correlate app-owned call-sites with reached runtime operations after explorer resilience.
+
+  - class: unsafe_webview_behavior
+    rule_ids:
+      - ASL-RUNTIME-WEBVIEW
+      - WEBVIEW-JS-BRIDGE-REMOTE
+      - WEBVIEW-UNSAFE-SETTINGS
+      - WEBVIEW-SSL-ERROR-PROCEED
+    detection_mode: [static, autonomous_runtime]
+    runtime_observer: [frida_webview_instance_correlation]
+    controlled_validator: []
+    current_implementation_status: partially_implemented
+    positive_fixture:
+      - tests/test_phase2_correlation.py::test_webview_ssl_proceed_runtime_confirms_and_static_candidate_is_only_potential
+    negative_fixture:
+      - tests/test_phase2_correlation.py::test_webview_load_only_and_cross_instance_configuration_are_not_findings
+    lab_result:
+      outcome: inconclusive
+      session_id: 20260718-104753-447618
+      tested_scope: runtime_observation_without_controlled_untrusted_content
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: unsafe_webview_behavior
+    confirmation_threshold: SSL proceed requires the same callback handler; unsafe settings or bridges require reached attacker-influenced content on the same WebView instance.
+    rejection_requirement: The exact reached instance has safe settings or removes the bridge before the tested content route; unrelated instances do not reject a candidate.
+    known_gap: No bounded generic untrusted-content activation validator exists.
+    false_positive_controls: [same_instance_correlation, same_ssl_handler, content_origin_required, static_reference_not_confirmed]
+    next_action: Add a local allowlisted WebView content route with positive, negative, and not-reached fixtures.
+
+  - class: weak_root_and_emulator_detection
+    rule_ids: [ASL-RUNTIME-ROOT]
+    detection_mode: [autonomous_runtime]
+    runtime_observer: [frida_root_check_observation]
+    controlled_validator: []
+    current_implementation_status: runtime_observation_only
+    positive_fixture: []
+    negative_fixture:
+      - tests/test_root_detection.py::test_root_detection_is_not_a_vulnerability_by_default
+    lab_result:
+      outcome: inconclusive
+      session_id: 20260718-213857-8de6f9
+      tested_scope: observer_attached_but_no_attributed_root_event
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: root_emulator_detection
+    confirmation_threshold: A paired baseline and controlled override show that the same check changes a security-relevant decision or opens a previously blocked flow.
+    rejection_requirement: The same reached decision is unchanged by a bounded override; this rejects only that check and route.
+    known_gap: Production events have unknown app response, no override path, little emulator coverage, and no security-decision correlation.
+    false_positive_controls: [check_presence_not_a_vulnerability, hook_presence_not_impact, target_process_only, indicator_hash_only]
+    next_action: Design the differential evidence model before adding override hooks or more detection techniques.
+
+  - class: dynamic_code_loading_and_deserialization
+    rule_ids: [ASL-STATIC-DYNAMIC-CODE, ASL-STATIC-DESERIALIZATION]
+    detection_mode: [static]
+    runtime_observer: []
+    controlled_validator: []
+    current_implementation_status: static_inventory_only
+    positive_fixture:
+      - tests/test_static_apk_analysis.py::test_static_behavior_emits_generic_storage_loading_and_deserialization
+    negative_fixture:
+      - tests/test_static_apk_analysis.py::test_static_behavior_does_not_emit_loading_or_deserialization_for_uninvoked_refs
+    lab_result:
+      outcome: potential
+      session_id: 20260718-215251-a8803a
+      tested_scope: static_call_sites_without_runtime_source_control
+      evidence_reference: docs/validation/class-coverage-lab.yaml
+      evidence_case: dynamic_code_and_deserialization
+    confirmation_threshold: Attributed runtime execution consumes attacker-influenced code or serialized input and reproduces a security-relevant effect.
+    rejection_requirement: The exact reached route uses a trusted bounded source or rejects the controlled input; static absence is not route rejection.
+    known_gap: No runtime observer or validator exists and packaged dependency call-sites are not down-ranked by ownership.
+    false_positive_controls: [exact_invoke_required, static_candidate_not_confirmed, route_scoped_outcome]
+    next_action: Add origin classification before any runtime confirmation work.
+
 coverage_defaults: &coverage_defaults
   detection_mode: static
   activation_required: apk_inspection

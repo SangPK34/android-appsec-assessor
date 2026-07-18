@@ -743,6 +743,25 @@ class DenseStorageAdb(AdbdRootStorageAdb):
         return super().shell(serial, arguments, **kwargs)
 
 
+class CanaryRedactionStorageAdb(AdbdRootStorageAdb):
+    def __init__(self) -> None:
+        super().__init__()
+        self.protected_values: list[tuple[str, ...]] = []
+
+    def shell(
+        self,
+        serial: str,
+        arguments: Sequence[str],
+        **kwargs: object,
+    ) -> CommandResult:
+        selected = tuple(arguments)
+        if selected[:2] == ("sh", "-c") and "grep -a -E -q" in selected[-1]:
+            values = kwargs.get("sensitive_values", ())
+            assert isinstance(values, tuple)
+            self.protected_values.append(values)
+        return super().shell(serial, arguments, **kwargs)
+
+
 def test_dense_internal_inventory_reserves_external_coverage_and_reports_limit() -> None:
     adb = DenseStorageAdb()
     backend = AdbPrivateStorageBackend(
@@ -774,7 +793,7 @@ def test_storage_backend_reuses_package_metadata_and_root_probe() -> None:
 
 
 def test_adbd_root_exact_canary_probe_is_bounded_and_returns_only_booleans() -> None:
-    adb = AdbdRootStorageAdb()
+    adb = CanaryRedactionStorageAdb()
     backend = AdbPrivateStorageBackend(
         adb,  # type: ignore[arg-type]
         max_entries=5,
@@ -835,6 +854,7 @@ def test_adbd_root_exact_canary_probe_is_bounded_and_returns_only_booleans() -> 
     assert all(DATA_DIRECTORY in command for command in grep_calls)
     assert all("su -c" not in command for command in grep_calls)
     assert all("THESIS_CANARY_STORAGE_TOKEN" not in command for command in grep_calls)
+    assert adb.protected_values == [(SESSION_CANARY,), (SESSION_CANARY,)]
 
 
 class TimedOutCanaryProbeAdb(AdbdRootStorageAdb):

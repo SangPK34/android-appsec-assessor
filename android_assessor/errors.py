@@ -21,6 +21,10 @@ class AdbError(AndroidAssessorError):
     """Raised for ADB discovery, parsing, or execution failures."""
 
 
+class AdbTimeoutError(AdbError):
+    """Raised when a bounded ADB operation exceeds its timeout."""
+
+
 class DeviceSelectionError(AdbError):
     """Raised when no explicit, authorized Android device can be selected."""
 

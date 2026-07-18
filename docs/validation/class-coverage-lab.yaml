@@ -1,0 +1,133 @@
+schema_version: 1
+generated_at: 2026-07-18
+purpose: Sanitized, reviewable evidence index for the vulnerability-class coverage matrix.
+artifact_policy: Source session artifacts remain local and ignored; report SHA-256 values bind these summaries to the authorized-lab artifacts without publishing target data or canaries.
+non_production_reference: true
+redaction:
+  raw_values_included: false
+  package_identifiers_included: false
+
+sessions:
+  - session_id: 20260718-213857-8de6f9
+    report_sha256: 99338e72f68fbfa85a78be50ad966aa4efdeeb10fffbf540e7f10295a5aa12a4
+    security_rules_evaluated: 30
+    confirmed: 3
+    potential: 10
+    pass: 7
+    inconclusive: 10
+  - session_id: 20260718-191354-57d6af
+    report_sha256: 23f215e81db513e5dce6338642749d73cc2fa0f545a042b6c9c3e6d6ecb312f6
+    security_rules_evaluated: 30
+    confirmed: 1
+    potential: 10
+    pass: 6
+    inconclusive: 5
+    skipped: 8
+  - session_id: 20260718-104753-447618
+    report_sha256: 22ee169d830669ef646f82bf1a91ac0f208c5a45187272274cfa3e4cc81e6260
+    security_rules_evaluated: 27
+    confirmed: 1
+    potential: 4
+    pass: 8
+    inconclusive: 14
+  - session_id: 20260718-215251-a8803a
+    report_sha256: ffbb43c5d578ed11c75b2fd895dd8ebdeb1300d261e6c5d329018c9c40292bb7
+    security_rules_evaluated: 30
+    confirmed: 3
+    potential: 11
+    pass: 6
+    inconclusive: 10
+  - session_id: 20260718-234334-b36f20
+    report_sha256: 19011db2b15e29c5eec7e56173b106533bbb41c6708298faff38ca19630319d1
+    security_rules_evaluated: 30
+    confirmed: 1
+    potential: 10
+    pass: 6
+    inconclusive: 13
+
+cases:
+  - case_id: build_manifest_configuration
+    session_id: 20260718-213857-8de6f9
+    outcome: confirmed
+    tested_scope: debuggable_build_flag
+    evidence: ASL-MVP-001 was confirmed from the normalized manifest flag.
+
+  - case_id: exported_receiver_boundary
+    session_id: 20260718-191354-57d6af
+    outcome: potential
+    tested_scope: receiver_route_reached_without_ipc_boundary_impact
+    evidence: One exact receiver route completed, but the IPC boundary had no reproduced security impact; a separate world-readable storage side effect was rejected only in the storage class.
+
+  - case_id: sensitive_external_sink
+    session_id: 20260718-213857-8de6f9
+    outcome: confirmed
+    tested_scope: exact_canary_http_body_sink
+    evidence: ASL-MVP-003 was confirmed only after the exact session canary reached a package-attributed external HTTP body sink.
+
+  - case_id: world_readable_storage_route
+    session_id: 20260718-191354-57d6af
+    outcome: rejected_for_tested_route
+    tested_scope: one_receiver_world_readable_artifact_route
+    evidence: Complete bounded post-action metadata rejected the expected unsafe mode for one candidate; untested call-sites were not rejected.
+
+  - case_id: hardcoded_secret_inventory
+    session_id: 20260718-213857-8de6f9
+    outcome: not_exercised
+    tested_scope: bounded_static_inventory_only
+    evidence: Static inventory completed with ASL-STATIC-HARDCODED-SECRET pass, but no candidate existed for sink correlation or controlled validation.
+
+  - case_id: cleartext_canary_route
+    session_id: 20260718-213857-8de6f9
+    outcome: confirmed
+    tested_scope: attributed_cleartext_canary_route
+    evidence: ASL-MVP-002 was confirmed by an exact-canary HTTP flow attributed to the authorized target.
+
+  - case_id: weak_crypto_operation
+    session_id: 20260718-104753-447618
+    outcome: potential
+    tested_scope: attributed_weak_digest_operations_without_sensitive_context
+    evidence: CRYPTO-WEAK-DIGEST was potential; the remaining seven crypto rules were inconclusive because their required operations were not reached.
+
+  - case_id: unsafe_webview_behavior
+    session_id: 20260718-104753-447618
+    outcome: inconclusive
+    tested_scope: runtime_observation_without_controlled_untrusted_content
+    evidence: Runtime WebView observation existed, but all three vulnerability rules remained inconclusive without same-instance attacker-influenced content or SSL-handler evidence.
+
+  - case_id: root_emulator_detection
+    session_id: 20260718-213857-8de6f9
+    outcome: inconclusive
+    tested_scope: observer_attached_but_no_attributed_root_event
+    evidence: The target-process observer ran, but no attributed check or security-decision delta was observed.
+
+  - case_id: dynamic_code_and_deserialization
+    session_id: 20260718-215251-a8803a
+    outcome: potential
+    tested_scope: static_call_sites_without_runtime_source_control
+    evidence: Both call-site rules were potential from exact DEX invokes; neither route had runtime source or impact evidence.
+
+phase_validations:
+  - phase_id: bounded_explorer_failure_resilience
+    baseline_session_id: 20260718-215251-a8803a
+    validation_session_id: 20260718-234334-b36f20
+    scan_sha256: 145e01ec453bedf75c76c2abca2eec8b07168688517aa2fba023edc7b1705987
+    explorer_summary_sha256: 4d5d85e24f0e70176cca73fd309af5ac73fa9634eb2ecb4d0b578c2a97e3d901
+    baseline_outcome:
+      explorer_status: error
+      termination_reason: explorer_error
+      partial_progress_persisted: false
+      cleanup_status: completed
+    validation_outcome:
+      explorer_status: partial
+      termination_reason: max_runtime
+      states_visited: 7
+      actions_attempted: 13
+      actions_executed: 11
+      actions_failed: 2
+      observation_retries: 3
+      state_refreshes: 2
+      controlled_canary_status: delivery_failed
+      cleanup_status: completed
+      report_module_result: partial
+      raw_canary_matches_in_commands_and_redacted_reports: 0
+    conclusion: ADB mutation timeouts were not replayed; safe exploration continued, partial coverage and failure reasons were persisted, and cleanup completed.

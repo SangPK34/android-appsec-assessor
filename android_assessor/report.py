@@ -619,6 +619,9 @@ class ReportService:
                 app_step is not None and app_steps.get(app_step) in {"skipped", "error"}
             )
             failed = step_result in {"error", "start_failed", "stop_failed"}
+            partial = step_result == "partial" or (
+                app_step is not None and app_steps.get(app_step) == "partial"
+            )
             limitation_values = []
             if isinstance(app, dict) and isinstance(app.get("limitations"), list):
                 limitation_values.extend(str(item) for item in app["limitations"])
@@ -676,7 +679,7 @@ class ReportService:
                         ),
                         None,
                     )
-                    if skipped or failed
+                    if skipped or failed or partial
                     else None
                 )
             modules.append(
@@ -691,6 +694,8 @@ class ReportService:
                         if failed
                         else "skipped"
                         if skipped
+                        else "partial"
+                        if partial
                         else "completed"
                         if executed
                         else "not_executed"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -76,7 +77,7 @@ def test_machine_readable_coverage_registry_has_complete_unique_rows() -> None:
         "runtime_sources",
     }
 
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert set(payload["detection_modes"]) == {
         "static",
         "autonomous_runtime",
@@ -102,6 +103,153 @@ def test_machine_readable_coverage_registry_has_complete_unique_rows() -> None:
     assert all(isinstance(row["manual_interaction_required"], bool) for row in rows)
     assert all(isinstance(row["auto_confirm_possible"], bool) for row in rows)
     assert all(isinstance(row["runtime_sources"], list) for row in rows)
+
+
+def test_class_coverage_matrix_is_complete_truthful_and_fixture_backed() -> None:
+    root = Path(__file__).parents[1]
+    payload = yaml.safe_load((root / "rules" / "coverage.yaml").read_text(encoding="utf-8"))
+    rows = payload["class_matrix"]
+    rule_ids = {row["rule_id"] for row in payload["rules"]}
+    expected_classes = {
+        "build_and_manifest_configuration",
+        "exported_components_and_ipc_boundaries",
+        "sensitive_logging_and_exposed_data_sinks",
+        "local_and_external_storage",
+        "hardcoded_secrets_and_embedded_credentials",
+        "cleartext_and_tls_trust_behavior",
+        "weak_cryptography",
+        "unsafe_webview_behavior",
+        "weak_root_and_emulator_detection",
+        "dynamic_code_loading_and_deserialization",
+    }
+    required = {
+        "class",
+        "rule_ids",
+        "detection_mode",
+        "runtime_observer",
+        "controlled_validator",
+        "current_implementation_status",
+        "positive_fixture",
+        "negative_fixture",
+        "lab_result",
+        "confirmation_threshold",
+        "rejection_requirement",
+        "known_gap",
+        "false_positive_controls",
+        "next_action",
+    }
+
+    assert {row["class"] for row in rows} == expected_classes
+    assert len(rows) == len(expected_classes)
+    assert all(required <= row.keys() for row in rows)
+    assert all(set(row["rule_ids"]) <= rule_ids for row in rows)
+    assert all(
+        set(row["detection_mode"]) <= set(payload["detection_modes"])
+        for row in rows
+    )
+    assert all(
+        row["current_implementation_status"] in payload["class_statuses"]
+        for row in rows
+    )
+    assert all(
+        row["lab_result"]["outcome"] in payload["class_outcomes"]
+        for row in rows
+    )
+    assert all(isinstance(row["runtime_observer"], list) for row in rows)
+    assert all(isinstance(row["controlled_validator"], list) for row in rows)
+    assert all(row["negative_fixture"] for row in rows)
+    assert all(row["false_positive_controls"] for row in rows)
+
+    evidence_documents: dict[Path, dict[str, Any]] = {}
+    for row in rows:
+        lab_result = row["lab_result"]
+        evidence_path = root / lab_result["evidence_reference"]
+        evidence_document = evidence_documents.setdefault(
+            evidence_path,
+            yaml.safe_load(evidence_path.read_text(encoding="utf-8")),
+        )
+        assert evidence_document["non_production_reference"] is True
+        assert evidence_document["redaction"] == {
+            "raw_values_included": False,
+            "package_identifiers_included": False,
+        }
+        assert all(
+            len(session["report_sha256"]) == 64
+            and set(session["report_sha256"]) <= set("0123456789abcdef")
+            for session in evidence_document["sessions"]
+        )
+        evidence_cases = {
+            item["case_id"]: item for item in evidence_document["cases"]
+        }
+        evidence_case = evidence_cases[lab_result["evidence_case"]]
+        assert evidence_case["session_id"] == lab_result["session_id"]
+        assert evidence_case["outcome"] == lab_result["outcome"]
+        assert evidence_case["tested_scope"] == lab_result["tested_scope"]
+
+    for row in rows:
+        for node_id in (*row["positive_fixture"], *row["negative_fixture"]):
+            relative, separator, test_name = node_id.partition("::")
+            path = root / relative
+            assert separator == "::"
+            assert path.is_file()
+            assert f"def {test_name}(" in path.read_text(encoding="utf-8")
+
+
+def test_root_and_secret_class_thresholds_do_not_overstate_impact() -> None:
+    root = Path(__file__).parents[1]
+    rows = yaml.safe_load(
+        (root / "rules" / "coverage.yaml").read_text(encoding="utf-8")
+    )["class_matrix"]
+    by_class = {row["class"]: row for row in rows}
+    root_detection = by_class["weak_root_and_emulator_detection"]
+    hardcoded_secret = by_class["hardcoded_secrets_and_embedded_credentials"]
+
+    assert root_detection["current_implementation_status"] == (
+        "runtime_observation_only"
+    )
+    assert root_detection["controlled_validator"] == []
+    assert "security-relevant decision" in root_detection["confirmation_threshold"]
+    assert "controlled override" in root_detection["confirmation_threshold"]
+    assert "hook_presence_not_impact" in root_detection["false_positive_controls"]
+
+    assert hardcoded_secret["current_implementation_status"] == (
+        "static_inventory_only"
+    )
+    assert hardcoded_secret["runtime_observer"] == []
+    assert hardcoded_secret["controlled_validator"] == []
+    assert "application-versus-dependency" in hardcoded_secret["known_gap"]
+    assert "crypto, network, or authentication sink" in (
+        hardcoded_secret["confirmation_threshold"]
+    )
+
+
+def test_explorer_resilience_lab_evidence_preserves_partial_outcome() -> None:
+    root = Path(__file__).parents[1]
+    evidence = yaml.safe_load(
+        (root / "docs" / "validation" / "class-coverage-lab.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    phase = next(
+        item
+        for item in evidence["phase_validations"]
+        if item["phase_id"] == "bounded_explorer_failure_resilience"
+    )
+    baseline = phase["baseline_outcome"]
+    validation = phase["validation_outcome"]
+
+    assert baseline["explorer_status"] == "error"
+    assert baseline["partial_progress_persisted"] is False
+    assert validation["explorer_status"] == "partial"
+    assert validation["report_module_result"] == "partial"
+    assert validation["actions_attempted"] == (
+        validation["actions_executed"] + validation["actions_failed"]
+    )
+    assert validation["actions_failed"] > 0
+    assert validation["state_refreshes"] > 0
+    assert validation["controlled_canary_status"] == "delivery_failed"
+    assert validation["cleanup_status"] == "completed"
+    assert validation["raw_canary_matches_in_commands_and_redacted_reports"] == 0
 
 
 def test_coverage_registry_id_kinds_do_not_overstate_finding_support() -> None:

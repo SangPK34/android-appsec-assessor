@@ -971,6 +971,7 @@ class AdbPrivateStorageBackend:
                 check=False,
                 operation="probing bounded private-storage canary attribution",
                 probe=probe,
+                sensitive_values=(canary,),
             )
             scanned_bytes += size
             if result.timed_out:

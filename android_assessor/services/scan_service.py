@@ -38,10 +38,29 @@ from .cleanup_service import CleanupService
 LOGGER = logging.getLogger(__name__)
 
 _EXPLORER_HARD_BOUND_TERMINATIONS = frozenset(
-    {"max_runtime", "max_actions", "max_states"}
+    {
+        "max_runtime",
+        "max_actions",
+        "max_states",
+        "action_failure_limit",
+        "action_recovery_failed",
+        "state_refresh_failed",
+        "process_state_unavailable",
+        "process_restart_failed",
+    }
 )
 _EXPLORER_LIMIT_BLOCK_REASONS = frozenset(
-    {"hard_limit", "insufficient_action_budget", "max_actions", "max_states"}
+    {
+        "hard_limit",
+        "insufficient_action_budget",
+        "max_actions",
+        "max_states",
+        "action_failure_limit",
+        "action_recovery_failed",
+        "state_refresh_failed",
+        "process_state_unavailable",
+        "process_restart_failed",
+    }
 )
 
 
@@ -71,18 +90,29 @@ def _exploration_coverage_limitation(result: ExplorerResult) -> str | None:
 
     blocked_activities = limit_blocked(activity_attempts)
     blocked_deep_links = limit_blocked(deep_link_attempts)
+    action_failures = _non_negative_count(getattr(result, "actions_failed", 0))
+    status = getattr(result, "status", "")
     if (
         termination not in _EXPLORER_HARD_BOUND_TERMINATIONS
         and blocked_activities == 0
         and blocked_deep_links == 0
+        and action_failures == 0
+        and status != "partial"
     ):
         return None
 
-    actions = _non_negative_count(getattr(result, "actions_executed", 0))
+    executed_actions = _non_negative_count(getattr(result, "actions_executed", 0))
+    actions = _non_negative_count(
+        getattr(result, "actions_attempted", executed_actions)
+    )
     states = _non_negative_count(getattr(result, "states_visited", 0))
     return (
         "Autonomous exploration coverage was bounded: "
-        f"termination={termination or 'unknown'}; actions={actions}; states={states}; "
+        f"status={status or 'unknown'}; termination={termination or 'unknown'}; "
+        f"actions={actions}; executed_actions={executed_actions}; "
+        f"failed_actions={action_failures}; states={states}; "
+        f"observation_retries={_non_negative_count(getattr(result, 'observation_retries', 0))}; "
+        f"state_refreshes={_non_negative_count(getattr(result, 'state_refreshes', 0))}; "
         f"targeted activity attempts={len(activity_attempts)} "
         f"(limit-blocked={blocked_activities}); targeted deep-link attempts="
         f"{len(deep_link_attempts)} (limit-blocked={blocked_deep_links})."
@@ -620,15 +650,59 @@ class ScanService:
                         if coverage_limitation is not None:
                             limitations.append(coverage_limitation)
                         controlled_canary_executed = (
-                            getattr(exploration_result, "controlled_canary_inputs", 0) > 0
+                            getattr(
+                                exploration_result,
+                                "controlled_canary_deliveries",
+                                0,
+                            )
+                            > 0
                         )
                         if controlled_canary:
-                            steps["controlled_canary"] = (
-                                "completed"
-                                if controlled_canary_executed
-                                else "not_exercised"
+                            canary_attempts = _non_negative_count(
+                                getattr(
+                                    exploration_result,
+                                    "controlled_canary_attempts",
+                                    0,
+                                )
                             )
-                            if not controlled_canary_executed:
+                            canary_failures = _non_negative_count(
+                                getattr(
+                                    exploration_result,
+                                    "controlled_canary_failures",
+                                    0,
+                                )
+                            )
+                            canary_budget_skips = _non_negative_count(
+                                getattr(
+                                    exploration_result,
+                                    "controlled_canary_budget_skips",
+                                    0,
+                                )
+                            )
+                            if controlled_canary_executed:
+                                steps["controlled_canary"] = "completed"
+                            elif canary_attempts and canary_failures:
+                                steps["controlled_canary"] = "delivery_failed"
+                                limitations.append(
+                                    "Controlled canary delivery was attempted but its "
+                                    "bounded ADB action failed; completion is unknown and "
+                                    "the action was not replayed."
+                                )
+                            elif canary_attempts:
+                                steps["controlled_canary"] = "delivery_incomplete"
+                                limitations.append(
+                                    "Controlled canary delivery started but the bounded "
+                                    "route did not reach a verified submit observation."
+                                )
+                            elif canary_budget_skips:
+                                steps["controlled_canary"] = "not_exercised"
+                                limitations.append(
+                                    "A compatible bounded form was reached, but the "
+                                    "remaining explorer action quota was insufficient for "
+                                    "the complete controlled canary route."
+                                )
+                            else:
+                                steps["controlled_canary"] = "not_exercised"
                                 limitations.append(
                                     "Controlled canary delivery was not exercised because "
                                     "no compatible bounded form action was reached."

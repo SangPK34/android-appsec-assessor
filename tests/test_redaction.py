@@ -42,6 +42,17 @@ def test_redacts_explicit_sensitive_argument() -> None:
     assert result == ["--token", REDACTED]
 
 
+def test_redacts_explicit_sensitive_value_embedded_in_argument() -> None:
+    canary = "THESIS_CANARY_20260718T120000Z_abcdef123456"
+
+    result = redact_arguments(
+        [f"grep -E '(^|_){canary}(_|$)' /scoped/file"],
+        sensitive_values=[canary],
+    )
+
+    assert result == ["grep -E '(^|_)<redacted>(_|$)' /scoped/file"]
+
+
 def test_redacts_phone_without_hiding_tool_versions() -> None:
     value = "Call +84 912 345 678; fastboot version 37.0.0-13978923"
 

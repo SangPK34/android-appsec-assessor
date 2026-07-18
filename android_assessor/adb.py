@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .errors import AdbError, ExternalCommandError
+from .errors import AdbError, AdbTimeoutError, ExternalCommandError
 from .redaction import redact_text_with_values
 from .subprocess_utils import CommandResult, run_command
 from .validation import (
@@ -160,13 +160,22 @@ class AdbClient:
         if not self.executable.is_file():
             raise AdbError(f"ADB executable not found: {self.executable}")
 
-    def _run(self, arguments: Sequence[str], *, timeout: float) -> CommandResult:
+    def _run(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout: float,
+        sensitive_values: Sequence[str] = (),
+    ) -> CommandResult:
         normalized = _validate_arguments(arguments)
         kwargs: dict[str, Any] = {"timeout": timeout, "check": False}
+        redacted_values = [str(value) for value in sensitive_values if value]
         if "-s" in normalized:
             serial_index = normalized.index("-s") + 1
             if serial_index < len(normalized):
-                kwargs["sensitive_values"] = (normalized[serial_index],)
+                redacted_values.append(normalized[serial_index])
+        if redacted_values:
+            kwargs["sensitive_values"] = tuple(dict.fromkeys(redacted_values))
         if self.command_log is not None:
             kwargs["command_log"] = self.command_log
         try:
@@ -182,7 +191,7 @@ class AdbClient:
         sensitive_values: Sequence[str] = (),
     ) -> CommandResult:
         if result.timed_out:
-            raise AdbError(f"ADB timed out while {operation}.")
+            raise AdbTimeoutError(f"ADB timed out while {operation}.")
         if result.exit_code != 0:
             detail = redact_text_with_values(
                 (result.stderr or result.stdout).strip(),
@@ -222,11 +231,21 @@ class AdbClient:
         timeout: float = 30,
         check: bool = False,
         operation: str = "running a device command",
+        sensitive_values: Sequence[str] = (),
     ) -> CommandResult:
         selected = validate_serial(serial)
-        result = self._run(("-s", selected, *_validate_arguments(arguments)), timeout=timeout)
+        protected_values = tuple(dict.fromkeys((selected, *sensitive_values)))
+        result = self._run(
+            ("-s", selected, *_validate_arguments(arguments)),
+            timeout=timeout,
+            sensitive_values=protected_values,
+        )
         return (
-            self._require_success(result, operation, sensitive_values=(selected,))
+            self._require_success(
+                result,
+                operation,
+                sensitive_values=protected_values,
+            )
             if check
             else result
         )
@@ -239,6 +258,7 @@ class AdbClient:
         timeout: float = 30,
         check: bool = False,
         operation: str = "running an Android shell command",
+        sensitive_values: Sequence[str] = (),
     ) -> CommandResult:
         return self.run_for_device(
             serial,
@@ -246,6 +266,7 @@ class AdbClient:
             timeout=timeout,
             check=check,
             operation=operation,
+            sensitive_values=sensitive_values,
         )
 
     def get_properties(self, serial: str) -> dict[str, str]:

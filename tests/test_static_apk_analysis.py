@@ -877,6 +877,31 @@ def test_static_behavior_emits_generic_storage_loading_and_deserialization() -> 
     }
 
 
+def test_static_behavior_does_not_emit_loading_or_deserialization_for_uninvoked_refs() -> None:
+    methods = (
+        ("Lfixture/ReferenceOnly;", "run", (), "V"),
+        (
+            "Ldalvik/system/DexFile;",
+            "loadDex",
+            ("Ljava/lang/String;", "Ljava/lang/String;", "I"),
+            "Ldalvik/system/DexFile;",
+        ),
+        (
+            "Ljava/io/ObjectInputStream;",
+            "readObject",
+            (),
+            "Ljava/lang/Object;",
+        ),
+    )
+    inventory = parse_dex_inventory(
+        build_dex(methods=methods, method_bodies=((0, 1, (0x0E,)),))
+    )
+
+    emitted = {item.rule_id for item in inventory.behavior_signals}
+    assert "ASL-STATIC-DYNAMIC-CODE" not in emitted
+    assert "ASL-STATIC-DESERIALIZATION" not in emitted
+
+
 def test_static_behavior_is_bounded_and_rejects_malformed_code(tmp_path: Path) -> None:
     methods = (
         ("Lfixture/BoundedFlow;", "run", (), "V"),
