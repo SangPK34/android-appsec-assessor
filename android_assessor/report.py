@@ -562,30 +562,50 @@ class ReportService:
             "report": ("report_", "experiment_results_csv"),
         }
         for module, (timing_key, description) in planned_modules.items():
-            planned = scan_profile == "full" or module not in {
-                "private_storage",
-                "frida",
-                "autonomous_exploration",
-                "runtime_observation",
-                "traffic",
-            }
+            explicit_exploration_requested = (
+                scan.get("autonomous_exploration_requested")
+                if isinstance(scan, dict)
+                else None
+            )
+            explicit_exploration_executed = (
+                scan.get("autonomous_exploration_executed")
+                if isinstance(scan, dict)
+                else None
+            )
+            if module == "autonomous_exploration" and isinstance(
+                explicit_exploration_requested, bool
+            ):
+                planned = explicit_exploration_requested
+            else:
+                planned = scan_profile == "full" or module not in {
+                    "private_storage",
+                    "frida",
+                    "autonomous_exploration",
+                    "runtime_observation",
+                    "traffic",
+                }
             app_step = {
                 "apk_acquisition": "apk_pull",
                 "manifest": "aapt2_manifest",
                 "signature": "apksigner",
             }.get(module)
             executed = (
-                (app_step is not None and app_steps.get(app_step) == "completed")
-                or (timing_key in scan_timings)
-                or (
-                    module == "frida"
-                    and scan_steps.get("frida_observation") not in {None, "skipped"}
+                bool(explicit_exploration_executed)
+                if module == "autonomous_exploration"
+                and isinstance(explicit_exploration_executed, bool)
+                else (
+                    (app_step is not None and app_steps.get(app_step) == "completed")
+                    or (timing_key in scan_timings)
+                    or (
+                        module == "frida"
+                        and scan_steps.get("frida_observation") not in {None, "skipped"}
+                    )
+                    or (
+                        module == "autonomous_exploration"
+                        and scan_steps.get("autonomous_exploration") not in {None, "skipped"}
+                    )
+                    or (module == "report")
                 )
-                or (
-                    module == "autonomous_exploration"
-                    and scan_steps.get("autonomous_exploration") not in {None, "skipped"}
-                )
-                or (module == "report")
             )
             skipped_step = {
                 "traffic": "traffic_capture",
@@ -613,7 +633,11 @@ class ReportService:
                 "logcat": ("logcat",),
                 "private_storage": ("storage",),
                 "frida": ("frida",),
-                "autonomous_exploration": ("exploration",),
+                "autonomous_exploration": (
+                    "exploration",
+                    "autonomous runtime",
+                    "traffic guard",
+                ),
                 "traffic": ("traffic", "proxy"),
             }
             evidence_count = (
@@ -627,21 +651,34 @@ class ReportService:
                 if executed
                 else 0
             )
-            skip_reason = (
-                next(
-                    (
-                        item
-                        for item in limitation_values
-                        if any(
-                            term in str(item).casefold()
-                            for term in module_terms.get(module, (module.replace("_", " "),))
-                        )
-                    ),
-                    None,
+            if (
+                module == "autonomous_exploration"
+                and planned is False
+                and explicit_exploration_requested is False
+            ):
+                skip_reason = (
+                    "Autonomous exploration was not requested; the caller selected "
+                    "zero-runtime or explicitly disabled exploration."
                 )
-                if skipped or failed
-                else None
-            )
+            else:
+                skip_reason = (
+                    next(
+                        (
+                            item
+                            for item in limitation_values
+                            if any(
+                                term in str(item).casefold()
+                                for term in module_terms.get(
+                                    module,
+                                    (module.replace("_", " "),),
+                                )
+                            )
+                        ),
+                        None,
+                    )
+                    if skipped or failed
+                    else None
+                )
             modules.append(
                 {
                     "module": module,

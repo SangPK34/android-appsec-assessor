@@ -30,6 +30,8 @@ class ValidationRecord:
     canary: str | None
     summary: str
     evidence_ids: tuple[str, ...] = ()
+    candidate_key: str | None = None
+    candidate_context: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -46,6 +48,16 @@ class ValidationRecord:
             canary=str(value["canary"]) if value.get("canary") else None,
             summary=str(value["summary"]),
             evidence_ids=tuple(str(item) for item in value.get("evidence_ids", [])),
+            candidate_key=(
+                str(value["candidate_key"])
+                if value.get("candidate_key")
+                else None
+            ),
+            candidate_context=(
+                dict(value["candidate_context"])
+                if isinstance(value.get("candidate_context"), dict)
+                else None
+            ),
         )
 
 

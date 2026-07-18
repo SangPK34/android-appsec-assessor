@@ -27,7 +27,7 @@ from ..scope import load_scope
 from ..session import SessionRepository
 from ..storage import read_json_object, require_under_root, write_text_atomic
 from ..traffic import TrafficCaptureService, load_traffic_events
-from ..validation import generate_session_canary
+from ..validation import generate_session_canary, static_candidate_key
 from ..validation_definitions import validation_for_rule
 
 _HOST_PATTERN = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
@@ -135,7 +135,7 @@ class ValidationService:
     def _storage_receiver_candidate(
         app: dict[str, object],
         finding: FindingRecord,
-    ) -> tuple[str, str] | None:
+    ) -> tuple[dict[str, object], str, str] | None:
         manifest = app.get("manifest")
         if not isinstance(manifest, dict):
             return None
@@ -181,7 +181,7 @@ class ValidationService:
                     if isinstance(action, str) and _BROADCAST_ACTION_PATTERN.fullmatch(
                         action
                     ):
-                        return component or "", action
+                        return dict(candidate), component or "", action
         return None
 
     def _validate_cleartext(
@@ -435,7 +435,17 @@ class ValidationService:
                     "world-readable storage call-site."
                 ),
             )
-        component, action = target
+        candidate, component, action = target
+        candidate_key = static_candidate_key(candidate)
+        candidate_context = {
+            "candidate_key": candidate_key,
+            "caller_class_descriptor": candidate.get("caller_class_descriptor"),
+            "caller_method_name": candidate.get("caller_method_name"),
+            "component": component,
+            "action": action,
+            "route": "explicit_receiver_broadcast",
+            "route_reached": False,
+        }
         record = self.repository.load(session_id)
         paths = self.repository.paths_for(session_id)
         with DeviceLock(
@@ -483,7 +493,10 @@ class ValidationService:
                 canary=canary,
                 summary="The receiver broadcast was blocked or did not complete.",
                 evidence_ids=(broadcast_evidence_id,),
+                candidate_key=candidate_key,
+                candidate_context=candidate_context,
             )
+        candidate_context = {**candidate_context, "route_reached": True}
         try:
             load_scope(self.paths).require_device_package(
                 record.serial,
@@ -510,6 +523,8 @@ class ValidationService:
                     f"validation did not complete: {redact_text(str(exc))[:200]}"
                 ),
                 evidence_ids=(broadcast_evidence_id,),
+                candidate_key=candidate_key,
+                candidate_context=candidate_context,
             )
         storage_evidence_ids = tuple(
             str(item["evidence_id"])
@@ -555,6 +570,8 @@ class ValidationService:
             canary=canary,
             summary=summary,
             evidence_ids=evidence_ids,
+            candidate_key=candidate_key,
+            candidate_context=candidate_context,
         )
 
     def validate(self, session_id: str, finding_id: str) -> FindingRecord:

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import secrets
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
+from typing import Any
 
 from .errors import SessionError
 
@@ -49,6 +53,30 @@ def validate_session_canary(canary: str) -> str:
     if not _SESSION_CANARY_PATTERN.fullmatch(value):
         raise SessionError("Session canary has an invalid format.")
     return value
+
+
+def static_candidate_key(candidate: Mapping[str, Any]) -> str:
+    """Return a stable, non-sensitive identity for one static call-site candidate."""
+    identity = {
+        key: candidate.get(key)
+        for key in (
+            "rule_id",
+            "source_id",
+            "dex_entry",
+            "caller_class_descriptor",
+            "caller_method_name",
+            "caller_prototype",
+            "callee_class_descriptor",
+            "callee_method_name",
+            "callee_prototype",
+        )
+        if candidate.get(key) is not None
+    }
+    indicators = candidate.get("indicators")
+    if isinstance(indicators, (list, tuple)):
+        identity["indicators"] = sorted(str(item) for item in indicators)
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def validate_reverse_endpoint(endpoint: str) -> str:

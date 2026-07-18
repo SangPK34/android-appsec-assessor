@@ -5,12 +5,13 @@ from pathlib import Path
 from shutil import copyfile
 
 from android_assessor.evidence import EvidenceRepository
-from android_assessor.findings import FindingStatus
+from android_assessor.findings import FindingRepository, FindingStatus, ValidationRecord
 from android_assessor.frida_events import parse_frida_jsonl
 from android_assessor.paths import ProjectPaths
 from android_assessor.rules import RuleEngine
 from android_assessor.session import SessionRepository
 from android_assessor.storage import read_json_object, write_json_atomic, write_text_atomic
+from android_assessor.validation import static_candidate_key
 
 PACKAGE = "com.example.phase2lab"
 
@@ -92,6 +93,37 @@ def _register_static_inventory(
         redacted=True,
     )
     return record.evidence_id
+
+
+def _register_storage_inventory(
+    paths: ProjectPaths,
+    repository: SessionRepository,
+    session_id: str,
+    *,
+    observations: list[dict[str, object]] | None = None,
+) -> str:
+    output = repository.paths_for(session_id).redacted_dir / "storage" / "private-storage.json"
+    write_json_atomic(
+        output,
+        {
+            "root_mode": "adb_root",
+            "inventory_status": "completed",
+            "inventory_limitations": [],
+            "content_scan_status": "completed",
+            "content_scan_limitations": [],
+            "observations": observations or [],
+        },
+        root=paths.root,
+    )
+    return EvidenceRepository(paths, repository).register_file(
+        session_id,
+        output,
+        evidence_type="private_storage_metadata",
+        source="fixture",
+        description="Bounded storage fixture.",
+        sensitive=True,
+        redacted=True,
+    ).evidence_id
 
 
 def _event(
@@ -1104,9 +1136,32 @@ def test_storage_static_candidate_keeps_confirmed_runtime_artifact(
     assert finding.details["static_behavior_candidates"][0]["rule_id"] == (
         "STORAGE-WORLD-READABLE"
     )
+    FindingRepository(paths, repository).set_validation(
+        session_id,
+        finding.finding_id,
+        ValidationRecord(
+            status=FindingStatus.PASS,
+            validation_type="root_assisted_validation",
+            validated_at="2026-07-18T10:00:00+00:00",
+            canary=None,
+            summary="The candidate route was rejected independently.",
+            evidence_ids=(storage_evidence_id,),
+            candidate_key=static_candidate_key(
+                finding.details["static_behavior_candidates"][0]
+            ),
+            candidate_context={"route_reached": True},
+        ),
+    )
+    re_evaluated = _findings(paths, repository, session_id)[
+        "STORAGE-WORLD-READABLE"
+    ]
+    assert re_evaluated.status is FindingStatus.CONFIRMED
+    assert re_evaluated.details["static_behavior_outcome"] == (
+        "candidate_scoped_rejected_runtime_confirmed"
+    )
 
 
-def test_completed_storage_inventory_rejects_static_storage_candidate(
+def test_completed_storage_inventory_does_not_reject_unexercised_storage_candidate(
     tmp_path: Path,
 ) -> None:
     paths, repository, session_id = _prepared_session(
@@ -1142,19 +1197,195 @@ def test_completed_storage_inventory_rejects_static_storage_candidate(
 
     finding = _findings(paths, repository, session_id)["STORAGE-WORLD-READABLE"]
 
-    assert finding.status is FindingStatus.PASS
+    assert finding.status is FindingStatus.POTENTIAL
     assert finding.analysis_type == "root_assisted"
     assert finding.root_used is True
     assert finding.evidence_ids == (storage_evidence_id, static_evidence_id)
     assert finding.details["method"] == "bounded_private_storage_correlation"
     assert finding.details["static_behavior_outcome"] == (
-        "rejected_by_completed_private_storage_inventory"
+        "candidate_scoped_not_exercised"
     )
     assert finding.details["candidate_count"] == 1
+    assert finding.details["candidate_outcomes"][0]["outcome"] == "unresolved"
+    assert finding.details["unresolved_candidate_count"] == 1
     assert finding.details["static_behavior_candidates"][0]["rule_id"] == (
         "STORAGE-WORLD-READABLE"
     )
-    assert finding.details["missing_evidence"] == []
+    assert "candidate-scoped controlled validation" in str(
+        finding.details["missing_evidence"]
+    )
+
+
+def test_candidate_scoped_storage_validation_can_reject_one_candidate(
+    tmp_path: Path,
+) -> None:
+    candidate = _static_behavior_candidate("STORAGE-WORLD-READABLE")
+    paths, repository, session_id = _prepared_session(
+        tmp_path,
+        static_behavior_candidates=(candidate,),
+    )
+    static_evidence_id = _register_static_inventory(paths, repository, session_id)
+    storage_evidence_id = _register_storage_inventory(paths, repository, session_id)
+    initial = _findings(paths, repository, session_id)["STORAGE-WORLD-READABLE"]
+    assert initial.status is FindingStatus.POTENTIAL
+
+    validation_output = (
+        repository.paths_for(session_id).redacted_dir
+        / "validation"
+        / "storage-receiver.txt"
+    )
+    write_text_atomic(
+        validation_output,
+        "broadcast completed; bounded inventory contained no eligible observation\n",
+        root=paths.root,
+    )
+    validation_evidence_id = EvidenceRepository(paths, repository).register_file(
+        session_id,
+        validation_output,
+        evidence_type="controlled_validation",
+        source="fixture",
+        description="Candidate-scoped storage validation fixture.",
+        sensitive=False,
+        redacted=True,
+    ).evidence_id
+    validation = ValidationRecord(
+        status=FindingStatus.PASS,
+        validation_type="root_assisted_validation",
+        validated_at="2026-07-18T10:00:00+00:00",
+        canary=None,
+        summary="The bounded receiver route completed and rejected the candidate.",
+        evidence_ids=(validation_evidence_id,),
+        candidate_key=static_candidate_key(candidate),
+        candidate_context={"route_reached": True, "route": "explicit_receiver_broadcast"},
+    )
+    FindingRepository(paths, repository).set_validation(
+        session_id,
+        initial.finding_id,
+        validation,
+    )
+
+    finding = _findings(paths, repository, session_id)["STORAGE-WORLD-READABLE"]
+
+    assert finding.status is FindingStatus.PASS
+    assert finding.details["static_behavior_outcome"] == "candidate_scoped_rejected"
+    assert finding.details["candidate_outcomes"] == [
+        {
+            "candidate_key": static_candidate_key(candidate),
+            "caller_class_descriptor": "Lcom/example/phase2lab/SecurityFlow;",
+            "caller_method_name": "exercise",
+            "indicators": ["fixture.normalized_call_site"],
+            "reached": True,
+            "outcome": "rejected",
+            "reason": "The bounded receiver route completed and rejected the candidate.",
+            "evidence_ids": [validation_evidence_id],
+        }
+    ]
+    assert finding.details["unresolved_candidate_count"] == 0
+    assert finding.evidence_ids == (
+        storage_evidence_id,
+        static_evidence_id,
+        validation_evidence_id,
+    )
+
+
+def test_candidate_scoped_storage_validation_does_not_reject_unmatched_dependency(
+    tmp_path: Path,
+) -> None:
+    receiver = _static_behavior_candidate("STORAGE-WORLD-READABLE")
+    dependency = {
+        **receiver,
+        "caller_class_descriptor": "Lcom/google/android/gms/internal/Storage;",
+        "caller_method_name": "zzv",
+        "indicators": ["fixture.dependency_call_site"],
+    }
+    paths, repository, session_id = _prepared_session(
+        tmp_path,
+        static_behavior_candidates=(receiver, dependency),
+    )
+    _register_static_inventory(paths, repository, session_id)
+    _register_storage_inventory(paths, repository, session_id)
+    initial = _findings(paths, repository, session_id)["STORAGE-WORLD-READABLE"]
+
+    validation_output = (
+        repository.paths_for(session_id).redacted_dir
+        / "validation"
+        / "storage-receiver.txt"
+    )
+    write_text_atomic(validation_output, "bounded receiver validation\n", root=paths.root)
+    validation_evidence_id = EvidenceRepository(paths, repository).register_file(
+        session_id,
+        validation_output,
+        evidence_type="controlled_validation",
+        source="fixture",
+        description="Candidate-scoped storage validation fixture.",
+        sensitive=False,
+        redacted=True,
+    ).evidence_id
+    FindingRepository(paths, repository).set_validation(
+        session_id,
+        initial.finding_id,
+        ValidationRecord(
+            status=FindingStatus.PASS,
+            validation_type="root_assisted_validation",
+            validated_at="2026-07-18T10:00:00+00:00",
+            canary=None,
+            summary="The explicit receiver candidate was rejected.",
+            evidence_ids=(validation_evidence_id,),
+            candidate_key=static_candidate_key(receiver),
+            candidate_context={
+                "route_reached": True,
+                "route": "explicit_receiver_broadcast",
+            },
+        ),
+    )
+
+    finding = _findings(paths, repository, session_id)["STORAGE-WORLD-READABLE"]
+
+    assert finding.status is FindingStatus.POTENTIAL
+    assert finding.details["static_behavior_outcome"] == (
+        "candidate_scoped_partial_rejection"
+    )
+    assert finding.details["unresolved_candidate_count"] == 1
+    outcomes = {
+        item["caller_class_descriptor"]: item["outcome"]
+        for item in finding.details["candidate_outcomes"]
+    }
+    assert outcomes["Lcom/example/phase2lab/SecurityFlow;"] == "rejected"
+    assert outcomes["Lcom/google/android/gms/internal/Storage;"] == "unresolved"
+    assert validation_evidence_id in finding.evidence_ids
+
+
+def test_candidate_scoped_inconclusive_validation_is_not_reported_as_pass(
+    tmp_path: Path,
+) -> None:
+    candidate = _static_behavior_candidate("STORAGE-WORLD-READABLE")
+    paths, repository, session_id = _prepared_session(
+        tmp_path,
+        static_behavior_candidates=(candidate,),
+    )
+    _register_static_inventory(paths, repository, session_id)
+    initial = _findings(paths, repository, session_id)["STORAGE-WORLD-READABLE"]
+    FindingRepository(paths, repository).set_validation(
+        session_id,
+        initial.finding_id,
+        ValidationRecord(
+            status=FindingStatus.INCONCLUSIVE,
+            validation_type="root_assisted_validation",
+            validated_at="2026-07-18T10:00:00+00:00",
+            canary=None,
+            summary="The bounded route did not complete.",
+            candidate_key=static_candidate_key(candidate),
+            candidate_context={"route_reached": False},
+        ),
+    )
+
+    finding = _findings(paths, repository, session_id)["STORAGE-WORLD-READABLE"]
+
+    assert finding.status is FindingStatus.INCONCLUSIVE
+    assert finding.details["static_behavior_outcome"] == (
+        "candidate_scoped_inconclusive"
+    )
+    assert finding.details["candidate_outcomes"][0]["outcome"] == "inconclusive"
 
 
 def test_incomplete_storage_inventory_cannot_produce_permission_passes(

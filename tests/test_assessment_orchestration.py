@@ -213,6 +213,31 @@ def test_direct_scan_session_rejects_controlled_delivery_config_before_loading(
         )
 
 
+def test_direct_scan_session_rejects_zero_runtime_autonomous_request_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    service = ScanService(SimpleNamespace(paths=paths), repository)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        repository,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("session must not load"),
+    )
+
+    with pytest.raises(
+        AndroidAssessorError,
+        match=r"runtime greater than zero",
+    ):
+        service.scan_session(
+            session_id,
+            profile="full",
+            autonomous=True,
+            runtime_seconds=0,
+        )
+
+
 def test_controlled_canary_scan_is_denied_before_execution_without_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1016,6 +1041,44 @@ def test_report_explorer_coverage_respects_profile_and_failure(
     )
     assert explorer["planned"] is expected_planned
     assert explorer["result"] == expected_result
+
+
+def test_report_explorer_coverage_uses_authoritative_scan_request_flags(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    session_paths = repository.paths_for(session_id)
+    write_json_atomic(
+        session_paths.scan_json,
+        {
+            "profile": "full",
+            "autonomous_exploration_requested": False,
+            "autonomous_exploration_executed": False,
+            "dynamic_steps": {"autonomous_exploration": "skipped"},
+            "runtime_termination": "completed_no_wait",
+        },
+        root=paths.root,
+    )
+    (paths.root / "templates").mkdir()
+    copyfile(
+        Path(__file__).resolve().parent.parent / "templates" / "report.html.j2",
+        paths.root / "templates" / "report.html.j2",
+    )
+
+    report = ReportService(paths, repository).generate(session_id)
+    explorer = next(
+        item
+        for item in report["module_execution_coverage"]
+        if item["module"] == "autonomous_exploration"
+    )
+
+    assert explorer["planned"] is False
+    assert explorer["executed"] is False
+    assert explorer["result"] == "not_planned"
+    assert explorer["skip_reason"] == (
+        "Autonomous exploration was not requested; the caller selected zero-runtime "
+        "or explicitly disabled exploration."
+    )
 
 
 def test_runtime_stop_request_is_idempotent_marker(tmp_path: Path) -> None:

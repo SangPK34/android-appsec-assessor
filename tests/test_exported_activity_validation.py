@@ -411,5 +411,15 @@ def test_world_readable_storage_receiver_validation_re_evaluates_evidence(
     )
     if expected is FindingStatus.PASS:
         assert updated.details["static_behavior_outcome"] == (
-            "rejected_by_completed_private_storage_inventory"
+            "candidate_scoped_rejected"
         )
+        assert updated.validation.candidate_key
+        assert updated.validation.candidate_context == {
+            "candidate_key": updated.validation.candidate_key,
+            "caller_class_descriptor": "Lcom/example/app/StorageReceiver;",
+            "caller_method_name": "onReceive",
+            "component": "com.example.app.StorageReceiver",
+            "action": "com.example.app.STORAGE_PROBE",
+            "route": "explicit_receiver_broadcast",
+            "route_reached": True,
+        }

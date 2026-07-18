@@ -248,6 +248,10 @@ class ScanService:
             autonomous=autonomous,
             explorer_config=explorer_config,
         )
+        if resolution.autonomous_exploration_enabled and runtime_seconds == 0:
+            raise AndroidAssessorError(
+                "Autonomous exploration requires a runtime greater than zero."
+            )
         record = self.repository.load(session_id)
         scope = load_scope(self.paths)
         scope.require_device_package(record.serial, record.package)

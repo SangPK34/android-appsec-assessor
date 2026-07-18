@@ -23,6 +23,7 @@ from .session import SessionRepository
 from .storage import read_json_object, require_under_root
 from .tls_analysis import TlsBehaviorAnalyzer
 from .traffic import load_traffic_events
+from .validation import static_candidate_key
 from .validation_definitions import validation_for_rule
 
 
@@ -454,24 +455,197 @@ class RuleEngine:
         )
 
     @staticmethod
-    def _rejects_static_storage_candidate(
+    def _storage_candidate_correlation(
         definition: RuleDefinition,
-        status: FindingStatus,
-        details: dict[str, Any],
-    ) -> bool:
-        """Return true when stronger storage evidence rules out a static file-mode hit."""
+        result: tuple[
+            FindingStatus,
+            str,
+            dict[str, Any],
+            tuple[str, ...],
+            bool,
+            bool,
+        ],
+        candidates: list[dict[str, Any]],
+        validation: Any,
+        context: dict[str, Any],
+    ) -> tuple[
+        FindingStatus,
+        str,
+        dict[str, Any],
+        tuple[str, ...],
+        bool,
+        bool,
+    ]:
+        """Correlate storage validation to the exact static call-site it exercised."""
+        status, analysis, details, ids, root_used, frida_used = result
         if definition.rule_id not in {
             "STORAGE-WORLD-READABLE",
             "STORAGE-WORLD-WRITABLE",
         }:
-            return False
-        return (
-            status is FindingStatus.PASS
-            and details.get("method") == "bounded_private_storage_correlation"
-            and details.get("inventory_status") == "completed"
-            and not details.get("inventory_limitations")
-            and not details.get("observed_behavior")
+            return result
+
+        base_status = status
+
+        # A static storage call-site remains a useful potential even when the
+        # Full-profile root module was not executed.  The capability gate must
+        # not erase that candidate; keep the gate details as a limitation and
+        # require candidate-scoped validation before calling it pass/confirmed.
+        if candidates and status is FindingStatus.SKIPPED and analysis in {
+            "capability_gate",
+            "root_assisted",
+        }:
+            gate_details = dict(details)
+            gate_missing = gate_details.get("missing_evidence", [])
+            details = {
+                "observed_behavior": "static_behavior_candidate",
+                "reason": (
+                    "Bounded static APK analysis matched a storage call-site; the "
+                    "root-assisted route was not usable in this assessment."
+                ),
+                "method": "bounded_apk_static_behavior_call_site_correlation",
+                "preconditions": [
+                    "bounded static APK analysis completed",
+                    "candidate-scoped controlled storage validation",
+                ],
+                "missing_evidence": [
+                    *(
+                        str(item)
+                        for item in gate_missing
+                        if str(item)
+                    ),
+                ],
+                "capability_gate": gate_details,
+            }
+            status = FindingStatus.POTENTIAL
+            analysis = "static"
+
+        candidate_outcomes: list[dict[str, Any]] = []
+        validation_key = getattr(validation, "candidate_key", None)
+        validation_context = getattr(validation, "candidate_context", None)
+        validation_status = getattr(validation, "status", None)
+        validation_summary = str(getattr(validation, "summary", ""))
+        for candidate in candidates:
+            key = static_candidate_key(candidate)
+            matched = bool(validation_key and validation_key == key)
+            if matched:
+                if validation_status is FindingStatus.CONFIRMED:
+                    outcome = "confirmed"
+                elif validation_status is FindingStatus.PASS:
+                    outcome = "rejected"
+                elif validation_status is FindingStatus.INCONCLUSIVE:
+                    outcome = "inconclusive"
+                else:
+                    outcome = "not_exercised"
+                reached = bool(
+                    isinstance(validation_context, dict)
+                    and validation_context.get("route_reached") is True
+                )
+                reason = validation_summary or "Candidate-scoped validation completed."
+                evidence_ids = list(
+                    dict.fromkeys(
+                        str(item)
+                        for item in getattr(validation, "evidence_ids", ())
+                    )
+                )
+            else:
+                outcome = "unresolved"
+                reached = False
+                reason = (
+                    "No candidate-scoped controlled validation exercised this static "
+                    "call-site."
+                )
+                evidence_ids = []
+            candidate_outcomes.append(
+                {
+                    "candidate_key": key,
+                    "caller_class_descriptor": candidate.get("caller_class_descriptor"),
+                    "caller_method_name": candidate.get("caller_method_name"),
+                    "indicators": candidate.get("indicators", []),
+                    "reached": reached,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "evidence_ids": evidence_ids,
+                }
+            )
+
+        outcomes = {str(item["outcome"]) for item in candidate_outcomes}
+        unresolved = sum(
+            1 for item in candidate_outcomes if item["outcome"] == "unresolved"
         )
+        if "confirmed" in outcomes:
+            status = FindingStatus.CONFIRMED
+            outcome = "candidate_scoped_confirmed"
+        elif "inconclusive" in outcomes:
+            status = FindingStatus.INCONCLUSIVE
+            outcome = "candidate_scoped_inconclusive"
+        elif "not_exercised" in outcomes:
+            status = FindingStatus.POTENTIAL
+            outcome = "candidate_scoped_not_exercised"
+        elif validation is None and status is FindingStatus.PASS:
+            # A completed inventory is a state observation, not proof that every
+            # static call-site has executed or that a future route is safe.
+            status = FindingStatus.POTENTIAL
+            outcome = "candidate_scoped_not_exercised"
+        elif "rejected" in outcomes and unresolved == 0:
+            status = (
+                FindingStatus.CONFIRMED
+                if base_status is FindingStatus.CONFIRMED
+                else FindingStatus.PASS
+            )
+            outcome = (
+                "candidate_scoped_rejected_runtime_confirmed"
+                if base_status is FindingStatus.CONFIRMED
+                else "candidate_scoped_rejected"
+            )
+        elif "rejected" in outcomes:
+            status = (
+                FindingStatus.CONFIRMED
+                if base_status is FindingStatus.CONFIRMED
+                else FindingStatus.POTENTIAL
+            )
+            outcome = (
+                "candidate_scoped_partial_rejection_runtime_confirmed"
+                if base_status is FindingStatus.CONFIRMED
+                else "candidate_scoped_partial_rejection"
+            )
+        elif candidate_outcomes and status is FindingStatus.PASS:
+            status = FindingStatus.POTENTIAL
+            outcome = "candidate_scoped_not_exercised"
+        else:
+            outcome = "candidate_scoped_unresolved"
+
+        missing = list(details.get("missing_evidence", []))
+        if unresolved and "candidate-scoped controlled validation" not in missing:
+            missing.append("candidate-scoped controlled validation for each static call-site")
+        if unresolved:
+            for item in (
+                "runtime execution of the referenced method",
+                "runtime reachability and security impact",
+            ):
+                if item not in missing:
+                    missing.append(item)
+        details = {
+            **details,
+            "static_behavior_outcome": outcome,
+            "candidate_count": len(candidate_outcomes),
+            "candidate_outcomes": candidate_outcomes,
+            "unresolved_candidate_count": unresolved,
+            "missing_evidence": missing,
+        }
+        ids = tuple(
+            dict.fromkeys(
+                (
+                    *ids,
+                    *context["evidence"]("static_apk_inventory"),
+                    *(
+                        str(item)
+                        for item in getattr(validation, "evidence_ids", ())
+                    ),
+                )
+            )
+        )
+        details["static_behavior_candidates"] = candidates
+        return status, analysis, details, ids, root_used, frida_used
 
     @staticmethod
     def _is_launcher(component: dict[str, Any]) -> bool:
@@ -2145,22 +2319,21 @@ class RuleEngine:
                     static_analysis,
                     definition.rule_id,
                 )
+                previous = previous_findings.get(definition.rule_id)
                 if static_behavior:
-                    is_static_fallback = details.get("method") == (
-                        "bounded_apk_static_behavior_call_site_correlation"
-                    )
-                    runtime_potential = (
-                        status is FindingStatus.POTENTIAL
-                        and analysis != "static"
-                        and not (
-                            definition.rule_id == "WEBVIEW-SSL-ERROR-PROCEED"
-                            and not details.get("observed_behavior", {}).get(
-                                "matched_callback_proceed_count"
-                            )
-                        )
-                    )
-                    if not is_static_fallback:
-                        if status is FindingStatus.CONFIRMED or runtime_potential:
+                    if definition.rule_id in {
+                        "STORAGE-WORLD-READABLE",
+                        "STORAGE-WORLD-WRITABLE",
+                    }:
+                        (
+                            status,
+                            analysis,
+                            details,
+                            ids,
+                            root_used,
+                            frida_used,
+                        ) = self._storage_candidate_correlation(
+                            definition,
                             (
                                 status,
                                 analysis,
@@ -2168,7 +2341,28 @@ class RuleEngine:
                                 ids,
                                 root_used,
                                 frida_used,
-                            ) = self._with_static_behavior_context(
+                            ),
+                            static_behavior,
+                            previous.validation if previous else None,
+                            context,
+                        )
+                        static_behavior = []
+                    else:
+                        is_static_fallback = details.get("method") == (
+                            "bounded_apk_static_behavior_call_site_correlation"
+                        )
+                        runtime_potential = (
+                            status is FindingStatus.POTENTIAL
+                            and analysis != "static"
+                            and not (
+                                definition.rule_id == "WEBVIEW-SSL-ERROR-PROCEED"
+                                and not details.get("observed_behavior", {}).get(
+                                    "matched_callback_proceed_count"
+                                )
+                            )
+                        )
+                        if not is_static_fallback:
+                            if status is FindingStatus.CONFIRMED or runtime_potential:
                                 (
                                     status,
                                     analysis,
@@ -2176,53 +2370,31 @@ class RuleEngine:
                                     ids,
                                     root_used,
                                     frida_used,
-                                ),
-                                context,
-                                static_behavior,
-                            )
-                        elif self._rejects_static_storage_candidate(
-                            definition,
-                            status,
-                            details,
-                        ):
-                            (
-                                status,
-                                analysis,
-                                details,
-                                ids,
-                                root_used,
-                                frida_used,
-                            ) = self._with_static_behavior_context(
+                                ) = self._with_static_behavior_context(
+                                    (
+                                        status,
+                                        analysis,
+                                        details,
+                                        ids,
+                                        root_used,
+                                        frida_used,
+                                    ),
+                                    context,
+                                    static_behavior,
+                                )
+                            else:
                                 (
                                     status,
                                     analysis,
-                                    {
-                                        **details,
-                                        "static_behavior_outcome": (
-                                            "rejected_by_completed_private_storage_inventory"
-                                        ),
-                                        "candidate_count": len(static_behavior),
-                                    },
+                                    details,
                                     ids,
                                     root_used,
                                     frida_used,
-                                ),
-                                context,
-                                static_behavior,
-                            )
-                        else:
-                            (
-                                status,
-                                analysis,
-                                details,
-                                ids,
-                                root_used,
-                                frida_used,
-                            ) = self._static_behavior_fallback(
-                                definition,
-                                context,
-                                static_behavior,
-                            )
+                                ) = self._static_behavior_fallback(
+                                    definition,
+                                    context,
+                                    static_behavior,
+                                )
             except (AndroidAssessorError, OSError, ValueError) as exc:
                 status = FindingStatus.ERROR
                 analysis = "unknown"
@@ -2230,7 +2402,6 @@ class RuleEngine:
                 ids = ()
                 root_used = False
                 frida_used = False
-            previous = previous_findings.get(definition.rule_id)
             if definition.validation_observable:
                 details = {
                     **details,
@@ -2247,8 +2418,9 @@ class RuleEngine:
                     "validation_type": definition.validation_type,
                 }
             validation = previous.validation if previous else None
-            if validation and validation.status is FindingStatus.CONFIRMED:
-                status = FindingStatus.CONFIRMED
+            if validation:
+                if validation.status is FindingStatus.CONFIRMED:
+                    status = FindingStatus.CONFIRMED
                 ids = tuple(dict.fromkeys((*ids, *validation.evidence_ids)))
             finding_confidence = definition.confidence
             if (
