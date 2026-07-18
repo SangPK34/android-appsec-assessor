@@ -10,6 +10,7 @@ from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 import pytest
 
 import android_assessor.static_apk_analysis as static_analysis
+from android_assessor.manifest import parse_aapt_strings
 from android_assessor.static_apk_analysis import (
     ApiPolicyEntry,
     DexFormatError,
@@ -1163,8 +1164,220 @@ def test_overlong_text_and_resource_strings_create_structured_limitation(
         policy=policy,
     )
 
-    assert result.status == "partial"
-    assert "limit:string_scan_bytes" in result.limitations
+    assert result.status == "completed"
+    assert "limit:string_scan_bytes" not in result.limitations
+
+
+def _large_region_policy(**overrides: int) -> StaticApkPolicy:
+    values = {
+        "max_string_bytes": 128,
+        "max_string_scan_chunk_bytes": 256,
+        "max_string_scan_file_bytes": 100_000,
+        "max_string_scan_apk_bytes": 100_000,
+        "max_string_scan_milliseconds": 5_000,
+    }
+    values.update(overrides)
+    return replace(StaticApkPolicy(), **values)
+
+
+@pytest.mark.parametrize("position", ("start", "middle", "boundary", "end"))
+def test_oversized_dex_regions_are_scanned_in_overlapping_windows(
+    tmp_path: Path,
+    position: str,
+) -> None:
+    candidate = ";client_secret=REALPRODKEY_9x8y7z6w5v4u;"
+    step = 256 - 128
+    if position == "start":
+        value = candidate + ("A" * 8_000)
+    elif position == "middle":
+        value = ("A" * 4_000) + candidate + ("B" * 4_000)
+    elif position == "boundary":
+        value = ("A" * (step - 5)) + candidate + ("B" * 4_000)
+    else:
+        value = ("A" * 8_000) + candidate
+    apk = tmp_path / f"oversized-{position}.apk"
+    write_apk(apk, build_dex(extra_strings=(value,)))
+
+    result = analyze_apks(
+        (StaticApkInput(apk, f"apk/oversized-{position}"),),
+        policy=_large_region_policy(),
+    )
+
+    assert len(result.secret_candidates) == 1
+    assert result.secret_candidates[0].kind == "named_assignment"
+    assert "oversized_dex_strings_skipped" not in result.limitations
+    assert result.metrics["oversized_dex_strings_scanned"] == 1
+
+
+def test_large_resource_string_is_scanned_after_aapt_handoff(
+    tmp_path: Path,
+) -> None:
+    candidate = ";client_secret=RESOURCESECRET_9x8y7w6v5u4t;"
+    value = ("A" * 5_000) + candidate + ("B" * 5_000)
+    parsed = parse_aapt_strings(f"String #0 : {value}\n")
+    assert len(parsed[0]) == len(value)
+    apk = tmp_path / "large-resource.apk"
+    write_apk(apk, build_dex())
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/large-resource", resource_strings=parsed),),
+        policy=_large_region_policy(),
+    )
+
+    assert len(result.secret_candidates) == 1
+    assert result.secret_candidates[0].location.startswith(
+        "resource_string:0:offset:"
+    )
+
+
+def test_large_text_region_endpoint_and_secret_are_redacted_and_deduplicated(
+    tmp_path: Path,
+) -> None:
+    secret = "TEXTSECRET_9x8y7w6v5u4t"
+    endpoint = "https://api.example.test/v1/items?access_token=token-9x8y7w6"
+    value = ("A" * 5_000) + f';client_secret={secret};"{endpoint}"' + ("B" * 5_000)
+    apk = tmp_path / "large-text.apk"
+    write_apk(apk, build_dex(), entries={"assets/config.txt": value.encode()})
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/large-text"),),
+        policy=_large_region_policy(),
+    )
+    serialized = json.dumps(result.to_dict())
+
+    assert len(result.secret_candidates) == 2
+    assert len(result.endpoints) == 1
+    assert secret not in serialized
+    assert endpoint not in serialized
+    assert result.metrics["string_scan_chunks"] > 1
+
+
+def test_large_binary_noise_does_not_create_string_candidates(tmp_path: Path) -> None:
+    apk = tmp_path / "large-noise.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={"assets/noise.txt": b"\x00\xff" * 100_000},
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/large-noise"),),
+        policy=_large_region_policy(),
+    )
+
+    assert result.secret_candidates == ()
+    assert result.endpoints == ()
+    assert "apk/large-noise:text_entry_binary_content" in result.limitations
+
+
+def test_large_region_budget_stops_without_false_pass(tmp_path: Path) -> None:
+    value = ("A" * 2_000) + ";client_secret=TOO_FAR_9x8y7w6v5u4t;"
+    apk = tmp_path / "budget.apk"
+    write_apk(apk, build_dex(extra_strings=(value,)))
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/budget"),),
+        policy=_large_region_policy(
+            max_string_scan_file_bytes=512,
+            max_string_scan_apk_bytes=512,
+        ),
+    )
+
+    assert result.secret_candidates == ()
+    assert "limit:string_scan_file_bytes" in result.limitations
+    assert "limit:string_scan_apk_bytes" in result.limitations
+
+
+def test_large_region_overlap_is_not_charged_twice_to_budget(tmp_path: Path) -> None:
+    candidate = ";client_secret=WITHIN_UNIQUE_BUDGET_9x8y7w6v5u4t;"
+    value = ("A" * 600) + candidate + ("B" * 2_000)
+    apk = tmp_path / "overlap-budget.apk"
+    write_apk(apk, build_dex(extra_strings=(value,)))
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/overlap-budget"),),
+        policy=_large_region_policy(
+            max_string_scan_file_bytes=1_000,
+            max_string_scan_apk_bytes=1_000,
+        ),
+    )
+
+    assert len(result.secret_candidates) == 1
+    assert result.metrics["string_scan_bytes"] == 1_000
+    assert "limit:string_scan_file_bytes" in result.limitations
+    assert "limit:string_scan_apk_bytes" in result.limitations
+
+
+def test_binary_noise_does_not_join_secret_fragments(tmp_path: Path) -> None:
+    apk = tmp_path / "binary-separator.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={
+            "assets/config.txt": (
+                b"client_sec\xffret=NOT_A_CONTIGUOUS_SECRET_9x8y7w6v5u4t"
+            )
+        },
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/binary-separator"),),
+        policy=_large_region_policy(),
+    )
+
+    assert result.secret_candidates == ()
+
+
+def test_large_region_timeout_is_structured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = ("A" * 8_000) + ";client_secret=AFTER_TIMEOUT_9x8y7w6v5u4t;"
+    apk = tmp_path / "timeout.apk"
+    write_apk(apk, build_dex(extra_strings=(value,)))
+    clock = iter((0.0, 0.0, 10.0))
+    monkeypatch.setattr(static_analysis.time, "monotonic", lambda: next(clock))
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/timeout"),),
+        policy=_large_region_policy(max_string_scan_milliseconds=1),
+    )
+
+    assert result.secret_candidates == ()
+    assert "limit:string_scan_timeout" in result.limitations
+    assert result.metrics["string_scan_timeouts"] == 1
+
+
+def test_oversized_string_does_not_hide_method_inventory(tmp_path: Path) -> None:
+    value = ("A" * 8_000) + ";https://api.example.test/late;"
+    apk = tmp_path / "large-methods.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(value,),
+            methods=(
+                (
+                    "Ldalvik/system/DexClassLoader;",
+                    "loadClass",
+                    ("Ljava/lang/String;",),
+                    "Ljava/lang/Class;",
+                ),
+                ("Landroid/webkit/WebSettings;", "setSavePassword", ("Z",), "V"),
+            ),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "apk/large-methods"),),
+        policy=_large_region_policy(),
+    )
+
+    assert {item.inventory_id for item in result.dynamic_loading_apis} == {
+        "DEX_CLASS_LOADER"
+    }
+    assert {item.policy_id for item in result.api_policy_matches} == {
+        "ANDROID-WEBSETTINGS-SAVE-PASSWORD"
+    }
 
 
 def test_resource_string_limit_never_false_passes_secret_after_sentinel(

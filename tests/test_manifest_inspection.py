@@ -561,7 +561,7 @@ def test_aapt_string_pool_parser_is_bounded_and_deduplicated() -> None:
         "https://api.example.test/v1",
     )
     assert len(values) == 3
-    assert len(values[2]) == 4097
+    assert len(values[2]) == 5000
 
 
 def test_aapt_string_pool_parser_retains_limit_sentinel() -> None:

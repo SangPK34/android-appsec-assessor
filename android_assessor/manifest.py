@@ -279,7 +279,9 @@ _MAX_DEEP_LINK_COMBINATIONS = 256
 _MAX_FILE_PROVIDER_RESOURCES = 16
 _MAX_FILE_PROVIDER_PATH_ENTRIES = 256
 _MAX_RESOURCE_STRINGS = 50_000
-_MAX_RESOURCE_STRING_LENGTH = 4096
+# Keep the AAPT hand-off bounded, but large enough for the static scanner to
+# inspect the value in overlapping windows instead of retaining only a prefix.
+_MAX_RESOURCE_STRING_LENGTH = 8 * 1024 * 1024
 
 
 def _canonical_boolean_numeric(value: int) -> bool | None:

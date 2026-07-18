@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import struct
+import time
 import zlib
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -226,6 +227,11 @@ class StaticApkPolicy:
     max_dex_parameter_references: int = 1_000_000
     max_dex_prototype_bytes: int = 16 * 1024 * 1024
     max_string_bytes: int = 4096
+    max_string_scan_chunk_bytes: int = 64 * 1024
+    max_string_scan_file_bytes: int = 8 * 1024 * 1024
+    max_string_scan_apk_bytes: int = 32 * 1024 * 1024
+    max_string_scan_candidates: int = 1000
+    max_string_scan_milliseconds: int = 5000
     max_resource_strings: int = 50_000
     max_secret_candidates: int = 500
     max_endpoints: int = 500
@@ -246,6 +252,12 @@ class StaticApkPolicy:
             raise ValueError("DEX limit may not exceed the general entry limit.")
         if self.max_dex_bytes > self.max_total_uncompressed_bytes:
             raise ValueError("DEX limit may not exceed the total uncompressed-byte limit.")
+        if self.max_string_scan_chunk_bytes <= self.max_string_bytes:
+            raise ValueError("String scan chunks must exceed the candidate string limit.")
+        if self.max_string_scan_file_bytes < self.max_string_scan_chunk_bytes:
+            raise ValueError("String scan file budget may not be smaller than a chunk.")
+        if self.max_string_scan_apk_bytes < self.max_string_scan_file_bytes:
+            raise ValueError("String scan APK budget may not be smaller than a file budget.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,6 +345,7 @@ class DexInventory:
     strings: tuple[str | None, ...]
     method_references: tuple[DexMethodReference, ...]
     oversized_strings: int
+    oversized_string_regions: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +475,10 @@ class _Collector:
             "dex_method_references": 0,
             "resource_strings_scanned": 0,
             "text_entries_scanned": 0,
+            "string_scan_bytes": 0,
+            "string_scan_chunks": 0,
+            "string_scan_timeouts": 0,
+            "oversized_dex_strings_scanned": 0,
         }
     )
     secret_keys: set[tuple[str, str, str]] = field(default_factory=set)
@@ -472,6 +489,10 @@ class _Collector:
     embedded_keys: set[tuple[str, str]] = field(default_factory=set)
     source_sensitive_values: dict[str, list[str]] = field(default_factory=dict)
     total_declared_bytes: int = 0
+    string_scan_started: dict[str, float] = field(default_factory=dict)
+    string_scan_source_bytes: dict[str, int] = field(default_factory=dict)
+    string_scan_file_bytes: dict[tuple[str, str], int] = field(default_factory=dict)
+    string_scan_timed_out: set[str] = field(default_factory=set)
 
     def limit(self, name: str) -> None:
         message = f"limit:{name}"
@@ -945,14 +966,14 @@ def _read_dex_string(
     offset: int,
     *,
     max_string_bytes: int,
-) -> tuple[str | None, bool, int]:
+) -> tuple[str | None, bool, int, int]:
     if offset < _DEX_HEADER_SIZE or offset >= len(data):
         raise DexFormatError("DEX string data offset is outside the file bounds.")
     declared_length, start = _read_uleb128(data, offset)
     search_end = min(len(data), start + max_string_bytes + 1)
     end = data.find(b"\x00", start, search_end)
     if end < 0:
-        return None, True, max(0, search_end - start)
+        return None, True, max(0, search_end - start), start
     raw = data[start:end]
     code_units: list[int] = []
     position = 0
@@ -991,7 +1012,7 @@ def _read_dex_string(
         raise DexFormatError("DEX string length metadata is inconsistent.")
     encoded_units = b"".join(struct.pack("<H", item) for item in code_units)
     decoded = encoded_units.decode("utf-16-le", errors="surrogatepass")
-    return decoded, False, len(raw)
+    return decoded, False, len(raw), start
 
 
 def parse_dex_inventory(
@@ -1054,9 +1075,11 @@ def parse_dex_inventory(
     )
 
     strings: list[str | None] = []
-    string_cache: dict[int, tuple[str | None, bool, int]] = {}
+    string_cache: dict[int, tuple[str | None, bool, int, int]] = {}
     string_work_bytes = 0
     oversized = 0
+    oversized_regions: list[tuple[int, int]] = []
+    oversized_offsets: set[int] = set()
     for index in range(string_count):
         data_offset = _uint32(data, string_offset + index * 4)
         cached = string_cache.get(data_offset)
@@ -1070,8 +1093,11 @@ def parse_dex_inventory(
             if string_work_bytes > limits.max_dex_string_work_bytes:
                 raise DexFormatError("DEX string decode work exceeds the configured limit.")
             string_cache[data_offset] = cached
-        value, was_oversized, _work_bytes = cached
+        value, was_oversized, _work_bytes, data_start = cached
         oversized += int(was_oversized)
+        if was_oversized and data_offset not in oversized_offsets:
+            oversized_offsets.add(data_offset)
+            oversized_regions.append((index, data_start))
         strings.append(value)
 
     types: list[str | None] = []
@@ -1184,6 +1210,7 @@ def parse_dex_inventory(
         strings=tuple(strings),
         method_references=tuple(methods),
         oversized_strings=oversized,
+        oversized_string_regions=tuple(oversized_regions),
     )
 
 
@@ -1409,9 +1436,20 @@ def _record_secret(
     candidate = _clean_secret_value(value)
     if _is_placeholder(candidate):
         return
+    if len(candidate.encode("utf-8", errors="surrogatepass")) > (
+        collector.policy.max_string_bytes
+    ):
+        collector.limit("string_candidate_bytes")
+        return
     digest = _hash_value(candidate)
     identity = (kind, source_id, digest)
     if identity in collector.secret_keys:
+        return
+    if (
+        len(collector.secrets) + len(collector.endpoints)
+        >= collector.policy.max_string_scan_candidates
+    ):
+        collector.limit("string_scan_candidates")
         return
     if len(collector.secrets) >= collector.policy.max_secret_candidates:
         collector.limit("secret_candidates")
@@ -1477,12 +1515,23 @@ def _record_endpoint(
     location: str,
     value: str,
 ) -> None:
+    if len(value.encode("utf-8", errors="surrogatepass")) > (
+        collector.policy.max_string_bytes
+    ):
+        collector.limit("string_candidate_bytes")
+        return
     parsed = _redact_endpoint(value)
     if parsed is None:
         return
     digest = _hash_value(value.rstrip(".,;:)]}"))
     identity = (source_id, digest)
     if identity in collector.endpoint_keys:
+        return
+    if (
+        len(collector.secrets) + len(collector.endpoints)
+        >= collector.policy.max_string_scan_candidates
+    ):
+        collector.limit("string_scan_candidates")
         return
     if len(collector.endpoints) >= collector.policy.max_endpoints:
         collector.limit("endpoints")
@@ -1502,17 +1551,85 @@ def _record_endpoint(
     )
 
 
-def _scan_text(
+def _string_scan_timed_out(collector: _Collector, source_id: str) -> bool:
+    if source_id in collector.string_scan_timed_out:
+        return True
+    now = time.monotonic()
+    started = collector.string_scan_started.get(source_id)
+    if started is None:
+        collector.string_scan_started[source_id] = now
+        return False
+    elapsed_ms = (now - started) * 1000
+    if elapsed_ms < collector.policy.max_string_scan_milliseconds:
+        return False
+    collector.string_scan_timed_out.add(source_id)
+    collector.metrics["string_scan_timeouts"] += 1
+    collector.limit("string_scan_timeout")
+    return True
+
+
+def _claim_string_scan_bytes(
+    collector: _Collector,
+    *,
+    source_id: str,
+    file_key: str,
+    requested: int,
+) -> int:
+    if requested <= 0 or _string_scan_timed_out(collector, source_id):
+        return 0
+    if (
+        len(collector.secrets) + len(collector.endpoints)
+        >= collector.policy.max_string_scan_candidates
+    ):
+        collector.limit("string_scan_candidates")
+        return 0
+    file_identity = (source_id, file_key)
+    file_used = collector.string_scan_file_bytes.get(file_identity, 0)
+    source_used = collector.string_scan_source_bytes.get(source_id, 0)
+    file_remaining = collector.policy.max_string_scan_file_bytes - file_used
+    source_remaining = collector.policy.max_string_scan_apk_bytes - source_used
+    allowed = min(requested, max(0, file_remaining), max(0, source_remaining))
+    if allowed < requested:
+        if file_remaining <= source_remaining:
+            collector.limit("string_scan_file_bytes")
+        if source_remaining <= file_remaining:
+            collector.limit("string_scan_apk_bytes")
+    if allowed <= 0:
+        return 0
+    collector.string_scan_file_bytes[file_identity] = file_used + allowed
+    collector.string_scan_source_bytes[source_id] = source_used + allowed
+    collector.metrics["string_scan_bytes"] += allowed
+    collector.metrics["string_scan_chunks"] += 1
+    return allowed
+
+
+def _accepted_scan_match(
+    match: re.Match[str],
+    *,
+    text_length: int,
+    final: bool,
+) -> bool:
+    if not final and match.end() >= text_length:
+        return False
+    return True
+
+
+def _scan_text_window(
     collector: _Collector,
     *,
     source_id: str,
     location: str,
-    value: str,
+    bounded: str,
+    final: bool,
 ) -> None:
-    if len(value) > collector.policy.max_string_bytes:
-        collector.limit("string_scan_bytes")
-    bounded = value[: collector.policy.max_string_bytes]
+    text_length = len(bounded)
     for match in _PRIVATE_KEY_HEADER_PATTERN.finditer(bounded):
+        if not _accepted_scan_match(
+            match,
+            text_length=text_length,
+            final=final,
+        ):
+            continue
         _record_secret(
             collector,
             kind="private_key_pem",
@@ -1524,6 +1641,12 @@ def _scan_text(
         )
     for pattern_name, pattern, confidence in _KNOWN_SECRET_PATTERNS:
         for match in pattern.finditer(bounded):
+            if not _accepted_scan_match(
+                match,
+                text_length=text_length,
+                final=final,
+            ):
+                continue
             secret = match.group(1) if pattern_name == "bearer_token" else match.group(0)
             _record_secret(
                 collector,
@@ -1535,6 +1658,12 @@ def _scan_text(
                 value=secret,
             )
     for match in _ASSIGNED_SECRET_PATTERN.finditer(bounded):
+        if not _accepted_scan_match(
+            match,
+            text_length=text_length,
+            final=final,
+        ):
+            continue
         key = match.group("key")
         if not is_sensitive_name(key) and not _is_sensitive_assignment_key(key):
             continue
@@ -1548,6 +1677,12 @@ def _scan_text(
             value=match.group("value"),
         )
     for match in _URL_PATTERN.finditer(bounded):
+        if not _accepted_scan_match(
+            match,
+            text_length=text_length,
+            final=final,
+        ):
+            continue
         url = match.group(0)
         try:
             password = urlsplit(url.rstrip(".,;:)]}")).password
@@ -1569,6 +1704,149 @@ def _scan_text(
             location=location,
             value=url,
         )
+
+
+def _scan_encoded_region(
+    collector: _Collector,
+    *,
+    source_id: str,
+    file_key: str,
+    location: str,
+    value: bytes | memoryview,
+    complete: bool,
+) -> None:
+    chunk_size = collector.policy.max_string_scan_chunk_bytes
+    overlap = min(collector.policy.max_string_bytes, chunk_size - 1)
+    step = chunk_size - overlap
+    total = len(value)
+    offset = 0
+    covered_end = 0
+    multi_window = total > chunk_size or not complete
+    while offset < total:
+        desired_end = min(offset + chunk_size, total)
+        new_bytes_requested = max(0, desired_end - covered_end)
+        new_bytes_allowed = _claim_string_scan_bytes(
+            collector,
+            source_id=source_id,
+            file_key=file_key,
+            requested=new_bytes_requested,
+        )
+        if new_bytes_allowed <= 0:
+            return
+        window_end = covered_end + new_bytes_allowed
+        raw_window = bytes(value[offset:window_end])
+        reached_end = window_end >= total
+        final = complete and reached_end
+        bounded = raw_window.decode("utf-8", errors="replace")
+        window_location = (
+            f"{location}:offset:{offset}" if multi_window else location
+        )
+        _scan_text_window(
+            collector,
+            source_id=source_id,
+            location=window_location,
+            bounded=bounded,
+            final=final,
+        )
+        covered_end = window_end
+        if new_bytes_allowed < new_bytes_requested or reached_end:
+            return
+        offset = max(offset + step, covered_end - overlap)
+
+
+def _bounded_dex_string_end(
+    collector: _Collector,
+    *,
+    source_id: str,
+    file_key: str,
+    data: bytes,
+    data_start: int,
+) -> tuple[int, bool] | None:
+    file_used = collector.string_scan_file_bytes.get((source_id, file_key), 0)
+    source_used = collector.string_scan_source_bytes.get(source_id, 0)
+    file_remaining = collector.policy.max_string_scan_file_bytes - file_used
+    source_remaining = collector.policy.max_string_scan_apk_bytes - source_used
+    available = min(max(0, file_remaining), max(0, source_remaining))
+    if available <= 0:
+        _claim_string_scan_bytes(
+            collector,
+            source_id=source_id,
+            file_key=file_key,
+            requested=1,
+        )
+        return None
+    maximum = min(len(data), data_start + available)
+    position = data_start
+    while position < maximum:
+        if _string_scan_timed_out(collector, source_id):
+            return None
+        chunk_end = min(
+            position + collector.policy.max_string_scan_chunk_bytes,
+            maximum,
+        )
+        terminator = data.find(b"\x00", position, chunk_end)
+        if terminator >= 0:
+            return terminator, True
+        position = chunk_end
+    if maximum < len(data):
+        if file_remaining <= source_remaining:
+            collector.limit("string_scan_file_bytes")
+        if source_remaining <= file_remaining:
+            collector.limit("string_scan_apk_bytes")
+    else:
+        collector.problem(source_id, "unterminated_dex_string")
+    return maximum, False
+
+
+def _scan_dex_oversized_region(
+    collector: _Collector,
+    *,
+    source_id: str,
+    dex_entry: str,
+    string_index: int,
+    data: bytes,
+    data_start: int,
+) -> None:
+    bounded_end = _bounded_dex_string_end(
+        collector,
+        source_id=source_id,
+        file_key=dex_entry,
+        data=data,
+        data_start=data_start,
+    )
+    if bounded_end is None:
+        return
+    end, complete = bounded_end
+    if end <= data_start:
+        return
+    _scan_encoded_region(
+        collector,
+        source_id=source_id,
+        file_key=dex_entry,
+        location=f"{dex_entry}:string:{string_index}",
+        value=memoryview(data)[data_start:end],
+        complete=complete,
+    )
+    collector.metrics["oversized_dex_strings_scanned"] += 1
+
+
+def _scan_text(
+    collector: _Collector,
+    *,
+    source_id: str,
+    location: str,
+    value: str,
+    file_key: str,
+) -> None:
+    encoded = value.encode("utf-8", errors="surrogatepass")
+    _scan_encoded_region(
+        collector,
+        source_id=source_id,
+        file_key=file_key,
+        location=location,
+        value=encoded,
+        complete=True,
+    )
 
 
 def _record_method_reference(
@@ -1795,8 +2073,6 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
                     collector.metrics["dex_method_references"] += len(
                         inventory.method_references
                     )
-                    if inventory.oversized_strings:
-                        collector.problem(item.source_id, "oversized_dex_strings_skipped")
                     for index, value in enumerate(inventory.strings):
                         if value is not None:
                             _scan_text(
@@ -1804,7 +2080,17 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
                                 source_id=item.source_id,
                                 location=f"{info.filename}:string:{index}",
                                 value=value,
+                                file_key=info.filename,
                             )
+                    for index, data_start in inventory.oversized_string_regions:
+                        _scan_dex_oversized_region(
+                            collector,
+                            source_id=item.source_id,
+                            dex_entry=info.filename,
+                            string_index=index,
+                            data=data,
+                            data_start=data_start,
+                        )
                     for reference in inventory.method_references:
                         _record_method_reference(
                             collector,
@@ -1835,6 +2121,7 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
                             source_id=item.source_id,
                             location=f"{info.filename}:line:{index + 1}",
                             value=line,
+                            file_key=info.filename,
                         )
     except (BadZipFile, LargeZipFile, OSError, ValueError):
         collector.problem(item.source_id, "invalid_apk_archive")
@@ -1881,6 +2168,7 @@ def analyze_apks(
                 source_id=item.source_id,
                 location=f"resource_string:{index}",
                 value=str(value),
+                file_key="resource_strings",
             )
         if len(item.resource_strings) > limits.max_resource_strings:
             collector.limit("resource_strings")
