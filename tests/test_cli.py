@@ -113,3 +113,63 @@ def test_controlled_canary_cli_requires_autonomous_full_profile(tmp_path) -> Non
             args,
             SimpleNamespace(paths=ProjectPaths(tmp_path)),  # type: ignore[arg-type]
         )
+
+
+def test_auto_cli_enables_bounded_controlled_exploration(tmp_path, monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeScanService:
+        def __init__(self, _context: object) -> None:
+            pass
+
+        def scan(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(kwargs)
+            return SimpleNamespace(to_dict=lambda: {"status": "completed"})
+
+    monkeypatch.setattr(cli, "ScanService", FakeScanService)
+    args = build_parser().parse_args(
+        [
+            "scan",
+            "--package",
+            "com.example.lab",
+            "--auto",
+            "--max-runtime",
+            "41",
+            "--json",
+        ]
+    )
+
+    assert cli._run_scan(  # type: ignore[attr-defined]
+        args,
+        SimpleNamespace(paths=ProjectPaths(tmp_path)),  # type: ignore[arg-type]
+    ) == 0
+    assert calls[0]["profile"] == "full"
+    assert calls[0]["autonomous"] is True
+    assert calls[0]["runtime_seconds"] == 41
+    assert calls[0]["controlled_canary"] is True
+    config = calls[0]["explorer_config"]
+    assert isinstance(config, ExplorerConfig)
+    assert config.per_action_timeout_seconds == 8
+    assert config.max_observation_retries == 2
+    assert config.max_action_failures == 4
+
+
+def test_auto_cli_cannot_combine_deterministic_scenario(tmp_path) -> None:
+    args = build_parser().parse_args(
+        [
+            "scan",
+            "--package",
+            "com.example.lab",
+            "--auto",
+            "--scenario-profile",
+            "profile.yaml",
+            "--scenario",
+            "scenario.yaml",
+        ]
+    )
+
+    with pytest.raises(AndroidAssessorError, match="cannot be combined"):
+        cli._run_scan(  # type: ignore[attr-defined]
+            args,
+            SimpleNamespace(paths=ProjectPaths(tmp_path)),  # type: ignore[arg-type]
+        )

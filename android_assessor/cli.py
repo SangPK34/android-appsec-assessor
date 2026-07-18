@@ -93,6 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Enable bounded package-scoped UI exploration for a full assessment.",
     )
+    scan.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Run a full bounded assessment without UI prompts; enables autonomous "
+            "exploration and scoped controlled-canary activation."
+        ),
+    )
     scan.add_argument("--max-runtime", type=int, default=None)
     scan.add_argument("--max-actions", type=int, default=100)
     scan.add_argument("--max-states", type=int, default=40)
@@ -325,13 +333,19 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
     if bool(args.package) == bool(args.session_id):
         raise AndroidAssessorError("Provide exactly one of --package or --session.")
     service = ScanService(context)
+    auto_mode = bool(args.auto)
     if bool(args.scenario_profile) != bool(args.scenario):
         raise AndroidAssessorError(
             "Use --scenario-profile and --scenario together for deterministic activation."
         )
+    if auto_mode and (args.scenario_profile is not None or args.scenario is not None):
+        raise AndroidAssessorError("--auto cannot be combined with a deterministic scenario.")
+    if auto_mode and args.autonomous is False:
+        raise AndroidAssessorError("--auto cannot be combined with --no-autonomous.")
+    scan_profile = ScanProfile.FULL.value if auto_mode else args.profile
     scenario_request = None
     if args.scenario_profile is not None:
-        if args.profile != ScanProfile.FULL.value:
+        if scan_profile != ScanProfile.FULL.value:
             raise AndroidAssessorError("Deterministic scenarios require a Full Assessment.")
         if args.autonomous is True:
             raise AndroidAssessorError(
@@ -350,13 +364,16 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
     if args.runtime_seconds is not None and args.max_runtime is not None:
         raise AndroidAssessorError("Use only one of --runtime-seconds or --max-runtime.")
     max_runtime = args.max_runtime if args.max_runtime is not None else args.runtime_seconds
-    if max_runtime == 0 and args.autonomous is True:
+    if max_runtime == 0 and (args.autonomous is True or auto_mode):
         raise AndroidAssessorError("--autonomous requires a runtime greater than zero.")
-    autonomous = False if max_runtime == 0 and args.autonomous is None else args.autonomous
+    autonomous = True if auto_mode else (
+        False if max_runtime == 0 and args.autonomous is None else args.autonomous
+    )
     if scenario_request is not None:
         autonomous = False
-    if args.controlled_canary and (
-        args.profile != ScanProfile.FULL.value
+    controlled_canary = args.controlled_canary or auto_mode
+    if controlled_canary and (
+        scan_profile != ScanProfile.FULL.value
         or autonomous is False
         or max_runtime == 0
     ):
@@ -365,7 +382,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
         )
     explorer_config = None
     if (
-        args.profile == ScanProfile.FULL.value
+        scan_profile == ScanProfile.FULL.value
         and autonomous is not False
         and max_runtime != 0
     ):
@@ -379,26 +396,29 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
             max_states=args.max_states,
             plateau_seconds=args.plateau_seconds,
             seed=args.seed,
+            per_action_timeout_seconds=8 if auto_mode else 3,
+            max_observation_retries=2 if auto_mode else 1,
+            max_action_failures=4 if auto_mode else 3,
         )
     if args.session_id:
         result = service.scan_session(
             args.session_id,
-            profile=args.profile,
+            profile=scan_profile,
             runtime_seconds=max_runtime,
             autonomous=autonomous,
             explorer_config=explorer_config,
-            controlled_canary=args.controlled_canary,
+            controlled_canary=controlled_canary,
             scenario_request=scenario_request,
         )
     else:
         result = service.scan(
             package=args.package,
             serial=args.serial,
-            profile=args.profile,
+            profile=scan_profile,
             runtime_seconds=max_runtime,
             autonomous=autonomous,
             explorer_config=explorer_config,
-            controlled_canary=args.controlled_canary,
+            controlled_canary=controlled_canary,
             scenario_request=scenario_request,
         )
     payload = result.to_dict()
