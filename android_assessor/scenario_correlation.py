@@ -257,6 +257,7 @@ def _correlate_event(
         if not _has_exact_owned_match(event):
             raise _RejectedEvent("logcat_match_not_exact")
 
+    eligible = _eligible_for_confirmation(observer, event, fingerprint)
     return {
         "session_id": context.session_id,
         "scenario_id": context.scenario_id,
@@ -268,10 +269,12 @@ def _correlate_event(
         "observer": observer,
         "canary_fingerprint": fingerprint,
         "evidence_id": evidence_id,
-        "eligible_for_confirmation": _eligible_for_confirmation(
-            observer, event, fingerprint
+        "eligible_for_confirmation": eligible,
+        "rejection_reason": (
+            None
+            if eligible
+            else _confirmation_ineligibility_reason(observer, event, fingerprint)
         ),
-        "rejection_reason": None,
         "attributes": _safe_attributes(event, observer=observer),
     }
 
@@ -397,6 +400,31 @@ def _eligible_for_confirmation(
     if observer == "logcat":
         return fingerprint is not None and _has_exact_owned_match(event)
     return _operation_completed(event, observer)
+
+
+def _confirmation_ineligibility_reason(
+    observer: str,
+    event: Mapping[str, Any],
+    fingerprint: str | None,
+) -> str:
+    """Explain why a correlated event is not evidence for confirmation."""
+
+    if observer == "logcat":
+        return "logcat_missing_exact_owned_value"
+    if observer == "frida":
+        category = event.get("category")
+        if category == "crypto":
+            return "crypto_operation_not_completed"
+        if category == "logging":
+            return (
+                "logging_event_missing_exact_canary_or_owned_value"
+                if fingerprint is None
+                else "logging_sink_not_confirmation_eligible"
+            )
+        if category == "storage":
+            return "storage_sink_missing_activated_plaintext_write"
+        return "frida_event_not_confirmation_eligible"
+    return "observer_not_confirmation_eligible"
 
 
 def _safe_attributes(

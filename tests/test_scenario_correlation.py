@@ -305,6 +305,10 @@ def test_non_owned_log_event_is_correlated_but_not_confirmation_eligible() -> No
 
     assert result.rejected == ()
     assert result.events[0]["eligible_for_confirmation"] is False
+    assert (
+        result.events[0]["rejection_reason"]
+        == "logcat_missing_exact_owned_value"
+    )
     assert result.events[0]["canary_fingerprint"] is None
     assert "must-never-survive" not in str(result.to_dict())
     assert "password" not in result.events[0]["attributes"]
@@ -322,6 +326,23 @@ def test_frida_step_outcome_does_not_replace_completed_operation_evidence() -> N
 
     assert result.rejected == ()
     assert result.events[0]["eligible_for_confirmation"] is False
+    assert result.events[0]["rejection_reason"] == "frida_event_not_confirmation_eligible"
+
+
+def test_incomplete_frida_crypto_event_reports_operation_reason() -> None:
+    event = {
+        **_base_event(),
+        "evidence_id": "event-evidence",
+        "category": "crypto",
+        "method": "cipher.do_final",
+        "arguments_redacted": [{"operation_id": "crypto-1", "executed": False}],
+    }
+
+    result = correlate_scenario_events(_summary(), frida_events=[event])
+
+    assert result.rejected == ()
+    assert result.events[0]["eligible_for_confirmation"] is False
+    assert result.events[0]["rejection_reason"] == "crypto_operation_not_completed"
 
 
 def test_frida_redacted_executed_metadata_is_confirmation_eligible() -> None:
