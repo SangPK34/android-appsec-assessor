@@ -351,12 +351,22 @@ class CleanupExecutor:
         while time.monotonic() < deadline:
             if not _remote_process_exists(self.adb, record.serial, pid):
                 return CleanupActionStatus.COMPLETED
-            current = capture_remote_process_identity(
-                self.adb,
-                record.serial,
-                pid,
-                executable_path,
-            )
+            try:
+                current = capture_remote_process_identity(
+                    self.adb,
+                    record.serial,
+                    pid,
+                    executable_path,
+                )
+            except CleanupError:
+                # The process can exit between the /proc existence check and
+                # identity reads. Re-check before treating that normal teardown
+                # race as a cleanup failure; persistent probe failures still
+                # reach the bounded timeout below.
+                if not _remote_process_exists(self.adb, record.serial, pid):
+                    return CleanupActionStatus.COMPLETED
+                time.sleep(0.1)
+                continue
             if current.proc_start_time != expected_start:
                 return CleanupActionStatus.COMPLETED
             time.sleep(0.1)

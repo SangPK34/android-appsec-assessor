@@ -43,6 +43,7 @@ class RemoteAdb:
         command_line: str,
         kill_effective: bool = True,
         existence_probe_fails: bool = False,
+        exit_during_post_kill_identity_probe: bool = False,
     ) -> None:
         self.pid = pid
         self.executable = executable
@@ -50,6 +51,9 @@ class RemoteAdb:
         self.command_line = command_line
         self.kill_effective = kill_effective
         self.existence_probe_fails = existence_probe_fails
+        self.exit_during_post_kill_identity_probe = (
+            exit_during_post_kill_identity_probe
+        )
         self.exists = True
         self.kill_calls = 0
 
@@ -69,6 +73,9 @@ class RemoteAdb:
                 return result(exit_code=1)
             return result(stdout="EXISTS\n" if self.exists else "MISSING\n")
         if command == f"readlink /proc/{self.pid}/exe":
+            if self.kill_calls and self.exit_during_post_kill_identity_probe:
+                self.exists = False
+                return result(exit_code=1)
             return result(stdout=self.executable + "\n")
         if command == f"cat /proc/{self.pid}/stat":
             return result(stdout=proc_stat(self.pid, self.start_time) + "\n")
@@ -76,7 +83,7 @@ class RemoteAdb:
             return result(stdout=self.command_line)
         if command == f"kill {self.pid}":
             self.kill_calls += 1
-            if self.kill_effective:
+            if self.kill_effective and not self.exit_during_post_kill_identity_probe:
                 self.exists = False
             return result()
         raise AssertionError(f"Unexpected shell command: {arguments}")
@@ -174,6 +181,30 @@ def test_frida_cleanup_reports_failure_when_kill_has_no_effect(tmp_path: Path) -
     assert cleanup.success is False
     assert adb.kill_calls == 1
     assert adb.exists is True
+
+
+def test_frida_cleanup_accepts_exit_during_post_kill_identity_probe(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id, pid, remote, payload = prepared_process_session(tmp_path)
+    repository.record_cleanup_action(
+        session_id,
+        CleanupActionType.STOP_REMOTE_PROCESS,
+        payload,
+    )
+    adb = RemoteAdb(
+        pid=pid,
+        executable=remote,
+        start_time="100",
+        command_line=remote + "\x00",
+        exit_during_post_kill_identity_probe=True,
+    )
+
+    cleanup = CleanupExecutor(paths, repository, adb).cleanup(session_id)  # type: ignore[arg-type]
+
+    assert cleanup.success is True
+    assert adb.kill_calls == 1
+    assert adb.exists is False
 
 
 def test_preexisting_frida_server_without_session_action_is_not_stopped(
