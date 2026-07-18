@@ -89,6 +89,33 @@ VALIDATION_DEFINITIONS: tuple[ValidationDefinition, ...] = (
         production_enabled=True,
     ),
     ValidationDefinition(
+        validation_id="world_readable_storage_receiver_probe",
+        rule_id="STORAGE-WORLD-READABLE",
+        validation_type="root_assisted_validation",
+        preconditions=(
+            "Active scoped session",
+            "Static file-mode call-site in an exported receiver",
+            "Root-assisted private-storage inventory",
+        ),
+        required_capabilities=("ADB_AUTHORIZED", "ANDROID_ROOT", "APP_DATA_READ"),
+        required_actions=("controlled_validation", "root_storage_read"),
+        expected_observable_effect=(
+            "A bounded receiver broadcast is followed by private-storage metadata "
+            "showing a world-readable package artifact."
+        ),
+        negative_case=(
+            "The receiver broadcast completes and bounded private-storage inventory "
+            "finds no world-readable package artifact."
+        ),
+        evidence_requirements=(
+            "Bounded am broadcast output",
+            "Redacted private-storage metadata",
+        ),
+        cleanup_plan=("No framework-owned persistent resource expected",),
+        timeout_seconds=30,
+        production_enabled=True,
+    ),
+    ValidationDefinition(
         validation_id="shared_preferences_canary",
         rule_id=None,
         validation_type="root_assisted_validation",

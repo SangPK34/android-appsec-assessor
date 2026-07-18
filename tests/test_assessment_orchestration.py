@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from android_assessor.errors import AndroidAssessorError, ScopeError
 from android_assessor.evidence import EvidenceRepository
 from android_assessor.explorer import ExplorerConfig
 from android_assessor.findings import FindingStatus
@@ -123,6 +124,37 @@ def test_direct_scan_uses_legacy_quick_default(
     assert captured["profile"] is ScanProfile.QUICK
     assert captured["autonomous"] is None
     assert captured["explorer_config"] is None
+    assert captured["controlled_canary"] is False
+
+
+def test_direct_scan_rejects_controlled_delivery_config_before_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = ProjectPaths(tmp_path / "lab")
+    paths.ensure_layout()
+    service = ScanService(SimpleNamespace(paths=paths))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "android_assessor.services.scan_service.AppInspectionService",
+        lambda *_args, **_kwargs: pytest.fail("inspection must not start"),
+    )
+    monkeypatch.setattr(
+        "android_assessor.services.scan_service.ExplorerService",
+        lambda *_args, **_kwargs: pytest.fail("explorer must not start"),
+    )
+
+    with pytest.raises(
+        AndroidAssessorError,
+        match=r"controlled_canary=True",
+    ):
+        service.scan(
+            package="com.example.app",
+            serial="FAKE_SERIAL",
+            profile="full",
+            autonomous=True,
+            explorer_config=ExplorerConfig(controlled_canary_delivery=True),
+        )
 
 
 def test_direct_scan_session_uses_legacy_profile_without_autonomous(
@@ -150,6 +182,65 @@ def test_direct_scan_session_uses_legacy_profile_without_autonomous(
     assert isinstance(resolution, ScanProfileResolution)
     assert resolution.effective_profile is ScanProfile.FULL
     assert resolution.autonomous_exploration_enabled is False
+
+
+def test_direct_scan_session_rejects_controlled_delivery_config_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    service = ScanService(SimpleNamespace(paths=paths), repository)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        repository,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("session must not load"),
+    )
+    monkeypatch.setattr(
+        "android_assessor.services.scan_service.ExplorerService",
+        lambda *_args, **_kwargs: pytest.fail("explorer must not start"),
+    )
+
+    with pytest.raises(
+        AndroidAssessorError,
+        match=r"controlled_canary=True",
+    ):
+        service.scan_session(
+            session_id,
+            profile="full",
+            autonomous=True,
+            explorer_config=ExplorerConfig(controlled_canary_delivery=True),
+        )
+
+
+def test_controlled_canary_scan_is_denied_before_execution_without_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    paths.scope_file.write_text(
+        "devices: [emulator-5554]\n"
+        "packages: [com.example.app]\n"
+        "api_hosts: [10.0.2.2]\n"
+        "allowed_actions: [inspect, autonomous_exploration, traffic_capture, "
+        "frida_observe]\n",
+        encoding="utf-8",
+    )
+    service = ScanService(SimpleNamespace(paths=paths), repository)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        service,
+        "_scan_session_locked",
+        lambda *_args, **_kwargs: pytest.fail("scan must not start"),
+    )
+
+    with pytest.raises(ScopeError, match="controlled_validation"):
+        service.scan_session(
+            session_id,
+            profile="full",
+            autonomous=True,
+            explorer_config=ExplorerConfig(max_runtime_seconds=1),
+            controlled_canary=True,
+        )
 
 
 def test_full_assessment_finalization_cleans_session_and_regenerates_final_report(
@@ -241,11 +332,64 @@ def test_full_assessment_exception_still_runs_owned_resource_cleanup(
 
 
 @pytest.mark.parametrize(
-    ("profile", "traffic_fails", "expected_dynamic_calls"),
+    (
+        "profile",
+        "traffic_fails",
+        "controlled_canary",
+        "explorer_termination",
+        "target_limit_reason",
+        "expected_dynamic_calls",
+    ),
     [
-        (ScanProfile.QUICK, False, []),
-        (ScanProfile.FULL, False, ["traffic", "frida", "explorer", "storage"]),
-        (ScanProfile.FULL, True, ["traffic", "storage"]),
+        (ScanProfile.QUICK, False, False, "coverage_plateau", None, []),
+        (
+            ScanProfile.FULL,
+            False,
+            False,
+            "coverage_plateau",
+            None,
+            ["traffic", "frida", "explorer", "storage"],
+        ),
+        (
+            ScanProfile.FULL,
+            True,
+            False,
+            "coverage_plateau",
+            None,
+            ["traffic", "storage"],
+        ),
+        (
+            ScanProfile.FULL,
+            False,
+            True,
+            "coverage_plateau",
+            None,
+            ["traffic", "frida", "explorer", "storage"],
+        ),
+        (
+            ScanProfile.FULL,
+            False,
+            False,
+            "max_actions",
+            None,
+            ["traffic", "frida", "explorer", "storage"],
+        ),
+        (
+            ScanProfile.FULL,
+            False,
+            False,
+            "coverage_plateau",
+            "max_states",
+            ["traffic", "frida", "explorer", "storage"],
+        ),
+        (
+            ScanProfile.FULL,
+            False,
+            False,
+            "coverage_plateau",
+            "scope_denied",
+            ["traffic", "frida", "explorer", "storage"],
+        ),
     ],
 )
 def test_scan_profile_starts_only_planned_controllers(
@@ -253,6 +397,9 @@ def test_scan_profile_starts_only_planned_controllers(
     monkeypatch: pytest.MonkeyPatch,
     profile: ScanProfile,
     traffic_fails: bool,
+    controlled_canary: bool,
+    explorer_termination: str,
+    target_limit_reason: str | None,
     expected_dynamic_calls: list[str],
 ) -> None:
     paths = ProjectPaths(tmp_path / "lab")
@@ -262,7 +409,7 @@ def test_scan_profile_starts_only_planned_controllers(
         "packages: [com.example.app]\n"
         "api_hosts: [10.0.2.2]\n"
         "allowed_actions: [inspect, traffic_capture, frida_observe, "
-        "autonomous_exploration]\n",
+        "autonomous_exploration, controlled_validation]\n",
         encoding="utf-8",
     )
     repository = SessionRepository(paths)
@@ -331,12 +478,38 @@ def test_scan_profile_starts_only_planned_controllers(
             canaries["explorer"] = _kwargs.get(  # type: ignore[assignment]
                 "session_canary"
             )
-            return SimpleNamespace(
-                status="completed",
-                termination_reason="coverage_plateau",
-                runtime_categories=(),
-                to_dict=lambda: {"status": "completed", "states_visited": 2},
-            )
+            config = _kwargs["config"]
+            assert isinstance(config, ExplorerConfig)
+            assert config.controlled_canary_delivery is controlled_canary
+            result: dict[str, object] = {
+                "status": "completed",
+                "termination_reason": explorer_termination,
+                "runtime_categories": (),
+                "controlled_canary_inputs": 1 if controlled_canary else 0,
+                "to_dict": lambda: {"status": "completed", "states_visited": 2},
+            }
+            if (
+                explorer_termination in {"max_runtime", "max_actions", "max_states"}
+                or target_limit_reason is not None
+            ):
+                result.update(
+                    actions_executed=7,
+                    states_visited=2,
+                    activity_attempts=(
+                        {
+                            "component": "org.private.HiddenActivity",
+                            "status": "blocked" if target_limit_reason else "opened",
+                            "reason": target_limit_reason,
+                        },
+                    ),
+                    deep_link_attempts=(
+                        {
+                            "component": "org.private.HiddenActivity",
+                            "status": "opened",
+                        },
+                    ),
+                )
+            return SimpleNamespace(**result)
 
     class Rules:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -379,6 +552,7 @@ def test_scan_profile_starts_only_planned_controllers(
         ),
         runtime_seconds=0,
         explorer_config=explorer_config,
+        controlled_canary=controlled_canary,
     )
 
     assert calls == expected_dynamic_calls
@@ -397,11 +571,42 @@ def test_scan_profile_starts_only_planned_controllers(
     assert scan["autonomous_exploration_executed"] is (
         profile is ScanProfile.FULL and not traffic_fails
     )
+    assert scan["controlled_canary_requested"] is controlled_canary
+    assert scan["controlled_canary_executed"] is (
+        controlled_canary and not traffic_fails
+    )
+    assert result.controlled_canary_requested is controlled_canary
+    assert result.controlled_canary_executed is (
+        controlled_canary and not traffic_fails
+    )
     assert scan["runtime_termination"] in {
         "coverage_plateau",
         "completed_no_wait",
+        "max_actions",
         "not_started",
     }
+    explorer_executed = profile is ScanProfile.FULL and not traffic_fails
+    if explorer_executed:
+        assert scan["runtime_termination"] == explorer_termination
+    coverage_limitations = [
+        item
+        for item in result.limitations
+        if item.startswith("Autonomous exploration coverage was bounded:")
+    ]
+    expected_coverage_limitation = explorer_executed and (
+        explorer_termination in {"max_runtime", "max_actions", "max_states"}
+        or target_limit_reason
+        in {"hard_limit", "insufficient_action_budget", "max_actions", "max_states"}
+    )
+    assert bool(coverage_limitations) is expected_coverage_limitation
+    if coverage_limitations:
+        limitation = coverage_limitations[0]
+        assert f"termination={explorer_termination}" in limitation
+        assert "actions=7" in limitation
+        assert "states=2" in limitation
+        assert "targeted activity attempts=1" in limitation
+        assert "targeted deep-link attempts=1" in limitation
+        assert "org.private" not in limitation
     assert "runtime_analysis" in result.phase_timings
     if profile is ScanProfile.FULL:
         propagated = [value for value in canaries.values() if value is not None]

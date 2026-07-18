@@ -62,6 +62,7 @@ def build_dex(
     *,
     extra_strings: tuple[str, ...] = (),
     methods: tuple[tuple[str, str, tuple[str, ...], str], ...] = (),
+    method_bodies: tuple[tuple[int, int, tuple[int, ...]], ...] = (),
 ) -> bytes:
     strings: list[str] = []
 
@@ -101,7 +102,13 @@ def build_dex(
     cursor += len(prototypes) * 12
     method_ids_offset = cursor if methods else 0
     cursor += len(methods) * 8
+    body_classes = sorted(
+        {methods[method_index][0] for method_index, _registers, _insns in method_bodies}
+    )
+    class_defs_offset = cursor if body_classes else 0
+    cursor += len(body_classes) * 32
     cursor = (cursor + 3) & ~3
+    data_offset = cursor
 
     parameter_offsets: dict[tuple[str, ...], int] = {}
     type_list_data = bytearray()
@@ -115,6 +122,43 @@ def build_dex(
         for parameter in parameters:
             type_list_data.extend(struct.pack("<H", types.index(parameter)))
     cursor += len(type_list_data)
+
+    code_offsets: dict[int, int] = {}
+    code_item_data = bytearray()
+    for method_index, registers_size, insns in sorted(method_bodies):
+        assert 0 <= method_index < len(methods)
+        assert method_index not in code_offsets
+        while (cursor + len(code_item_data)) % 4:
+            code_item_data.append(0)
+        code_offsets[method_index] = cursor + len(code_item_data)
+        code_item_data.extend(
+            struct.pack("<HHHHII", registers_size, 0, 5, 0, 0, len(insns))
+        )
+        code_item_data.extend(struct.pack(f"<{len(insns)}H", *insns))
+    cursor += len(code_item_data)
+
+    class_data_offsets: dict[str, int] = {}
+    class_data = bytearray()
+    for class_descriptor in body_classes:
+        class_data_offsets[class_descriptor] = cursor + len(class_data)
+        method_indexes = sorted(
+            method_index
+            for method_index, _registers, _insns in method_bodies
+            if methods[method_index][0] == class_descriptor
+        )
+        class_data.extend(_uleb128(0))
+        class_data.extend(_uleb128(0))
+        class_data.extend(_uleb128(len(method_indexes)))
+        class_data.extend(_uleb128(0))
+        previous = 0
+        for position, method_index in enumerate(method_indexes):
+            class_data.extend(
+                _uleb128(method_index if position == 0 else method_index - previous)
+            )
+            class_data.extend(_uleb128(0x09))
+            class_data.extend(_uleb128(code_offsets[method_index]))
+            previous = method_index
+    cursor += len(class_data)
 
     string_offsets: list[int] = []
     string_data = bytearray()
@@ -134,9 +178,9 @@ def build_dex(
     struct.pack_into("<II", value, 0x40, len(types), type_ids_offset)
     struct.pack_into("<II", value, 0x48, len(prototypes), proto_ids_offset)
     struct.pack_into("<II", value, 0x58, len(methods), method_ids_offset)
-    data_offset = 0x70 if not (type_list_data or string_data) else (
-        method_ids_offset + len(methods) * 8 if methods else cursor - len(type_list_data)
-    )
+    struct.pack_into("<II", value, 0x60, len(body_classes), class_defs_offset)
+    if not (type_list_data or code_item_data or class_data or string_data):
+        data_offset = 0x70
     struct.pack_into("<II", value, 0x68, file_size - data_offset, data_offset)
 
     for index, offset in enumerate(string_offsets):
@@ -165,9 +209,84 @@ def build_dex(
             prototypes.index((parameters, return_type)),
             strings.index(method_name),
         )
-    value[cursor - len(type_list_data) : cursor] = type_list_data
+    for index, class_descriptor in enumerate(body_classes):
+        struct.pack_into(
+            "<IIIIIIII",
+            value,
+            class_defs_offset + index * 32,
+            types.index(class_descriptor),
+            0x01,
+            0xFFFFFFFF,
+            0,
+            0xFFFFFFFF,
+            0,
+            class_data_offsets[class_descriptor],
+            0,
+        )
+    data_cursor = data_offset
+    value[data_cursor : data_cursor + len(type_list_data)] = type_list_data
+    data_cursor += len(type_list_data)
+    value[data_cursor : data_cursor + len(code_item_data)] = code_item_data
+    data_cursor += len(code_item_data)
+    value[data_cursor : data_cursor + len(class_data)] = class_data
     value[cursor:] = string_data
     return bytes(value)
+
+
+def _const_string(register: int, string_index: int) -> tuple[int, ...]:
+    assert 0 <= register <= 0xFF
+    assert 0 <= string_index <= 0xFFFF
+    return (0x1A | (register << 8), string_index)
+
+
+def _const_int(register: int, value: int) -> tuple[int, ...]:
+    assert 0 <= register <= 0xFF
+    assert -0x8000 <= value <= 0x7FFF
+    return (0x13 | (register << 8), value & 0xFFFF)
+
+
+def _invoke(
+    method_index: int,
+    registers: tuple[int, ...],
+    *,
+    static: bool = False,
+    direct: bool = False,
+) -> tuple[int, ...]:
+    assert len(registers) <= 5
+    assert all(0 <= register <= 0x0F for register in registers)
+    padded = (*registers, 0, 0, 0, 0, 0)
+    first = (
+        (0x71 if static else 0x70 if direct else 0x6E)
+        | (len(registers) << 12)
+        | ((padded[4] if len(registers) == 5 else 0) << 8)
+    )
+    packed = padded[0] | (padded[1] << 4) | (padded[2] << 8) | (padded[3] << 12)
+    return first, method_index, packed
+
+
+def _first_code_offset(value: bytes) -> int:
+    class_defs_offset = struct.unpack_from("<I", value, 0x64)[0]
+    class_data_offset = struct.unpack_from("<I", value, class_defs_offset + 24)[0]
+    cursor = class_data_offset
+
+    def read_uleb() -> int:
+        nonlocal cursor
+        decoded = 0
+        shift = 0
+        while True:
+            item = value[cursor]
+            cursor += 1
+            decoded |= (item & 0x7F) << shift
+            if not item & 0x80:
+                return decoded
+            shift += 7
+
+    counts = tuple(read_uleb() for _index in range(4))
+    assert counts[:2] == (0, 0)
+    assert counts[2] >= 1
+    read_uleb()
+    read_uleb()
+    return read_uleb()
 
 
 def write_apk(
@@ -418,6 +537,426 @@ def test_security_api_inventory_matches_exact_references_only(tmp_path: Path) ->
     assert len(serialized["security_api_candidates"]) == 4
 
 
+def test_static_behavior_candidates_require_actual_crypto_invokes(tmp_path: Path) -> None:
+    methods = (
+        ("Lfixture/SecurityFlow;", "inspect", (), "V"),
+        (
+            "Ljavax/crypto/Cipher;",
+            "getInstance",
+            ("Ljava/lang/String;",),
+            "Ljavax/crypto/Cipher;",
+        ),
+        (
+            "Ljava/security/MessageDigest;",
+            "getInstance",
+            ("Ljava/lang/String;",),
+            "Ljava/security/MessageDigest;",
+        ),
+        (
+            "Ljavax/crypto/spec/PBEKeySpec;",
+            "<init>",
+            ("[C", "[B", "I", "I"),
+            "V",
+        ),
+        ("Ljava/util/Random;", "nextBytes", ("[B",), "V"),
+        (
+            "Ljavax/crypto/spec/SecretKeySpec;",
+            "<init>",
+            ("[B", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(0, 0),
+        *_invoke(1, (0,), static=True),
+        *_const_string(1, 1),
+        *_invoke(1, (1,), static=True),
+        *_const_string(2, 2),
+        *_invoke(2, (2,), static=True),
+        *_const_int(3, 500),
+        *_invoke(3, (4, 5, 6, 3, 7), direct=True),
+        *_invoke(4, (8, 9)),
+        *_invoke(5, (10, 9, 11), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "crypto-behavior.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("AES/ECB/PKCS5Padding", "DES/CBC/PKCS5Padding", "MD5"),
+            methods=methods,
+            method_bodies=((0, 12, insns),),
+        ),
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "apk/crypto-behavior"),))
+    candidates = result.static_behavior_candidates
+
+    assert {item.rule_id for item in candidates} == {
+        "CRYPTO-ECB",
+        "CRYPTO-LOW-PBE-ITERATIONS",
+        "CRYPTO-PREDICTABLE-RANDOM",
+        "CRYPTO-WEAK-ALGORITHM",
+        "CRYPTO-WEAK-DIGEST",
+    }
+    assert {item.caller_method_name for item in candidates} == {"inspect"}
+    serialized_candidates = json.dumps(
+        result.to_dict()["static_behavior_candidates"]
+    )
+    assert set(result.to_dict()["static_behavior_candidates"][0]) == {
+        "rule_id",
+        "confidence",
+        "source_id",
+        "dex_entry",
+        "caller_class_descriptor",
+        "caller_method_name",
+        "caller_prototype",
+        "indicators",
+    }
+    assert "AES/ECB/PKCS5Padding" not in serialized_candidates
+    assert "DES/CBC/PKCS5Padding" not in serialized_candidates
+    assert result.metrics["dex_behavior_invocations_scanned"] == 6
+
+
+def test_static_behavior_correlates_webview_calls_within_one_caller(
+    tmp_path: Path,
+) -> None:
+    methods = (
+        ("Lfixture/WebFlow;", "configure", (), "V"),
+        (
+            "Landroid/webkit/WebSettings;",
+            "setJavaScriptEnabled",
+            ("Z",),
+            "V",
+        ),
+        (
+            "Landroid/webkit/WebSettings;",
+            "setAllowUniversalAccessFromFileURLs",
+            ("Z",),
+            "V",
+        ),
+        (
+            "Landroid/webkit/WebSettings;",
+            "setMixedContentMode",
+            ("I",),
+            "V",
+        ),
+        (
+            "Landroid/webkit/WebView;",
+            "addJavascriptInterface",
+            ("Ljava/lang/Object;", "Ljava/lang/String;"),
+            "V",
+        ),
+        (
+            "Landroid/webkit/WebView;",
+            "loadUrl",
+            ("Ljava/lang/String;",),
+            "V",
+        ),
+        ("Landroid/webkit/SslErrorHandler;", "proceed", (), "V"),
+    )
+    insns = (
+        *_const_int(1, 1),
+        *_invoke(1, (0, 1)),
+        *_invoke(2, (0, 1)),
+        *_const_int(2, 0),
+        *_invoke(3, (0, 2)),
+        *_invoke(4, (3, 4, 5)),
+        *_const_string(6, 0),
+        *_invoke(5, (3, 6)),
+        *_invoke(6, (7,)),
+        0x0E,
+    )
+    remote_url = "https://remote.example.test/content?token=never-serialize"
+    apk = tmp_path / "web-behavior.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(remote_url,),
+            methods=methods,
+            method_bodies=((0, 8, insns),),
+        ),
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "apk/web-behavior"),))
+    candidates = result.static_behavior_candidates
+
+    assert {item.rule_id for item in candidates} == {
+        "WEBVIEW-JS-BRIDGE-REMOTE",
+        "WEBVIEW-SSL-ERROR-PROCEED",
+        "WEBVIEW-UNSAFE-SETTINGS",
+    }
+    candidate_json = json.dumps(result.to_dict()["static_behavior_candidates"])
+    assert remote_url not in candidate_json
+    bridge = next(
+        item for item in candidates if item.rule_id == "WEBVIEW-JS-BRIDGE-REMOTE"
+    )
+    assert "remote_scheme:https" in bridge.indicators
+
+
+def test_static_behavior_never_correlates_global_strings_or_separate_callers() -> None:
+    methods = (
+        ("Lfixture/SeparatedFlow;", "enableBridge", (), "V"),
+        ("Lfixture/SeparatedFlow;", "loadRemote", (), "V"),
+        (
+            "Landroid/webkit/WebSettings;",
+            "setJavaScriptEnabled",
+            ("Z",),
+            "V",
+        ),
+        (
+            "Landroid/webkit/WebView;",
+            "addJavascriptInterface",
+            ("Ljava/lang/Object;", "Ljava/lang/String;"),
+            "V",
+        ),
+        (
+            "Landroid/webkit/WebView;",
+            "loadUrl",
+            ("Ljava/lang/String;",),
+            "V",
+        ),
+        (
+            "Ljavax/crypto/Cipher;",
+            "getInstance",
+            ("Ljava/lang/String;",),
+            "Ljavax/crypto/Cipher;",
+        ),
+    )
+    first_body = (
+        *_const_int(1, 1),
+        *_invoke(2, (0, 1)),
+        *_invoke(3, (2, 3, 4)),
+        0x0E,
+    )
+    second_body = (
+        *_const_string(1, 0),
+        *_invoke(4, (0, 1)),
+        0x0E,
+    )
+    inventory = parse_dex_inventory(
+        build_dex(
+            extra_strings=("https://remote.example.test/", "AES/ECB/PKCS5Padding"),
+            methods=methods,
+            method_bodies=((0, 5, first_body), (1, 2, second_body)),
+        )
+    )
+
+    assert "WEBVIEW-JS-BRIDGE-REMOTE" not in {
+        item.rule_id for item in inventory.behavior_signals
+    }
+    assert "CRYPTO-ECB" not in {item.rule_id for item in inventory.behavior_signals}
+
+
+@pytest.mark.parametrize(
+    ("overwrite_name", "overwrite"),
+    (
+        ("12x-neg-int", (0x7B | (1 << 8) | (2 << 12),)),
+        ("12x-binop-2addr", (0xB0 | (1 << 8) | (2 << 12),)),
+        ("22c-instance-of", (0x20 | (1 << 8) | (2 << 12), 0)),
+        ("22s-add-int-lit16", (0xD0 | (1 << 8) | (2 << 12), 0)),
+        ("const-wide", (0x16 | (1 << 8), 0)),
+        ("move-wide", (0x04 | (1 << 8),)),
+        ("const-method-handle", (0xFE | (1 << 8), 0)),
+        ("const-method-type", (0xFF | (1 << 8), 0)),
+    ),
+)
+def test_static_behavior_kills_stale_constants_for_dex_destination_formats(
+    overwrite_name: str,
+    overwrite: tuple[int, ...],
+) -> None:
+    methods = (
+        ("Lfixture/RegisterFlow;", "configure", (), "V"),
+        (
+            "Landroid/webkit/WebSettings;",
+            "setJavaScriptEnabled",
+            ("Z",),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_int(1, 1),
+        *_const_int(2, 0),
+        *overwrite,
+        *_invoke(1, (0, 1)),
+        0x0E,
+    )
+
+    inventory = parse_dex_inventory(
+        build_dex(methods=methods, method_bodies=((0, 3, insns),))
+    )
+
+    assert overwrite_name
+    assert "WEBVIEW-UNSAFE-SETTINGS" not in {
+        item.rule_id for item in inventory.behavior_signals
+    }
+
+
+def test_predictable_random_requires_forward_unbroken_value_provenance() -> None:
+    methods = (
+        ("Lfixture/RandomFlow;", "positive", (), "V"),
+        ("Lfixture/RandomFlow;", "reversed", (), "V"),
+        ("Lfixture/RandomFlow;", "overwritten", (), "V"),
+        ("Ljava/util/Random;", "nextBytes", ("[B",), "V"),
+        (
+            "Ljavax/crypto/spec/SecretKeySpec;",
+            "<init>",
+            ("[B", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    random_call = _invoke(3, (0, 1))
+    crypto_constructor = _invoke(4, (2, 1, 3), direct=True)
+    positive = (*random_call, *crypto_constructor, 0x0E)
+    reversed_calls = (*crypto_constructor, *random_call, 0x0E)
+    overwrite_byte_array = 0x07 | (1 << 8) | (4 << 12)
+    overwritten = (
+        *random_call,
+        overwrite_byte_array,
+        *crypto_constructor,
+        0x0E,
+    )
+
+    inventory = parse_dex_inventory(
+        build_dex(
+            methods=methods,
+            method_bodies=(
+                (0, 5, positive),
+                (1, 5, reversed_calls),
+                (2, 5, overwritten),
+            ),
+        )
+    )
+    predictable = [
+        item
+        for item in inventory.behavior_signals
+        if item.rule_id == "CRYPTO-PREDICTABLE-RANDOM"
+    ]
+
+    assert [item.caller_method_name for item in predictable] == ["positive"]
+
+
+def test_static_behavior_emits_generic_storage_loading_and_deserialization() -> None:
+    methods = (
+        ("Lfixture/GenericFlow;", "run", (), "V"),
+        (
+            "Landroid/content/Context;",
+            "openFileOutput",
+            ("Ljava/lang/String;", "I"),
+            "Ljava/io/FileOutputStream;",
+        ),
+        (
+            "Ldalvik/system/DexFile;",
+            "loadDex",
+            ("Ljava/lang/String;", "Ljava/lang/String;", "I"),
+            "Ldalvik/system/DexFile;",
+        ),
+        (
+            "Ljava/io/ObjectInputStream;",
+            "readObject",
+            (),
+            "Ljava/lang/Object;",
+        ),
+    )
+    insns = (
+        *_const_int(2, 3),
+        *_invoke(1, (0, 1, 2)),
+        *_invoke(2, (3, 4, 5), static=True),
+        *_invoke(3, (6,)),
+        0x0E,
+    )
+    inventory = parse_dex_inventory(
+        build_dex(methods=methods, method_bodies=((0, 7, insns),))
+    )
+
+    assert {item.rule_id for item in inventory.behavior_signals} == {
+        "ASL-STATIC-DESERIALIZATION",
+        "ASL-STATIC-DYNAMIC-CODE",
+        "STORAGE-WORLD-READABLE",
+        "STORAGE-WORLD-WRITABLE",
+    }
+
+
+def test_static_behavior_is_bounded_and_rejects_malformed_code(tmp_path: Path) -> None:
+    methods = (
+        ("Lfixture/BoundedFlow;", "run", (), "V"),
+        (
+            "Ljavax/crypto/Cipher;",
+            "getInstance",
+            ("Ljava/lang/String;",),
+            "Ljavax/crypto/Cipher;",
+        ),
+    )
+    insns = (*_const_string(0, 0), *_invoke(1, (0,), static=True), 0x0E)
+    dex = build_dex(
+        extra_strings=("DES/ECB/PKCS5Padding",),
+        methods=methods,
+        method_bodies=((0, 1, insns),),
+    )
+    apk = tmp_path / "bounded-behavior.apk"
+    write_apk(apk, dex)
+
+    bounded = analyze_apks(
+        (StaticApkInput(apk, "apk/bounded-behavior"),),
+        policy=replace(StaticApkPolicy(), max_dex_code_units=1),
+    )
+
+    assert bounded.static_behavior_candidates == ()
+    assert "limit:dex_code_units" in bounded.limitations
+    assert bounded.metrics["dex_behavior_methods_scanned"] == 0
+
+    candidate_bounded = analyze_apks(
+        (StaticApkInput(apk, "apk/candidate-bounded"),),
+        policy=replace(StaticApkPolicy(), max_static_behavior_candidates=1),
+    )
+
+    assert len(candidate_bounded.static_behavior_candidates) == 1
+    assert "limit:static_behavior_candidates" in candidate_bounded.limitations
+
+    malformed = bytearray(dex)
+    code_offset = _first_code_offset(malformed)
+    struct.pack_into("<I", malformed, code_offset + 12, len(malformed))
+    with pytest.raises(DexFormatError, match="instructions are truncated"):
+        parse_dex_inventory(bytes(malformed))
+
+    bad_string_reference = bytearray(dex)
+    code_offset = _first_code_offset(bad_string_reference)
+    struct.pack_into("<H", bad_string_reference, code_offset + 18, 0xFFFF)
+    with pytest.raises(DexFormatError, match="const-string references"):
+        parse_dex_inventory(bytes(bad_string_reference))
+
+
+def test_deprecated_webview_plugin_state_policy_requires_exact_prototype(
+    tmp_path: Path,
+) -> None:
+    apk = tmp_path / "plugin-state.apk"
+    write_apk(
+        apk,
+        build_dex(
+            methods=(
+                (
+                    "Landroid/webkit/WebSettings;",
+                    "setPluginState",
+                    ("Landroid/webkit/WebSettings$PluginState;",),
+                    "V",
+                ),
+                (
+                    "Landroid/webkit/WebSettings;",
+                    "setPluginState",
+                    ("I",),
+                    "V",
+                ),
+            )
+        ),
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "apk/plugin-state"),))
+
+    assert [item.policy_id for item in result.api_policy_matches] == [
+        "ANDROID-WEBSETTINGS-PLUGIN-STATE"
+    ]
+
+
 @pytest.mark.parametrize(
     ("inventory_id", "category", "class_descriptor", "method_name", "prototype"),
     tuple(
@@ -474,8 +1013,11 @@ def test_every_security_api_pattern_requires_an_exact_prototype(
     assert rejected.security == []
 
 
-def test_security_inventory_limit_is_appended_for_positional_policy_compatibility() -> None:
-    assert fields(StaticApkPolicy)[-1].name == "max_security_api_matches"
+def test_behavior_limits_are_appended_for_positional_policy_compatibility() -> None:
+    names = [item.name for item in fields(StaticApkPolicy)]
+
+    assert names.index("max_security_api_matches") < names.index("max_dex_class_defs")
+    assert names[-1] == "max_static_behavior_candidates"
 
 
 def test_security_api_inventory_is_deduplicated_ordered_and_bounded(

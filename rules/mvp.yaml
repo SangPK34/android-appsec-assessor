@@ -193,11 +193,50 @@ rules:
     cwe_mapping: mapping_pending
     remediation: Remove deployable secrets from application packages and rotate any exposed credential.
 
+  - id: ASL-STATIC-API-POLICY
+    evaluator: static_api_policy
+    title: Banned or deprecated API method reference
+    category: platform-api
+    description: Evaluates exact DEX method references against the configured banned and deprecated API policy without assuming invocation, reachability, or runtime impact.
+    severity: medium
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Replace banned APIs and migrate deprecated APIs to supported platform behavior after reviewing each reachable call-site.
+
+  - id: ASL-STATIC-DYNAMIC-CODE
+    evaluator: static_behavior_candidate
+    title: Dynamic code-loading call-site candidate
+    category: code-loading
+    description: Evaluates bounded DEX call-sites for dynamic code-loading behavior without assuming that the call-site executes or is reachable.
+    severity: high
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Avoid loading executable code from writable or untrusted locations and verify the provenance and integrity of every dynamically loaded artifact.
+
+  - id: ASL-STATIC-DESERIALIZATION
+    evaluator: static_behavior_candidate
+    title: Deserialization call-site candidate
+    category: input-validation
+    description: Evaluates bounded DEX call-sites for object deserialization without assuming attacker influence, execution, or runtime reachability.
+    severity: high
+    confidence: medium
+    validation_type: none
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Do not deserialize untrusted objects; use a constrained data format and enforce explicit type and input validation.
+
   - id: CRYPTO-ECB
     evaluator: crypto_runtime
-    title: ECB mode observed at runtime
+    title: ECB cipher mode usage
     category: crypto
-    description: Evaluates runtime crypto metadata for ECB mode.
+    description: Correlates attributed runtime crypto metadata for ECB mode and retains bounded static DEX call-sites as potential findings until execution and reachability are observed.
     severity: medium
     confidence: high
     validation_type: instrumented_validation
@@ -210,9 +249,9 @@ rules:
 
   - id: CRYPTO-WEAK-ALGORITHM
     evaluator: crypto_runtime
-    title: Weak runtime crypto algorithm
+    title: Weak cryptographic algorithm usage
     category: crypto
-    description: Evaluates runtime crypto metadata for configured weak algorithms.
+    description: Correlates attributed runtime crypto metadata for configured weak algorithms and retains bounded static DEX call-sites as potential findings until execution and reachability are observed.
     severity: high
     confidence: high
     validation_type: instrumented_validation
@@ -267,9 +306,9 @@ rules:
 
   - id: CRYPTO-WEAK-DIGEST
     evaluator: crypto_runtime
-    title: Weak digest or MAC observed at runtime
+    title: Weak digest or MAC usage
     category: crypto
-    description: Correlates completed MD5, SHA-1, or HMAC-SHA1 operations while preserving context uncertainty.
+    description: Correlates completed MD5, SHA-1, or HMAC-SHA1 operations and retains bounded static DEX call-sites as potential findings while preserving execution and data-context uncertainty.
     severity: medium
     confidence: medium
     validation_type: instrumented_validation
@@ -283,7 +322,7 @@ rules:
     evaluator: crypto_runtime
     title: Password-based derivation iteration count below policy
     category: crypto
-    description: Evaluates bounded runtime PBE salt-length and iteration-count metadata.
+    description: Correlates bounded runtime PBE iteration metadata and retains bounded static low-iteration call-sites as potential findings until execution and reachability are observed.
     severity: medium
     confidence: medium
     validation_type: instrumented_validation
@@ -295,9 +334,9 @@ rules:
 
   - id: CRYPTO-PREDICTABLE-RANDOM
     evaluator: crypto_runtime
-    title: Weak random output used as cryptographic material
+    title: Predictable random source used as cryptographic material
     category: crypto
-    description: Correlates java.util.Random output fingerprints with key or IV material used by a completed runtime cipher operation.
+    description: Correlates runtime weak-random output with key or IV material and retains bounded static weak-random crypto call-sites as potential findings until execution and data flow are observed.
     severity: medium
     confidence: high
     validation_type: instrumented_validation
@@ -311,7 +350,7 @@ rules:
     evaluator: webview_security
     title: JavaScript bridge exposed to remote WebView content
     category: webview
-    description: Correlates JavaScript enablement, a JavaScript interface, and remote content on the same WebView instance.
+    description: Correlates JavaScript enablement, a JavaScript interface, and remote content at runtime while retaining bounded static same-method call-sites as potential findings until reachability is observed.
     severity: high
     confidence: medium
     validation_type: instrumented_validation
@@ -323,9 +362,9 @@ rules:
 
   - id: WEBVIEW-UNSAFE-SETTINGS
     evaluator: webview_security
-    title: Security-relevant WebView setting enabled at runtime
+    title: Security-relevant WebView setting enabled
     category: webview
-    description: Evaluates unsafe file-URL access, permissive mixed content, and WebView debugging runtime settings.
+    description: Evaluates unsafe file-URL access, permissive mixed content, and WebView debugging at runtime while retaining bounded static setting call-sites as potential findings until reachability is observed.
     severity: medium
     confidence: medium
     validation_type: instrumented_validation
@@ -339,7 +378,7 @@ rules:
     evaluator: webview_security
     title: WebView continued after an SSL certificate error
     category: network
-    description: Detects package-attributed SslErrorHandler.proceed behavior and retains static references as candidates only.
+    description: Detects package-attributed SslErrorHandler.proceed behavior and retains bounded static callback call-sites as potential findings until execution and reachability are observed.
     severity: high
     confidence: high
     validation_type: evidence_correlation
@@ -353,7 +392,7 @@ rules:
     evaluator: storage_security
     title: World-readable private-storage file
     category: data-storage
-    description: Evaluates bounded package storage metadata for read permission granted to other Android UIDs.
+    description: Evaluates bounded package storage permissions and retains static world-readable file-mode call-sites as potential findings until execution and resulting file permissions are observed.
     severity: medium
     confidence: high
     validation_type: root_assisted_validation
@@ -367,7 +406,7 @@ rules:
     evaluator: storage_security
     title: World-writable private-storage file
     category: data-storage
-    description: Evaluates bounded package storage metadata for write permission granted to other Android UIDs.
+    description: Evaluates bounded package storage permissions and retains static world-writable file-mode call-sites as potential findings until execution and resulting file permissions are observed.
     severity: high
     confidence: high
     validation_type: root_assisted_validation

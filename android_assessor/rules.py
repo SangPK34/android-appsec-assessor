@@ -23,6 +23,7 @@ from .session import SessionRepository
 from .storage import read_json_object, require_under_root
 from .tls_analysis import TlsBehaviorAnalyzer
 from .traffic import load_traffic_events
+from .validation_definitions import validation_for_rule
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +117,70 @@ _SYMMETRIC_CIPHERS = {
     "CAMELLIA",
 }
 
+_STATIC_BEHAVIOR_RULE_IDS = frozenset(
+    {
+        "ASL-STATIC-DESERIALIZATION",
+        "ASL-STATIC-DYNAMIC-CODE",
+        "CRYPTO-ECB",
+        "CRYPTO-LOW-PBE-ITERATIONS",
+        "CRYPTO-PREDICTABLE-RANDOM",
+        "CRYPTO-WEAK-ALGORITHM",
+        "CRYPTO-WEAK-DIGEST",
+        "STORAGE-WORLD-READABLE",
+        "STORAGE-WORLD-WRITABLE",
+        "WEBVIEW-JS-BRIDGE-REMOTE",
+        "WEBVIEW-SSL-ERROR-PROCEED",
+        "WEBVIEW-UNSAFE-SETTINGS",
+    }
+)
+
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def _conservative_confidence(default: str, candidates: list[dict[str, Any]]) -> str:
+    values = [
+        default,
+        *(
+            str(item["confidence"])
+            for item in candidates
+            if item.get("confidence") in _CONFIDENCE_RANK
+        ),
+    ]
+    ranked = [value for value in values if value in _CONFIDENCE_RANK]
+    return min(ranked, key=_CONFIDENCE_RANK.__getitem__) if ranked else default
+
+
+def _static_behavior_candidates(
+    static_analysis: dict[str, Any] | None,
+    rule_id: str,
+) -> list[dict[str, Any]]:
+    """Return bounded static call-site candidates attributed to one rule."""
+    if not static_analysis or rule_id not in _STATIC_BEHAVIOR_RULE_IDS:
+        return []
+    values = static_analysis.get("static_behavior_candidates", [])
+    if not isinstance(values, list):
+        return []
+    return [
+        dict(item)
+        for item in values
+        if isinstance(item, dict)
+        and item.get("rule_id") == rule_id
+        and item.get("confidence") in {"high", "medium"}
+        and all(
+            isinstance(item.get(key), str) and bool(item.get(key))
+            for key in (
+                "source_id",
+                "dex_entry",
+                "caller_class_descriptor",
+                "caller_method_name",
+                "caller_prototype",
+            )
+        )
+        and isinstance(item.get("indicators"), list)
+        and bool(item.get("indicators"))
+        and all(isinstance(value, str) and value for value in item["indicators"])
+    ]
+
 
 class RuleEngine:
     def __init__(
@@ -143,6 +208,7 @@ class RuleEngine:
             if not isinstance(value, dict):
                 raise SessionError("Rule entry is invalid.")
             validation_type = str(value.get("validation_type", "none"))
+            validation_definition = validation_for_rule(str(value["id"]))
             output.append(
                 RuleDefinition(
                     rule_id=str(value["id"]),
@@ -159,8 +225,10 @@ class RuleEngine:
                         "cwe": str(value.get("cwe_mapping", "mapping_pending")),
                     },
                     validation_type=validation_type,
-                    validation_supported=validation_type
-                    in {"natural_validation", "adb_assisted_validation"},
+                    validation_supported=bool(
+                        validation_definition
+                        and validation_definition.production_enabled
+                    ),
                     validation_observable=(
                         str(value["validation_observable"])
                         if value.get("validation_observable")
@@ -313,6 +381,96 @@ class RuleEngine:
             (),
             False,
             False,
+        )
+
+    @staticmethod
+    def _static_behavior_fallback(
+        definition: RuleDefinition,
+        context: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[FindingStatus, str, dict[str, Any], tuple[str, ...], bool, bool]:
+        """Promote static call-site evidence without claiming runtime execution."""
+        return (
+            FindingStatus.POTENTIAL,
+            "static",
+            {
+                "observed_behavior": "static_behavior_candidate",
+                "static_behavior_candidates": candidates,
+                "candidate_count": len(candidates),
+                "candidate_confidences": sorted(
+                    {
+                        str(item.get("confidence"))
+                        for item in candidates
+                        if item.get("confidence")
+                    }
+                ),
+                "reason": (
+                    "Bounded static APK analysis matched one or more method "
+                    "call-sites to this policy; execution and reachability were "
+                    "not assumed."
+                ),
+                "method": "bounded_apk_static_behavior_call_site_correlation",
+                "preconditions": [
+                    "static APK inventory completed sufficiently to decode the call-site",
+                    f"candidate rule_id equals {definition.rule_id}",
+                ],
+                "missing_evidence": [
+                    "package-attributed runtime execution of the identified method call-site",
+                    "runtime reachability in a security-sensitive or attacker-influenced flow",
+                ],
+            },
+            context["evidence"]("static_apk_inventory"),
+            False,
+            False,
+        )
+
+    @staticmethod
+    def _with_static_behavior_context(
+        result: tuple[
+            FindingStatus,
+            str,
+            dict[str, Any],
+            tuple[str, ...],
+            bool,
+            bool,
+        ],
+        context: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[FindingStatus, str, dict[str, Any], tuple[str, ...], bool, bool]:
+        """Attach corroborating static locations to a positive runtime result."""
+        status, analysis, details, ids, root_used, frida_used = result
+        return (
+            status,
+            analysis,
+            {
+                **details,
+                "static_behavior_candidates": candidates,
+            },
+            tuple(
+                dict.fromkeys((*ids, *context["evidence"]("static_apk_inventory")))
+            ),
+            root_used,
+            frida_used,
+        )
+
+    @staticmethod
+    def _rejects_static_storage_candidate(
+        definition: RuleDefinition,
+        status: FindingStatus,
+        details: dict[str, Any],
+    ) -> bool:
+        """Return true when stronger storage evidence rules out a static file-mode hit."""
+        if definition.rule_id not in {
+            "STORAGE-WORLD-READABLE",
+            "STORAGE-WORLD-WRITABLE",
+        }:
+            return False
+        return (
+            status is FindingStatus.PASS
+            and details.get("method") == "bounded_private_storage_correlation"
+            and details.get("inventory_status") == "completed"
+            and not details.get("inventory_limitations")
+            and not details.get("observed_behavior")
         )
 
     @staticmethod
@@ -1627,6 +1785,153 @@ class RuleEngine:
                 bool(sensitive_canary_rule and frida),
             )
 
+        if definition.evaluator == "static_api_policy":
+            if static_analysis is None:
+                return (
+                    FindingStatus.SKIPPED,
+                    "static",
+                    {
+                        "reason": "Static APK inventory is unavailable.",
+                        "method": "bounded_apk_static_api_policy_reference",
+                        "preconditions": ["static APK analysis completed"],
+                        "missing_evidence": ["static APK inventory"],
+                    },
+                    (),
+                    False,
+                    False,
+                )
+            raw_matches = static_analysis.get("api_policy_matches")
+            policy_matches = (
+                [
+                    dict(item)
+                    for item in raw_matches
+                    if isinstance(item, dict)
+                    and item.get("disposition") in {"banned", "deprecated"}
+                    and all(
+                        isinstance(item.get(key), str) and bool(item.get(key))
+                        for key in (
+                            "policy_id",
+                            "source_id",
+                            "dex_entry",
+                            "class_descriptor",
+                            "method_name",
+                            "prototype",
+                        )
+                    )
+                ]
+                if isinstance(raw_matches, list)
+                else []
+            )
+            policy_inventory_valid = isinstance(raw_matches, list) and len(
+                policy_matches
+            ) == len(raw_matches)
+            inventory_status = str(static_analysis.get("status", "partial"))
+            if policy_matches:
+                status = FindingStatus.POTENTIAL
+                reason = (
+                    "The bounded DEX inventory contains method references matched by "
+                    "the configured banned or deprecated API policy; invocation and "
+                    "reachability were not assumed."
+                )
+                missing = [
+                    "runtime execution of the referenced method",
+                    "reachable call-site and security or compatibility impact",
+                ]
+            elif inventory_status == "error":
+                status = FindingStatus.ERROR
+                reason = "Static API policy analysis failed before coverage completed."
+                missing = ["completed static API policy inventory"]
+            elif inventory_status == "completed" and policy_inventory_valid:
+                status = FindingStatus.PASS
+                reason = "No banned or deprecated method reference matched the policy."
+                missing = []
+            else:
+                status = FindingStatus.INCONCLUSIVE
+                reason = "Static API policy coverage is unavailable or incomplete."
+                missing = ["completed static API policy inventory"]
+            return (
+                status,
+                "static",
+                {
+                    "observed_behavior": (
+                        "static_api_policy_match"
+                        if policy_matches
+                        else "no_static_api_policy_match"
+                    ),
+                    "api_policy_matches": policy_matches,
+                    "reason": reason,
+                    "method": "bounded_apk_static_api_policy_reference",
+                    "preconditions": [
+                        "policy matching uses exact DEX class, method, and prototype metadata"
+                    ],
+                    "missing_evidence": missing,
+                    "inventory_status": inventory_status,
+                },
+                evidence("static_apk_inventory"),
+                False,
+                False,
+            )
+
+        if definition.evaluator == "static_behavior_candidate":
+            if static_analysis is None:
+                return (
+                    FindingStatus.SKIPPED,
+                    "static",
+                    {
+                        "reason": "Static APK inventory is unavailable.",
+                        "method": "bounded_apk_static_behavior_call_site_correlation",
+                        "preconditions": ["static APK analysis completed"],
+                        "missing_evidence": ["static APK inventory"],
+                    },
+                    (),
+                    False,
+                    False,
+                )
+            candidates = _static_behavior_candidates(
+                static_analysis,
+                definition.rule_id,
+            )
+            if candidates:
+                return self._static_behavior_fallback(
+                    definition,
+                    context,
+                    candidates,
+                )
+            inventory_present = isinstance(
+                static_analysis.get("static_behavior_candidates"),
+                list,
+            )
+            inventory_status = str(static_analysis.get("status", "partial"))
+            if inventory_status == "error":
+                status = FindingStatus.ERROR
+                reason = "Static behavior analysis failed before coverage completed."
+                missing = ["completed static behavior candidate inventory"]
+            elif inventory_status == "completed" and inventory_present:
+                status = FindingStatus.PASS
+                reason = "No matching call-site was found in the bounded static inventory."
+                missing = []
+            else:
+                status = FindingStatus.INCONCLUSIVE
+                reason = "Static behavior call-site coverage is unavailable or incomplete."
+                missing = ["completed static behavior candidate inventory"]
+            return (
+                status,
+                "static",
+                {
+                    "observed_behavior": "no_static_behavior_candidate",
+                    "reason": reason,
+                    "method": "bounded_apk_static_behavior_call_site_correlation",
+                    "preconditions": [
+                        "static APK inventory completed sufficiently to decode call-sites"
+                    ],
+                    "missing_evidence": missing,
+                    "inventory_status": inventory_status,
+                },
+                evidence("static_apk_inventory"),
+                False,
+                False,
+            )
+
         raise SessionError(f"Unknown rule evaluator: {definition.evaluator}")
 
     def evaluate(self, session_id: str) -> list[FindingRecord]:
@@ -1836,6 +2141,88 @@ class RuleEngine:
                             context,
                         )
                     )
+                static_behavior = _static_behavior_candidates(
+                    static_analysis,
+                    definition.rule_id,
+                )
+                if static_behavior:
+                    is_static_fallback = details.get("method") == (
+                        "bounded_apk_static_behavior_call_site_correlation"
+                    )
+                    runtime_potential = (
+                        status is FindingStatus.POTENTIAL
+                        and analysis != "static"
+                        and not (
+                            definition.rule_id == "WEBVIEW-SSL-ERROR-PROCEED"
+                            and not details.get("observed_behavior", {}).get(
+                                "matched_callback_proceed_count"
+                            )
+                        )
+                    )
+                    if not is_static_fallback:
+                        if status is FindingStatus.CONFIRMED or runtime_potential:
+                            (
+                                status,
+                                analysis,
+                                details,
+                                ids,
+                                root_used,
+                                frida_used,
+                            ) = self._with_static_behavior_context(
+                                (
+                                    status,
+                                    analysis,
+                                    details,
+                                    ids,
+                                    root_used,
+                                    frida_used,
+                                ),
+                                context,
+                                static_behavior,
+                            )
+                        elif self._rejects_static_storage_candidate(
+                            definition,
+                            status,
+                            details,
+                        ):
+                            (
+                                status,
+                                analysis,
+                                details,
+                                ids,
+                                root_used,
+                                frida_used,
+                            ) = self._with_static_behavior_context(
+                                (
+                                    status,
+                                    analysis,
+                                    {
+                                        **details,
+                                        "static_behavior_outcome": (
+                                            "rejected_by_completed_private_storage_inventory"
+                                        ),
+                                        "candidate_count": len(static_behavior),
+                                    },
+                                    ids,
+                                    root_used,
+                                    frida_used,
+                                ),
+                                context,
+                                static_behavior,
+                            )
+                        else:
+                            (
+                                status,
+                                analysis,
+                                details,
+                                ids,
+                                root_used,
+                                frida_used,
+                            ) = self._static_behavior_fallback(
+                                definition,
+                                context,
+                                static_behavior,
+                            )
             except (AndroidAssessorError, OSError, ValueError) as exc:
                 status = FindingStatus.ERROR
                 analysis = "unknown"
@@ -1863,6 +2250,19 @@ class RuleEngine:
             if validation and validation.status is FindingStatus.CONFIRMED:
                 status = FindingStatus.CONFIRMED
                 ids = tuple(dict.fromkeys((*ids, *validation.evidence_ids)))
+            finding_confidence = definition.confidence
+            if (
+                status is FindingStatus.POTENTIAL
+                and analysis == "static"
+                and details.get("method")
+                == "bounded_apk_static_behavior_call_site_correlation"
+            ):
+                candidate_values = details.get("static_behavior_candidates", [])
+                if isinstance(candidate_values, list):
+                    finding_confidence = _conservative_confidence(
+                        definition.confidence,
+                        [item for item in candidate_values if isinstance(item, dict)],
+                    )
             findings.append(
                 FindingRecord(
                     finding_id=f"finding-{definition.rule_id.lower()}",
@@ -1871,7 +2271,7 @@ class RuleEngine:
                     category=definition.category,
                     description=definition.description,
                     severity=definition.severity,
-                    confidence=definition.confidence,
+                    confidence=finding_confidence,
                     status=status,
                     analysis_type=analysis,
                     root_required=definition.root_required,

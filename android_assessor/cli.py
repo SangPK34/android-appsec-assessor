@@ -97,6 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--max-states", type=int, default=40)
     scan.add_argument("--plateau-seconds", type=int, default=8)
     scan.add_argument("--seed", type=int, default=1337)
+    scan.add_argument(
+        "--controlled-canary",
+        action="store_true",
+        help=(
+            "Opt in to bounded exact-canary form delivery during an autonomous "
+            "Full Assessment; requires controlled_validation in scope."
+        ),
+    )
     scan.add_argument("--json", action="store_true", dest="as_json")
     scan.add_argument("--output", type=Path)
 
@@ -307,6 +315,14 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
     if max_runtime == 0 and args.autonomous is True:
         raise AndroidAssessorError("--autonomous requires a runtime greater than zero.")
     autonomous = False if max_runtime == 0 and args.autonomous is None else args.autonomous
+    if args.controlled_canary and (
+        args.profile != ScanProfile.FULL.value
+        or autonomous is False
+        or max_runtime == 0
+    ):
+        raise AndroidAssessorError(
+            "--controlled-canary requires an autonomous Full Assessment."
+        )
     explorer_config = None
     if (
         args.profile == ScanProfile.FULL.value
@@ -331,6 +347,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
             runtime_seconds=max_runtime,
             autonomous=autonomous,
             explorer_config=explorer_config,
+            controlled_canary=args.controlled_canary,
         )
     else:
         result = service.scan(
@@ -340,6 +357,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
             runtime_seconds=max_runtime,
             autonomous=autonomous,
             explorer_config=explorer_config,
+            controlled_canary=args.controlled_canary,
         )
     payload = result.to_dict()
     _write_output(payload, args.output, context.paths)

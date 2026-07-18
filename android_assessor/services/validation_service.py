@@ -10,7 +10,7 @@ from urllib.parse import urlencode, urlunsplit
 
 from ..app_context import AppContext
 from ..device_lock import DeviceLock
-from ..errors import SessionError
+from ..errors import AndroidAssessorError, SessionError
 from ..evidence import EvidenceRepository
 from ..findings import (
     FindingRecord,
@@ -19,8 +19,10 @@ from ..findings import (
     ValidationRecord,
 )
 from ..logcat import LogcatCollector
+from ..private_storage import AdbPrivateStorageBackend, PrivateStorageService
 from ..redaction import redact_text
 from ..report import ReportService
+from ..rules import RuleEngine
 from ..scope import load_scope
 from ..session import SessionRepository
 from ..storage import read_json_object, require_under_root, write_text_atomic
@@ -30,6 +32,7 @@ from ..validation_definitions import validation_for_rule
 
 _HOST_PATTERN = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 _PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$")
+_BROADCAST_ACTION_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,255}$")
 
 
 class ValidationService:
@@ -99,6 +102,8 @@ class ValidationService:
         session_id: str,
         rule_id: str,
         text: str,
+        *,
+        source: str = "adb_am_start",
     ) -> str:
         paths = self.repository.paths_for(session_id)
         target = (
@@ -111,13 +116,73 @@ class ValidationService:
             session_id,
             target,
             evidence_type="controlled_validation",
-            source="adb_am_start",
+            source=source,
             description=f"Bounded controlled-validation output for {rule_id}.",
             sensitive=True,
             redacted=True,
             related_findings=(f"finding-{rule_id.lower()}",),
         )
         return record.evidence_id
+
+    @staticmethod
+    def _descriptor_to_component(value: object) -> str | None:
+        if not isinstance(value, str) or not value.startswith("L") or not value.endswith(";"):
+            return None
+        component = value[1:-1].replace("/", ".")
+        return component if "." in component else None
+
+    @staticmethod
+    def _storage_receiver_candidate(
+        app: dict[str, object],
+        finding: FindingRecord,
+    ) -> tuple[str, str] | None:
+        manifest = app.get("manifest")
+        if not isinstance(manifest, dict):
+            return None
+        components = manifest.get("components", [])
+        if not isinstance(components, list):
+            return None
+        receivers: dict[str, dict[str, object]] = {}
+        for item in components:
+            if (
+                isinstance(item, dict)
+                and item.get("component_type") == "receiver"
+                and item.get("effective_exported") is True
+                and item.get("permission") in {None, ""}
+                and isinstance(item.get("name"), str)
+            ):
+                receivers[str(item["name"])] = item
+        candidates = finding.details.get("static_behavior_candidates", [])
+        if not isinstance(candidates, list):
+            return None
+        for candidate in candidates:
+            if (
+                not isinstance(candidate, dict)
+                or candidate.get("rule_id") != finding.rule_id
+                or candidate.get("caller_method_name") != "onReceive"
+            ):
+                continue
+            component = ValidationService._descriptor_to_component(
+                candidate.get("caller_class_descriptor")
+            )
+            receiver = receivers.get(component or "")
+            if receiver is None:
+                continue
+            filters = receiver.get("intent_filters", [])
+            if not isinstance(filters, list):
+                continue
+            for intent_filter in filters:
+                if not isinstance(intent_filter, dict):
+                    continue
+                actions = intent_filter.get("actions", [])
+                if not isinstance(actions, list):
+                    continue
+                for action in actions:
+                    if isinstance(action, str) and _BROADCAST_ACTION_PATTERN.fullmatch(
+                        action
+                    ):
+                        return component or "", action
+        return None
 
     def _validate_cleartext(
         self,
@@ -352,6 +417,146 @@ class ValidationService:
             evidence_ids=evidence_ids,
         )
 
+    def _validate_world_readable_storage(
+        self,
+        session_id: str,
+        finding: FindingRecord,
+        canary: str,
+    ) -> ValidationRecord:
+        target = self._storage_receiver_candidate(self._app(session_id), finding)
+        if target is None:
+            return ValidationRecord(
+                status=FindingStatus.SKIPPED,
+                validation_type="root_assisted_validation",
+                validated_at=datetime.now(UTC).isoformat(),
+                canary=canary,
+                summary=(
+                    "No exported receiver action was correlated to a static "
+                    "world-readable storage call-site."
+                ),
+            )
+        component, action = target
+        record = self.repository.load(session_id)
+        paths = self.repository.paths_for(session_id)
+        with DeviceLock(
+            self.paths,
+            record.serial,
+            operation="validate_world_readable_storage_receiver",
+            session_id=session_id,
+        ):
+            result = self.context.adb_client(
+                command_log=paths.commands_jsonl
+            ).shell(
+                record.serial,
+                (
+                    "am",
+                    "broadcast",
+                    "-n",
+                    f"{record.package}/{component}",
+                    "-a",
+                    action,
+                    "--es",
+                    "thesis_canary",
+                    canary,
+                ),
+                timeout=30,
+                check=False,
+                operation="broadcasting to an allowlisted receiver for validation",
+            )
+        output = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}\n"
+        broadcast_evidence_id = self._activity_evidence(
+            session_id,
+            finding.rule_id,
+            output,
+            source="adb_am_broadcast",
+        )
+        broadcast_completed = (
+            not result.timed_out
+            and result.exit_code == 0
+            and "Broadcast completed" in output
+        )
+        if not broadcast_completed:
+            return ValidationRecord(
+                status=FindingStatus.INCONCLUSIVE,
+                validation_type="root_assisted_validation",
+                validated_at=datetime.now(UTC).isoformat(),
+                canary=canary,
+                summary="The receiver broadcast was blocked or did not complete.",
+                evidence_ids=(broadcast_evidence_id,),
+            )
+        try:
+            load_scope(self.paths).require_device_package(
+                record.serial,
+                record.package,
+                action="root_storage_read",
+            )
+            backend = AdbPrivateStorageBackend(
+                self.context.adb_client(command_log=paths.commands_jsonl)
+            )
+            if record.serial.startswith("emulator-"):
+                backend.environment_type = "emulator"
+            storage = PrivateStorageService(self.repository, backend).collect(
+                session_id,
+                session_canary=canary,
+            )
+        except (AndroidAssessorError, OSError, ValueError) as exc:
+            return ValidationRecord(
+                status=FindingStatus.INCONCLUSIVE,
+                validation_type="root_assisted_validation",
+                validated_at=datetime.now(UTC).isoformat(),
+                canary=canary,
+                summary=(
+                    "The receiver broadcast completed, but private-storage "
+                    f"validation did not complete: {redact_text(str(exc))[:200]}"
+                ),
+                evidence_ids=(broadcast_evidence_id,),
+            )
+        storage_evidence_ids = tuple(
+            str(item["evidence_id"])
+            for item in self.evidence.list(session_id)
+            if item.get("evidence_type") == "private_storage_metadata"
+        )
+        evidence_ids = tuple(
+            dict.fromkeys((broadcast_evidence_id, *storage_evidence_ids))
+        )
+        matched = next(
+            (
+                item
+                for item in storage.observations
+                if item.observation_id == "storage-world-readable"
+            ),
+            None,
+        )
+        if matched and matched.finding_eligible:
+            status = FindingStatus.CONFIRMED
+            summary = (
+                "The receiver broadcast completed and private-storage metadata "
+                "showed a world-readable package artifact."
+            )
+        elif (
+            storage.inventory_status == "completed"
+            and not storage.inventory_limitations
+        ):
+            status = FindingStatus.PASS
+            summary = (
+                "The receiver broadcast completed and bounded private-storage "
+                "metadata rejected a world-readable artifact outcome."
+            )
+        else:
+            status = FindingStatus.INCONCLUSIVE
+            summary = (
+                "The receiver broadcast completed, but private-storage inventory "
+                "coverage was incomplete."
+            )
+        return ValidationRecord(
+            status=status,
+            validation_type="root_assisted_validation",
+            validated_at=datetime.now(UTC).isoformat(),
+            canary=canary,
+            summary=summary,
+            evidence_ids=evidence_ids,
+        )
+
     def validate(self, session_id: str, finding_id: str) -> FindingRecord:
         record = self.repository.load(session_id)
         scope = load_scope(self.paths)
@@ -420,9 +625,15 @@ class ValidationService:
             validation = self._validate_sensitive_log(session_id, finding, canary)
         elif finding.rule_id == "ASL-MVP-004":
             validation = self._validate_exported_activity(session_id, finding, canary)
+        elif finding.rule_id == "STORAGE-WORLD-READABLE":
+            validation = self._validate_world_readable_storage(
+                session_id,
+                finding,
+                canary,
+            )
         else:
-            raise SessionError("No MVP validator is registered for this finding.")
-        updated = self.findings.set_validation(session_id, finding_id, validation)
+            raise SessionError("No production validator is registered for this finding.")
+        self.findings.set_validation(session_id, finding_id, validation)
         self.repository.append_event(
             session_id,
             "finding_validated",
@@ -432,5 +643,10 @@ class ValidationService:
                 "validation_type": validation.validation_type,
             },
         )
+        # Controlled actions may add traffic, logcat, or other evidence consumed
+        # by rules beyond the finding that initiated validation. Re-evaluate the
+        # shared evidence once so those correlations are not left stale.
+        RuleEngine(self.paths, self.repository).evaluate(session_id)
+        updated = self.findings.get(session_id, finding_id)
         ReportService(self.paths, self.repository).generate(session_id)
         return updated

@@ -19,6 +19,9 @@ def _prepared_session(
     tmp_path: Path,
     *,
     static_candidates: tuple[str, ...] = (),
+    static_behavior_candidates: tuple[dict[str, object], ...] = (),
+    api_policy_matches: tuple[dict[str, object], ...] | None = None,
+    static_status: str = "completed",
 ) -> tuple[ProjectPaths, SessionRepository, str]:
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
@@ -30,6 +33,15 @@ def _prepared_session(
     repository = SessionRepository(paths)
     record = repository.initialize(serial="FIXTURE_SERIAL", package=PACKAGE)
     session_paths = repository.paths_for(record.session_id)
+    static_analysis: dict[str, object] = {
+        "status": static_status,
+        "security_api_candidates": [
+            {"inventory_id": candidate} for candidate in static_candidates
+        ],
+        "static_behavior_candidates": list(static_behavior_candidates),
+    }
+    if api_policy_matches is not None:
+        static_analysis["api_policy_matches"] = list(api_policy_matches)
     write_json_atomic(
         session_paths.app_json,
         {
@@ -41,16 +53,45 @@ def _prepared_session(
                 "network_security_config": None,
                 "components": [],
             },
-            "static_analysis": {
-                "status": "completed",
-                "security_api_candidates": [
-                    {"inventory_id": candidate} for candidate in static_candidates
-                ],
-            },
+            "static_analysis": static_analysis,
         },
         root=paths.root,
     )
     return paths, repository, record.session_id
+
+
+def _static_behavior_candidate(
+    rule_id: str,
+    *,
+    confidence: str = "high",
+) -> dict[str, object]:
+    return {
+        "rule_id": rule_id,
+        "confidence": confidence,
+        "source_id": "dex-source-fixture",
+        "dex_entry": "classes.dex",
+        "caller_class_descriptor": "Lcom/example/phase2lab/SecurityFlow;",
+        "caller_method_name": "exercise",
+        "caller_prototype": "()V",
+        "indicators": ["fixture.normalized_call_site"],
+    }
+
+
+def _register_static_inventory(
+    paths: ProjectPaths,
+    repository: SessionRepository,
+    session_id: str,
+) -> str:
+    record = EvidenceRepository(paths, repository).register_file(
+        session_id,
+        repository.paths_for(session_id).app_json,
+        evidence_type="static_apk_inventory",
+        source="fixture",
+        description="Bounded static behavior inventory fixture.",
+        sensitive=False,
+        redacted=True,
+    )
+    return record.evidence_id
 
 
 def _event(
@@ -845,7 +886,15 @@ def test_crypto_rule_coverage_is_per_flow_not_aggregate_policy_pass(
 def test_weak_random_crypto_correlation_is_consumed_by_rule_engine(
     tmp_path: Path,
 ) -> None:
-    paths, repository, session_id = _prepared_session(tmp_path)
+    paths, repository, session_id = _prepared_session(
+        tmp_path,
+        static_behavior_candidates=(
+            _static_behavior_candidate(
+                "CRYPTO-PREDICTABLE-RANDOM",
+                confidence="medium",
+            ),
+        ),
+    )
     _write_frida_events(
         paths,
         repository,
@@ -883,6 +932,12 @@ def test_weak_random_crypto_correlation_is_consumed_by_rule_engine(
         "CRYPTO-PREDICTABLE-RANDOM"
     ]
     assert finding.status is FindingStatus.CONFIRMED
+    assert finding.confidence == "high"
+    assert finding.analysis_type == "instrumentation"
+    assert finding.details["method"] == "normalized_frida_crypto_correlation"
+    assert finding.details["static_behavior_candidates"][0][
+        "caller_method_name"
+    ] == "exercise"
     assert finding.details["uses"] == ["initialization_vector", "key_material"]
 
 
@@ -997,6 +1052,109 @@ def test_storage_security_rules_do_not_treat_root_readability_as_a_finding(
     assert findings["STORAGE-WORLD-WRITABLE"].status is FindingStatus.PASS
     assert findings["STORAGE-SENSITIVE-CANARY"].status is FindingStatus.INCONCLUSIVE
     assert findings["ASL-RUNTIME-STORAGE"].details["observation_only"] is True
+
+
+def test_storage_static_candidate_keeps_confirmed_runtime_artifact(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id = _prepared_session(
+        tmp_path,
+        static_behavior_candidates=(
+            _static_behavior_candidate("STORAGE-WORLD-READABLE"),
+        ),
+    )
+    static_evidence_id = _register_static_inventory(paths, repository, session_id)
+    session_paths = repository.paths_for(session_id)
+    output = session_paths.redacted_dir / "storage" / "private-storage.json"
+    write_json_atomic(
+        output,
+        {
+            "root_mode": "adb_root",
+            "inventory_status": "completed",
+            "inventory_limitations": [],
+            "content_scan_status": "completed",
+            "content_scan_limitations": [],
+            "observations": [
+                {
+                    "observation_id": "storage-world-readable",
+                    "status": "confirmed",
+                    "finding_eligible": True,
+                    "artifact_paths": ["shared_prefs/public.xml"],
+                    "rationale": "A package-owned file grants read access to other UIDs.",
+                }
+            ],
+        },
+        root=paths.root,
+    )
+    storage_evidence_id = EvidenceRepository(paths, repository).register_file(
+        session_id,
+        output,
+        evidence_type="private_storage_metadata",
+        source="fixture",
+        description="Bounded storage fixture.",
+        sensitive=True,
+        redacted=True,
+    ).evidence_id
+
+    finding = _findings(paths, repository, session_id)["STORAGE-WORLD-READABLE"]
+
+    assert finding.status is FindingStatus.CONFIRMED
+    assert finding.analysis_type == "root_assisted"
+    assert finding.evidence_ids == (storage_evidence_id, static_evidence_id)
+    assert finding.details["static_behavior_candidates"][0]["rule_id"] == (
+        "STORAGE-WORLD-READABLE"
+    )
+
+
+def test_completed_storage_inventory_rejects_static_storage_candidate(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id = _prepared_session(
+        tmp_path,
+        static_behavior_candidates=(
+            _static_behavior_candidate("STORAGE-WORLD-READABLE"),
+        ),
+    )
+    static_evidence_id = _register_static_inventory(paths, repository, session_id)
+    session_paths = repository.paths_for(session_id)
+    output = session_paths.redacted_dir / "storage" / "private-storage.json"
+    write_json_atomic(
+        output,
+        {
+            "root_mode": "adb_root",
+            "inventory_status": "completed",
+            "inventory_limitations": [],
+            "content_scan_status": "completed",
+            "content_scan_limitations": [],
+            "observations": [],
+        },
+        root=paths.root,
+    )
+    storage_evidence_id = EvidenceRepository(paths, repository).register_file(
+        session_id,
+        output,
+        evidence_type="private_storage_metadata",
+        source="fixture",
+        description="Bounded storage fixture.",
+        sensitive=True,
+        redacted=True,
+    ).evidence_id
+
+    finding = _findings(paths, repository, session_id)["STORAGE-WORLD-READABLE"]
+
+    assert finding.status is FindingStatus.PASS
+    assert finding.analysis_type == "root_assisted"
+    assert finding.root_used is True
+    assert finding.evidence_ids == (storage_evidence_id, static_evidence_id)
+    assert finding.details["method"] == "bounded_private_storage_correlation"
+    assert finding.details["static_behavior_outcome"] == (
+        "rejected_by_completed_private_storage_inventory"
+    )
+    assert finding.details["candidate_count"] == 1
+    assert finding.details["static_behavior_candidates"][0]["rule_id"] == (
+        "STORAGE-WORLD-READABLE"
+    )
+    assert finding.details["missing_evidence"] == []
 
 
 def test_incomplete_storage_inventory_cannot_produce_permission_passes(
@@ -1132,6 +1290,219 @@ def test_quick_profile_structurally_skips_capability_dependent_rules(
     # The static WebView SSL candidate remains evaluable without Frida.
     assert findings["WEBVIEW-SSL-ERROR-PROCEED"].status is FindingStatus.POTENTIAL
     assert findings["WEBVIEW-SSL-ERROR-PROCEED"].details["frida_required"] is False
+
+
+def test_static_behavior_candidates_are_potential_call_site_evidence(
+    tmp_path: Path,
+) -> None:
+    rule_ids = (
+        "CRYPTO-ECB",
+        "CRYPTO-WEAK-ALGORITHM",
+        "CRYPTO-WEAK-DIGEST",
+        "CRYPTO-LOW-PBE-ITERATIONS",
+        "CRYPTO-PREDICTABLE-RANDOM",
+        "WEBVIEW-UNSAFE-SETTINGS",
+        "WEBVIEW-JS-BRIDGE-REMOTE",
+        "WEBVIEW-SSL-ERROR-PROCEED",
+        "STORAGE-WORLD-READABLE",
+        "STORAGE-WORLD-WRITABLE",
+        "ASL-STATIC-DYNAMIC-CODE",
+        "ASL-STATIC-DESERIALIZATION",
+    )
+    paths, repository, session_id = _prepared_session(
+        tmp_path,
+        static_behavior_candidates=tuple(
+            _static_behavior_candidate(rule_id) for rule_id in rule_ids
+        ),
+    )
+    inventory_id = _register_static_inventory(paths, repository, session_id)
+
+    findings = _findings(paths, repository, session_id)
+
+    for rule_id in rule_ids:
+        finding = findings[rule_id]
+        assert finding.status is FindingStatus.POTENTIAL
+        assert finding.analysis_type == "static"
+        assert finding.frida_used is False
+        assert finding.root_used is False
+        assert finding.evidence_ids == (inventory_id,)
+        assert finding.details["method"] == (
+            "bounded_apk_static_behavior_call_site_correlation"
+        )
+        call_site = finding.details["static_behavior_candidates"][0]
+        assert call_site["source_id"] == "dex-source-fixture"
+        assert call_site["dex_entry"] == "classes.dex"
+        assert call_site["caller_class_descriptor"] == (
+            "Lcom/example/phase2lab/SecurityFlow;"
+        )
+        assert call_site["caller_method_name"] == "exercise"
+        assert call_site["caller_prototype"] == "()V"
+        assert call_site["indicators"] == ["fixture.normalized_call_site"]
+        assert any(
+            "runtime execution" in item
+            for item in finding.details["missing_evidence"]
+        )
+        assert any(
+            "runtime reachability" in item
+            for item in finding.details["missing_evidence"]
+        )
+
+
+def test_static_behavior_confidence_is_conservative_and_rejects_malformed(
+    tmp_path: Path,
+) -> None:
+    mixed_high = _static_behavior_candidate("CRYPTO-WEAK-ALGORITHM")
+    mixed_medium = {
+        **_static_behavior_candidate(
+            "CRYPTO-WEAK-ALGORITHM",
+            confidence="medium",
+        ),
+        "caller_method_name": "exerciseAlternate",
+    }
+    malformed = {
+        "rule_id": "WEBVIEW-SSL-ERROR-PROCEED",
+        "confidence": "medium",
+        "indicators": ["ssl_error_action:proceed"],
+    }
+    paths, repository, session_id = _prepared_session(
+        tmp_path,
+        static_behavior_candidates=(
+            _static_behavior_candidate("CRYPTO-ECB", confidence="medium"),
+            _static_behavior_candidate(
+                "CRYPTO-PREDICTABLE-RANDOM",
+                confidence="medium",
+            ),
+            mixed_high,
+            mixed_medium,
+            malformed,
+        ),
+    )
+
+    findings = _findings(paths, repository, session_id)
+
+    assert findings["CRYPTO-ECB"].status is FindingStatus.POTENTIAL
+    assert findings["CRYPTO-ECB"].confidence == "medium"
+    assert findings["CRYPTO-PREDICTABLE-RANDOM"].status is (
+        FindingStatus.POTENTIAL
+    )
+    assert findings["CRYPTO-PREDICTABLE-RANDOM"].confidence == "medium"
+    assert findings["CRYPTO-WEAK-ALGORITHM"].status is FindingStatus.POTENTIAL
+    assert findings["CRYPTO-WEAK-ALGORITHM"].confidence == "medium"
+    assert findings["CRYPTO-WEAK-ALGORITHM"].details[
+        "candidate_confidences"
+    ] == ["high", "medium"]
+    assert findings["WEBVIEW-SSL-ERROR-PROCEED"].status is (
+        FindingStatus.INCONCLUSIVE
+    )
+    assert findings["WEBVIEW-SSL-ERROR-PROCEED"].confidence == "high"
+    assert "static_behavior_candidates" not in findings[
+        "WEBVIEW-SSL-ERROR-PROCEED"
+    ].details
+
+
+def test_static_api_policy_inventory_is_promoted_without_claiming_invocation(
+    tmp_path: Path,
+) -> None:
+    policy_match = {
+        "policy_id": "ANDROID-WEBSETTINGS-PLUGIN-STATE",
+        "disposition": "deprecated",
+        "source_id": "dex-source-fixture",
+        "dex_entry": "classes.dex",
+        "class_descriptor": "Landroid/webkit/WebSettings;",
+        "method_name": "setPluginState",
+        "prototype": "(Landroid/webkit/WebSettings$PluginState;)V",
+        "deprecated_since": 18,
+        "rationale": "Fixture policy rationale.",
+    }
+    paths, repository, session_id = _prepared_session(
+        tmp_path / "matched",
+        api_policy_matches=(policy_match,),
+    )
+    inventory_id = _register_static_inventory(paths, repository, session_id)
+
+    finding = _findings(paths, repository, session_id)["ASL-STATIC-API-POLICY"]
+
+    assert finding.status is FindingStatus.POTENTIAL
+    assert finding.analysis_type == "static"
+    assert finding.evidence_ids == (inventory_id,)
+    assert finding.details["api_policy_matches"] == [policy_match]
+    assert any(
+        "runtime execution" in item for item in finding.details["missing_evidence"]
+    )
+
+    for suffix, matches, status, expected in (
+        ("complete-empty", (), "completed", FindingStatus.PASS),
+        ("partial-empty", (), "partial", FindingStatus.INCONCLUSIVE),
+        ("missing-field", None, "completed", FindingStatus.INCONCLUSIVE),
+    ):
+        case_paths, case_repository, case_session = _prepared_session(
+            tmp_path / suffix,
+            api_policy_matches=matches,
+            static_status=status,
+        )
+
+        case_finding = _findings(case_paths, case_repository, case_session)[
+            "ASL-STATIC-API-POLICY"
+        ]
+
+        assert case_finding.status is expected
+
+
+def test_static_behavior_fallback_bypasses_quick_and_full_execution_gates(
+    tmp_path: Path,
+) -> None:
+    for profile, rule_id in (
+        ("quick", "CRYPTO-ECB"),
+        ("full", "WEBVIEW-JS-BRIDGE-REMOTE"),
+    ):
+        paths, repository, session_id = _prepared_session(
+            tmp_path / profile,
+            static_behavior_candidates=(_static_behavior_candidate(rule_id),),
+        )
+        _write_orchestrated_scan(
+            paths,
+            repository,
+            session_id,
+            profile=profile,
+            frida_step="skipped",
+            storage_step="skipped",
+        )
+
+        finding = _findings(paths, repository, session_id)[rule_id]
+
+        assert finding.status is FindingStatus.POTENTIAL
+        assert finding.analysis_type == "static"
+        assert finding.details["method"] == (
+            "bounded_apk_static_behavior_call_site_correlation"
+        )
+        assert "error_category" not in finding.details
+
+
+def test_static_behavior_fallback_survives_corrupt_frida_evidence(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id = _prepared_session(
+        tmp_path,
+        static_behavior_candidates=(_static_behavior_candidate("CRYPTO-ECB"),),
+    )
+    _write_frida_events(paths, repository, session_id, [])
+    event_path = (
+        repository.paths_for(session_id).redacted_dir / "frida" / "events.jsonl"
+    )
+    write_text_atomic(
+        event_path,
+        event_path.read_text(encoding="utf-8") + "\n",
+        root=paths.root,
+    )
+
+    finding = _findings(paths, repository, session_id)["CRYPTO-ECB"]
+
+    assert finding.status is FindingStatus.POTENTIAL
+    assert finding.analysis_type == "static"
+    assert finding.details["method"] == (
+        "bounded_apk_static_behavior_call_site_correlation"
+    )
+    assert "error_category" not in finding.details
 
 
 def test_full_profile_skips_unavailable_capabilities_and_errors_failed_modules(

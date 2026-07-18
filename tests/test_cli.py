@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from android_assessor import cli
 from android_assessor.cli import build_parser
+from android_assessor.errors import AndroidAssessorError
 from android_assessor.explorer import ExplorerConfig
 from android_assessor.paths import ProjectPaths
 
@@ -53,6 +56,7 @@ def test_full_scan_cli_forwards_autonomous_configuration(
             "37",
             "--max-actions",
             "12",
+            "--controlled-canary",
             "--json",
         ]
     )
@@ -64,6 +68,7 @@ def test_full_scan_cli_forwards_autonomous_configuration(
     assert calls[0]["profile"] == "full"
     assert calls[0]["autonomous"] is True
     assert calls[0]["runtime_seconds"] == 37
+    assert calls[0]["controlled_canary"] is True
     config = calls[0]["explorer_config"]
     assert isinstance(config, ExplorerConfig)
     assert config.max_runtime_seconds == 37
@@ -88,3 +93,23 @@ def test_full_scan_cli_forwards_autonomous_configuration(
     ) == 0
     assert calls[0]["autonomous"] is False
     assert calls[0]["explorer_config"] is None
+    assert calls[0]["controlled_canary"] is False
+
+
+def test_controlled_canary_cli_requires_autonomous_full_profile(tmp_path) -> None:
+    args = build_parser().parse_args(
+        [
+            "scan",
+            "--package",
+            "com.example.lab",
+            "--profile",
+            "quick",
+            "--controlled-canary",
+        ]
+    )
+
+    with pytest.raises(AndroidAssessorError, match="autonomous Full Assessment"):
+        cli._run_scan(  # type: ignore[attr-defined]
+            args,
+            SimpleNamespace(paths=ProjectPaths(tmp_path)),  # type: ignore[arg-type]
+        )

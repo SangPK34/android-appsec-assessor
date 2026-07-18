@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from android_assessor.rule_catalog import ROOT_FOCUSED_TESTS, merge_root_coverage
+from android_assessor.validation_definitions import validation_for_rule
 
 
 def test_root_focused_catalog_has_eleven_unique_bounded_groups() -> None:
@@ -193,18 +194,24 @@ def test_phase2_registry_does_not_overstate_static_or_auto_confirm_support() -> 
     by_id = {row["rule_id"]: row for row in rows}
 
     for rule_id in {
-        "WEBVIEW-JS-BRIDGE-REMOTE",
-        "WEBVIEW-UNSAFE-SETTINGS",
         "ASL-MVP-005",
-        "CRYPTO-ECB",
-        "CRYPTO-WEAK-ALGORITHM",
         "CRYPTO-SHORT-KEY",
         "CRYPTO-ZERO-IV",
         "CRYPTO-REUSED-IV",
-        "CRYPTO-WEAK-DIGEST",
-        "CRYPTO-LOW-PBE-ITERATIONS",
     }:
         assert by_id[rule_id]["static_support"] is False
+    for rule_id in {
+        "WEBVIEW-JS-BRIDGE-REMOTE",
+        "WEBVIEW-UNSAFE-SETTINGS",
+        "CRYPTO-ECB",
+        "CRYPTO-WEAK-ALGORITHM",
+        "CRYPTO-WEAK-DIGEST",
+        "CRYPTO-LOW-PBE-ITERATIONS",
+        "CRYPTO-PREDICTABLE-RANDOM",
+        "STORAGE-WORLD-READABLE",
+        "STORAGE-WORLD-WRITABLE",
+    }:
+        assert by_id[rule_id]["static_support"] is True
     for rule_id in {
         "WEBVIEW-JS-BRIDGE-REMOTE",
         "WEBVIEW-UNSAFE-SETTINGS",
@@ -259,10 +266,8 @@ def test_coverage_registry_matches_production_rule_and_validation_catalog() -> N
         assert coverage_by_id[rule["id"]]["frida_required"] is bool(
             rule.get("frida_required", False)
         )
-        expected = rule.get("validation_type", "none") in {
-            "natural_validation",
-            "adb_assisted_validation",
-        }
+        definition = validation_for_rule(rule["id"])
+        expected = bool(definition and definition.production_enabled)
         assert (
             coverage_by_id[rule["id"]]["controlled_validation_available"]
             is expected

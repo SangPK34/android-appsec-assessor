@@ -239,6 +239,12 @@ class StaticApkPolicy:
     max_policy_api_matches: int = 500
     max_embedded_code_entries: int = 500
     max_security_api_matches: int = 500
+    max_dex_class_defs: int = 100_000
+    max_dex_encoded_methods: int = 200_000
+    max_dex_code_units: int = 8_000_000
+    max_dex_invocations: int = 500_000
+    min_pbe_iterations: int = 10_000
+    max_static_behavior_candidates: int = 500
 
     def __post_init__(self) -> None:
         numeric_values = asdict(self)
@@ -316,6 +322,15 @@ DEFAULT_API_POLICY: tuple[ApiPolicyEntry, ...] = (
         rationale="Android deprecated WebView form-data saving in API level 26.",
     ),
     ApiPolicyEntry(
+        policy_id="ANDROID-WEBSETTINGS-PLUGIN-STATE",
+        class_descriptor="Landroid/webkit/WebSettings;",
+        method_name="setPluginState",
+        prototype="(Landroid/webkit/WebSettings$PluginState;)V",
+        disposition="deprecated",
+        deprecated_since=18,
+        rationale="Android deprecated WebView plugin-state configuration in API level 18.",
+    ),
+    ApiPolicyEntry(
         policy_id="ANDROID-ACTIVITYMANAGER-RUNNING-TASKS",
         class_descriptor="Landroid/app/ActivityManager;",
         method_name="getRunningTasks",
@@ -346,6 +361,36 @@ class DexInventory:
     method_references: tuple[DexMethodReference, ...]
     oversized_strings: int
     oversized_string_regions: tuple[tuple[int, int], ...] = ()
+    behavior_signals: tuple[_DexBehaviorSignal, ...] = ()
+    behavior_limitations: tuple[str, ...] = ()
+    behavior_metrics: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _DexBehaviorSignal:
+    rule_id: str
+    confidence: str
+    caller_class_descriptor: str
+    caller_method_name: str
+    caller_prototype: str
+    indicators: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StaticBehaviorCandidate:
+    rule_id: str
+    confidence: str
+    source_id: str
+    dex_entry: str
+    caller_class_descriptor: str
+    caller_method_name: str
+    caller_prototype: str
+    indicators: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["indicators"] = list(self.indicators)
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,6 +475,7 @@ class StaticApkAnalysisResult:
     limitations: tuple[str, ...]
     metrics: dict[str, int]
     security_api_candidates: tuple[ApiInventoryMatch, ...] = ()
+    static_behavior_candidates: tuple[StaticBehaviorCandidate, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -443,6 +489,9 @@ class StaticApkAnalysisResult:
             ],
             "security_api_candidates": [
                 item.to_dict() for item in self.security_api_candidates
+            ],
+            "static_behavior_candidates": [
+                item.to_dict() for item in self.static_behavior_candidates
             ],
             "api_policy_matches": [item.to_dict() for item in self.api_policy_matches],
             "embedded_code": [item.to_dict() for item in self.embedded_code],
@@ -459,6 +508,7 @@ class _Collector:
     endpoints: list[EndpointCandidate] = field(default_factory=list)
     dynamic: list[ApiInventoryMatch] = field(default_factory=list)
     security: list[ApiInventoryMatch] = field(default_factory=list)
+    behavior: list[StaticBehaviorCandidate] = field(default_factory=list)
     policy_matches: list[ApiPolicyMatch] = field(default_factory=list)
     embedded: list[EmbeddedCodeEntry] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
@@ -473,6 +523,11 @@ class _Collector:
             "dex_files_scanned": 0,
             "dex_strings_scanned": 0,
             "dex_method_references": 0,
+            "dex_class_defs_seen": 0,
+            "dex_behavior_methods_scanned": 0,
+            "dex_behavior_code_units_scanned": 0,
+            "dex_behavior_invocations_scanned": 0,
+            "static_behavior_candidates": 0,
             "resource_strings_scanned": 0,
             "text_entries_scanned": 0,
             "string_scan_bytes": 0,
@@ -485,6 +540,7 @@ class _Collector:
     endpoint_keys: set[tuple[str, str]] = field(default_factory=set)
     dynamic_keys: set[tuple[str, str, str, str, str]] = field(default_factory=set)
     security_keys: set[tuple[str, str, str, str, str]] = field(default_factory=set)
+    behavior_keys: set[tuple[str, str, str, str, str]] = field(default_factory=set)
     policy_keys: set[tuple[str, str, str, str]] = field(default_factory=set)
     embedded_keys: set[tuple[str, str]] = field(default_factory=set)
     source_sensitive_values: dict[str, list[str]] = field(default_factory=dict)
@@ -1015,6 +1071,878 @@ def _read_dex_string(
     return decoded, False, len(raw), start
 
 
+@dataclass(frozen=True, slots=True)
+class _DexConstant:
+    value: str | int | tuple[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _DexInvocation:
+    reference: DexMethodReference
+    arguments: tuple[_DexConstant | None, ...]
+    argument_generations: tuple[int, ...]
+    invoke_kind: str
+
+
+def _sign_extend(value: int, bits: int) -> int:
+    sign = 1 << (bits - 1)
+    return (value ^ sign) - sign
+
+
+def _dex_payload_width(insns: memoryview, offset: int, signature: int) -> int | None:
+    remaining = len(insns) - offset
+    if signature == 0x0100:
+        if remaining < 2:
+            raise DexFormatError("DEX packed-switch payload is truncated.")
+        return 4 + int(insns[offset + 1]) * 2
+    if signature == 0x0200:
+        if remaining < 2:
+            raise DexFormatError("DEX sparse-switch payload is truncated.")
+        return 2 + int(insns[offset + 1]) * 4
+    if signature == 0x0300:
+        if remaining < 4:
+            raise DexFormatError("DEX array-data payload is truncated.")
+        element_width = int(insns[offset + 1])
+        element_count = int(insns[offset + 2]) | (int(insns[offset + 3]) << 16)
+        if element_width not in {1, 2, 4, 8}:
+            raise DexFormatError("DEX array-data element width is invalid.")
+        return 4 + (element_width * element_count + 1) // 2
+    return None
+
+
+def _dex_instruction_width(insns: memoryview, offset: int) -> int | None:
+    unit = int(insns[offset])
+    opcode = unit & 0xFF
+    if opcode == 0x00:
+        if unit == 0:
+            return 1
+        return _dex_payload_width(insns, offset, unit)
+    if opcode in {
+        0x02,
+        0x05,
+        0x08,
+        0x13,
+        0x15,
+        0x16,
+        0x19,
+        0x1A,
+        0x1C,
+        0x1F,
+        0x20,
+        0x22,
+        0x23,
+        0x29,
+        0xFE,
+        0xFF,
+    } or 0x2D <= opcode <= 0x6D or 0x90 <= opcode <= 0xAF or 0xD0 <= opcode <= 0xE2:
+        return 2
+    if opcode in {
+        0x03,
+        0x06,
+        0x09,
+        0x14,
+        0x17,
+        0x1B,
+        0x24,
+        0x25,
+        0x26,
+        0x2A,
+        0x2B,
+        0x2C,
+        0x6E,
+        0x6F,
+        0x70,
+        0x71,
+        0x72,
+        0x74,
+        0x75,
+        0x76,
+        0x77,
+        0x78,
+        0xFC,
+        0xFD,
+    }:
+        return 3
+    if opcode in {0xFA, 0xFB}:
+        return 4
+    if opcode == 0x18:
+        return 5
+    if (
+        0x01 <= opcode <= 0x12
+        or 0x1D <= opcode <= 0x1E
+        or opcode in {0x21, 0x27, 0x28}
+        or 0x7B <= opcode <= 0x8F
+        or 0xB0 <= opcode <= 0xCF
+    ):
+        return 1
+    return None
+
+
+def _invoke_registers(insns: memoryview, offset: int, opcode: int) -> tuple[int, ...]:
+    first = int(insns[offset])
+    if 0x6E <= opcode <= 0x72:
+        count = (first >> 12) & 0x0F
+        if count > 5:
+            raise DexFormatError("DEX invoke argument count is invalid.")
+        packed = int(insns[offset + 2])
+        registers = (
+            packed & 0x0F,
+            (packed >> 4) & 0x0F,
+            (packed >> 8) & 0x0F,
+            (packed >> 12) & 0x0F,
+            (first >> 8) & 0x0F,
+        )
+        return registers[:count]
+    count = (first >> 8) & 0xFF
+    start = int(insns[offset + 2])
+    return tuple(range(start, start + count))
+
+
+def _scan_dex_invocations(
+    data: bytes,
+    *,
+    code_offset: int,
+    method_table: Sequence[DexMethodReference | None],
+    string_count: int,
+    invocation_budget: int,
+) -> tuple[tuple[_DexInvocation, ...], int, bool, bool]:
+    if code_offset < _DEX_HEADER_SIZE or code_offset % 4 or code_offset + 16 > len(data):
+        raise DexFormatError("DEX code item is outside the file bounds.")
+    registers_size, _ins_size, _outs_size, tries_size = struct.unpack_from(
+        "<4H", data, code_offset
+    )
+    insns_size = _uint32(data, code_offset + 12)
+    insns_offset = code_offset + 16
+    insns_end = insns_offset + insns_size * 2
+    if insns_end > len(data):
+        raise DexFormatError("DEX code instructions are truncated.")
+    if tries_size:
+        tries_offset = insns_end + (2 if insns_size % 2 else 0)
+        if tries_offset + tries_size * 8 > len(data):
+            raise DexFormatError("DEX code exception table is truncated.")
+    insns = memoryview(data)[insns_offset:insns_end].cast("H")
+    constants: dict[int, _DexConstant] = {}
+    register_generations: dict[int, int] = {}
+    next_generation = 1
+    flow_epoch = 0
+
+    def validate_register(register: int, *, width: int = 1) -> None:
+        if register < 0 or register + width > registers_size:
+            raise DexFormatError("DEX instruction references an invalid register.")
+
+    def register_generation(register: int) -> int:
+        validate_register(register)
+        return register_generations.get(
+            register,
+            -(flow_epoch * 0x10000 + register + 1),
+        )
+
+    def define_register(register: int, *, width: int = 1) -> None:
+        nonlocal next_generation
+        validate_register(register, width=width)
+        for item in range(register, register + width):
+            constants.pop(item, None)
+            register_generations[item] = next_generation
+            next_generation += 1
+
+    def copy_register(destination: int, source: int) -> None:
+        validate_register(destination)
+        validate_register(source)
+        if source in constants:
+            constants[destination] = constants[source]
+        else:
+            constants.pop(destination, None)
+        register_generations[destination] = register_generation(source)
+
+    def clear_flow_state() -> None:
+        nonlocal flow_epoch
+        constants.clear()
+        register_generations.clear()
+        flow_epoch += 1
+
+    invocations: list[_DexInvocation] = []
+    offset = 0
+    unsupported = False
+    limited = False
+    while offset < len(insns):
+        first = int(insns[offset])
+        opcode = first & 0xFF
+        width = _dex_instruction_width(insns, offset)
+        if width is None:
+            unsupported = True
+            break
+        if width < 1 or offset + width > len(insns):
+            raise DexFormatError("DEX instruction is truncated.")
+
+        if opcode == 0x12:
+            register = (first >> 8) & 0x0F
+            define_register(register)
+            constants[register] = _DexConstant(_sign_extend(first >> 12, 4))
+        elif opcode == 0x13:
+            destination = first >> 8
+            define_register(destination)
+            constants[destination] = _DexConstant(
+                _sign_extend(int(insns[offset + 1]), 16)
+            )
+        elif opcode == 0x14:
+            literal = int(insns[offset + 1]) | (int(insns[offset + 2]) << 16)
+            destination = first >> 8
+            define_register(destination)
+            constants[destination] = _DexConstant(_sign_extend(literal, 32))
+        elif opcode == 0x15:
+            literal = int(insns[offset + 1]) << 16
+            destination = first >> 8
+            define_register(destination)
+            constants[destination] = _DexConstant(_sign_extend(literal, 32))
+        elif 0x16 <= opcode <= 0x19:
+            define_register(first >> 8, width=2)
+        elif opcode in {0x1A, 0x1B}:
+            string_index = int(insns[offset + 1])
+            if opcode == 0x1B:
+                string_index |= int(insns[offset + 2]) << 16
+            if string_index >= string_count:
+                raise DexFormatError(
+                    "DEX const-string references an invalid string index."
+                )
+            # String values are looked up by the caller because method-id parsing
+            # deliberately does not retain a second unbounded string table here.
+            destination = first >> 8
+            define_register(destination)
+            constants[destination] = _DexConstant(("string-index", string_index))
+        elif opcode in {0x01, 0x07}:
+            destination = (first >> 8) & 0x0F
+            source = (first >> 12) & 0x0F
+            copy_register(destination, source)
+        elif opcode == 0x04:
+            source = (first >> 12) & 0x0F
+            validate_register(source, width=2)
+            define_register((first >> 8) & 0x0F, width=2)
+        elif opcode in {0x02, 0x08}:
+            destination = first >> 8
+            source = int(insns[offset + 1])
+            copy_register(destination, source)
+        elif opcode == 0x05:
+            validate_register(int(insns[offset + 1]), width=2)
+            define_register(first >> 8, width=2)
+        elif opcode in {0x03, 0x09}:
+            destination = int(insns[offset + 1])
+            source = int(insns[offset + 2])
+            copy_register(destination, source)
+        elif opcode == 0x06:
+            validate_register(int(insns[offset + 2]), width=2)
+            define_register(int(insns[offset + 1]), width=2)
+        elif 0x6E <= opcode <= 0x72 or 0x74 <= opcode <= 0x78:
+            registers = _invoke_registers(insns, offset, opcode)
+            if any(register >= registers_size for register in registers):
+                raise DexFormatError("DEX invoke references an invalid register.")
+            method_index = int(insns[offset + 1])
+            if method_index >= len(method_table):
+                raise DexFormatError("DEX invoke references an invalid method index.")
+            reference = method_table[method_index]
+            if reference is not None:
+                if len(invocations) >= invocation_budget:
+                    limited = True
+                    break
+                invocations.append(
+                    _DexInvocation(
+                        reference=reference,
+                        arguments=tuple(constants.get(register) for register in registers),
+                        argument_generations=tuple(
+                            register_generation(register) for register in registers
+                        ),
+                        invoke_kind={
+                            0x6E: "virtual",
+                            0x6F: "super",
+                            0x70: "direct",
+                            0x71: "static",
+                            0x72: "interface",
+                            0x74: "virtual",
+                            0x75: "super",
+                            0x76: "direct",
+                            0x77: "static",
+                            0x78: "interface",
+                        }[opcode],
+                    )
+                )
+        elif opcode in {0x0A, 0x0C, 0x0D}:
+            define_register(first >> 8)
+        elif opcode == 0x0B:
+            define_register(first >> 8, width=2)
+        elif opcode in {0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C} or 0x32 <= opcode <= 0x3D:
+            clear_flow_state()
+        elif opcode in {0x21, 0x23, 0x20}:
+            define_register((first >> 8) & 0x0F)
+        elif 0x52 <= opcode <= 0x58:
+            define_register(
+                (first >> 8) & 0x0F,
+                width=2 if opcode == 0x53 else 1,
+            )
+        elif opcode in {0x1C, 0x1F, 0x22, 0xFE, 0xFF}:
+            define_register(first >> 8)
+        elif 0x2D <= opcode <= 0x31:
+            define_register(first >> 8)
+        elif 0x44 <= opcode <= 0x4A:
+            define_register(first >> 8, width=2 if opcode == 0x45 else 1)
+        elif 0x60 <= opcode <= 0x66:
+            define_register(first >> 8, width=2 if opcode == 0x61 else 1)
+        elif 0x7B <= opcode <= 0x8F:
+            define_register(
+                (first >> 8) & 0x0F,
+                width=(
+                    2
+                    if opcode
+                    in {0x7D, 0x7E, 0x80, 0x81, 0x83, 0x86, 0x88, 0x89, 0x8B}
+                    else 1
+                ),
+            )
+        elif 0x90 <= opcode <= 0xAF:
+            define_register(
+                first >> 8,
+                width=2 if 0x9B <= opcode <= 0xA5 or 0xAB <= opcode <= 0xAF else 1,
+            )
+        elif 0xB0 <= opcode <= 0xCF:
+            define_register(
+                (first >> 8) & 0x0F,
+                width=2 if 0xBB <= opcode <= 0xC5 or 0xCB <= opcode <= 0xCF else 1,
+            )
+        elif 0xD0 <= opcode <= 0xD7:
+            define_register((first >> 8) & 0x0F)
+        elif 0xD8 <= opcode <= 0xE2:
+            define_register(first >> 8)
+        offset += width
+    return tuple(invocations), offset, unsupported, limited
+
+
+def _constant_value(
+    value: _DexConstant | None,
+    strings: Sequence[str | None],
+) -> str | int | None:
+    if value is None:
+        return None
+    raw = value.value
+    if isinstance(raw, tuple):
+        string_index = raw[1]
+        if 0 <= string_index < len(strings):
+            return strings[string_index]
+        raise DexFormatError("DEX const-string references an invalid string index.")
+    return raw
+
+
+def _algorithm_family(value: str) -> str:
+    algorithm = value.upper().strip().split("/", 1)[0]
+    return re.sub(r"[^A-Z0-9]", "", algorithm)
+
+
+def _weak_cipher_family(value: str) -> str | None:
+    family = _algorithm_family(value)
+    aliases = {
+        "DES": "des",
+        "DESEDE": "triple_des",
+        "3DES": "triple_des",
+        "TRIPLEDES": "triple_des",
+        "RC2": "rc2",
+        "RC4": "rc4",
+        "ARC4": "rc4",
+        "ARCFOUR": "rc4",
+        "BLOWFISH": "blowfish",
+    }
+    if family in aliases:
+        return aliases[family]
+    if family.startswith("PBEWITH") and any(
+        marker in family for marker in ("MD5", "SHA1", "DES", "RC2", "RC4")
+    ):
+        return "legacy_pbe"
+    return None
+
+
+def _weak_digest_family(value: str) -> str | None:
+    family = re.sub(r"[^A-Z0-9]", "", value.upper().strip())
+    if family in {"MD2", "MD4", "MD5", "HMACMD5"}:
+        return "md5_family"
+    if family in {"SHA", "SHA1", "HMACSHA1"}:
+        return "sha1_family"
+    return None
+
+
+def _is_remote_url(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    scheme = urlsplit(value.strip()).scheme.lower()
+    return scheme if scheme in {"http", "https", "ws", "wss"} else None
+
+
+def _behavior_signals_for_method(
+    caller: DexMethodReference,
+    invocations: Sequence[_DexInvocation],
+    strings: Sequence[str | None],
+    *,
+    min_pbe_iterations: int,
+) -> tuple[_DexBehaviorSignal, ...]:
+    detected: dict[str, tuple[str, set[str]]] = {}
+
+    def record(rule_id: str, confidence: str, *indicators: str) -> None:
+        current = detected.get(rule_id)
+        if current is None:
+            detected[rule_id] = (confidence, set(indicators))
+            return
+        old_confidence, old_indicators = current
+        if old_confidence == "medium" and confidence == "high":
+            old_confidence = "high"
+        old_indicators.update(indicators)
+        detected[rule_id] = (old_confidence, old_indicators)
+
+    random_material_generations: set[int] = set()
+    correlated_crypto_material: set[str] = set()
+    javascript_enabled = False
+    javascript_bridge = False
+    remote_web_content: set[str] = set()
+
+    for invocation in invocations:
+        reference = invocation.reference
+        arguments = tuple(
+            _constant_value(item, strings) for item in invocation.arguments
+        )
+        class_name = reference.class_descriptor
+        method_name = reference.method_name
+        prototype = reference.prototype
+        argument_generations = invocation.argument_generations
+
+        if (
+            class_name == "Ljavax/crypto/Cipher;"
+            and method_name == "getInstance"
+            and invocation.invoke_kind == "static"
+            and prototype.startswith("(Ljava/lang/String;")
+            and arguments
+            and isinstance(arguments[0], str)
+        ):
+            transformation = arguments[0]
+            normalized = transformation.upper().replace(" ", "")
+            parts = normalized.split("/")
+            family = _algorithm_family(transformation)
+            if len(parts) >= 2 and parts[1] == "ECB":
+                record(
+                    "CRYPTO-ECB",
+                    "high",
+                    "cipher_mode:ecb",
+                    f"cipher_family:{family.lower()}",
+                )
+            elif "/" not in normalized and family in {
+                "AES",
+                "ARIA",
+                "BLOWFISH",
+                "CAMELLIA",
+                "CAST5",
+                "DES",
+                "DESEDE",
+                "IDEA",
+                "RC2",
+                "SEED",
+                "TRIPLEDES",
+            }:
+                record(
+                    "CRYPTO-ECB",
+                    "medium",
+                    "cipher_mode:provider_default",
+                    f"cipher_family:{family.lower()}",
+                )
+            weak_family = _weak_cipher_family(transformation)
+            if weak_family is not None:
+                record(
+                    "CRYPTO-WEAK-ALGORITHM",
+                    "high",
+                    f"weak_cipher_family:{weak_family}",
+                )
+
+        if (
+            class_name in {"Ljava/security/MessageDigest;", "Ljavax/crypto/Mac;"}
+            and method_name == "getInstance"
+            and invocation.invoke_kind == "static"
+            and arguments
+            and isinstance(arguments[0], str)
+        ):
+            weak_family = _weak_digest_family(arguments[0])
+            if weak_family is not None:
+                record(
+                    "CRYPTO-WEAK-DIGEST",
+                    "high",
+                    f"weak_digest_family:{weak_family}",
+                    (
+                        "primitive:message_digest"
+                        if class_name == "Ljava/security/MessageDigest;"
+                        else "primitive:mac"
+                    ),
+                )
+
+        iteration: object | None = None
+        if (
+            class_name == "Ljavax/crypto/spec/PBEParameterSpec;"
+            and method_name == "<init>"
+            and invocation.invoke_kind == "direct"
+            and prototype in {
+                "([BI)V",
+                "([BILjava/security/spec/AlgorithmParameterSpec;)V",
+            }
+            and len(arguments) >= 3
+        ):
+            iteration = arguments[2]
+        elif (
+            class_name == "Ljavax/crypto/spec/PBEKeySpec;"
+            and method_name == "<init>"
+            and invocation.invoke_kind == "direct"
+            and prototype in {"([C[BI)V", "([C[BII)V"}
+            and len(arguments) >= 4
+        ):
+            iteration = arguments[3]
+        if isinstance(iteration, int) and iteration < min_pbe_iterations:
+            record(
+                "CRYPTO-LOW-PBE-ITERATIONS",
+                "high",
+                "pbe_iterations:below_policy",
+                f"policy_min_iterations:{min_pbe_iterations}",
+            )
+
+        if (
+            class_name == "Ljava/util/Random;"
+            and method_name == "nextBytes"
+            and invocation.invoke_kind == "virtual"
+            and len(argument_generations) >= 2
+        ):
+            random_material_generations.add(argument_generations[1])
+        crypto_material_inputs = {
+            "Ljavax/crypto/spec/SecretKeySpec;": (1, "secret_key"),
+            "Ljavax/crypto/spec/IvParameterSpec;": (1, "initialization_vector"),
+            "Ljavax/crypto/spec/PBEKeySpec;": (2, "pbe_salt"),
+            "Ljavax/crypto/spec/PBEParameterSpec;": (1, "pbe_salt"),
+        }
+        material_input = crypto_material_inputs.get(class_name)
+        if material_input is not None and invocation.invoke_kind == "direct":
+            register_index, material_name = material_input
+            if (
+                len(argument_generations) > register_index
+                and argument_generations[register_index]
+                in random_material_generations
+            ):
+                correlated_crypto_material.add(material_name)
+
+        if (
+            class_name == "Landroid/webkit/WebSettings;"
+            and invocation.invoke_kind == "virtual"
+        ):
+            unsafe_true = {
+                "setAllowContentAccess": "content_access",
+                "setAllowFileAccess": "file_access",
+                "setAllowFileAccessFromFileURLs": "file_url_access",
+                "setAllowUniversalAccessFromFileURLs": "universal_file_url_access",
+                "setGeolocationEnabled": "geolocation",
+                "setJavaScriptCanOpenWindowsAutomatically": "javascript_windows",
+                "setJavaScriptEnabled": "javascript_enabled",
+            }
+            setting = unsafe_true.get(method_name)
+            value = arguments[1] if len(arguments) >= 2 else None
+            if setting is not None and value == 1:
+                record(
+                    "WEBVIEW-UNSAFE-SETTINGS",
+                    "high",
+                    f"unsafe_web_setting:{setting}",
+                    "constant_value:true",
+                )
+                javascript_enabled = javascript_enabled or (
+                    method_name == "setJavaScriptEnabled"
+                )
+            if method_name == "setMixedContentMode" and value == 0:
+                record(
+                    "WEBVIEW-UNSAFE-SETTINGS",
+                    "high",
+                    "unsafe_web_setting:mixed_content",
+                    "constant_value:always_allow",
+                )
+            if method_name == "setSafeBrowsingEnabled" and value == 0:
+                record(
+                    "WEBVIEW-UNSAFE-SETTINGS",
+                    "high",
+                    "unsafe_web_setting:safe_browsing_disabled",
+                    "constant_value:false",
+                )
+        if (
+            class_name == "Landroid/webkit/WebView;"
+            and method_name == "addJavascriptInterface"
+            and invocation.invoke_kind == "virtual"
+            and prototype == "(Ljava/lang/Object;Ljava/lang/String;)V"
+        ):
+            javascript_bridge = True
+        if (
+            class_name == "Landroid/webkit/WebView;"
+            and method_name in {"loadUrl", "loadDataWithBaseURL"}
+            and invocation.invoke_kind == "virtual"
+        ):
+            url_argument = arguments[1] if len(arguments) >= 2 else None
+            remote_scheme = _is_remote_url(url_argument)
+            if remote_scheme is not None:
+                remote_web_content.add(remote_scheme)
+        if (
+            class_name == "Landroid/webkit/SslErrorHandler;"
+            and method_name == "proceed"
+            and prototype == "()V"
+            and invocation.invoke_kind == "virtual"
+        ):
+            record(
+                "WEBVIEW-SSL-ERROR-PROCEED",
+                "high",
+                "ssl_error_action:proceed",
+            )
+
+        dynamic_methods = {
+            "Ldalvik/system/DexClassLoader;": {"<init>", "loadClass"},
+            "Ldalvik/system/InMemoryDexClassLoader;": {"<init>", "loadClass"},
+            "Ldalvik/system/DexFile;": {"loadClass", "loadDex"},
+        }
+        if (
+            method_name in dynamic_methods.get(class_name, set())
+            and (
+                (method_name == "<init>" and invocation.invoke_kind == "direct")
+                or (method_name == "loadDex" and invocation.invoke_kind == "static")
+                or (method_name == "loadClass" and invocation.invoke_kind == "virtual")
+            )
+        ):
+            record(
+                "ASL-STATIC-DYNAMIC-CODE",
+                "high" if method_name in {"<init>", "loadDex"} else "medium",
+                "dynamic_code_api:actual_invoke",
+                f"dynamic_code_operation:{method_name.lower().strip('<>')}",
+            )
+        if (
+            class_name == "Ljava/io/ObjectInputStream;"
+            and method_name == "readObject"
+            and prototype == "()Ljava/lang/Object;"
+            and invocation.invoke_kind == "virtual"
+        ):
+            record(
+                "ASL-STATIC-DESERIALIZATION",
+                "medium",
+                "deserialization_api:object_input_stream_read_object",
+            )
+
+        storage_mode_index: int | None = None
+        if class_name in {
+            "Landroid/content/Context;",
+            "Landroid/content/ContextWrapper;",
+        }:
+            if method_name in {"openFileOutput", "getSharedPreferences"}:
+                storage_mode_index = 2
+            elif method_name == "openOrCreateDatabase":
+                storage_mode_index = 2
+        if (
+            storage_mode_index is not None
+            and invocation.invoke_kind == "virtual"
+            and len(arguments) > storage_mode_index
+        ):
+            storage_mode = arguments[storage_mode_index]
+            if isinstance(storage_mode, int):
+                if storage_mode & 0x01:
+                    record(
+                        "STORAGE-WORLD-READABLE",
+                        "high",
+                        "storage_mode:world_readable",
+                        f"storage_api:{method_name}",
+                    )
+                if storage_mode & 0x02:
+                    record(
+                        "STORAGE-WORLD-WRITABLE",
+                        "high",
+                        "storage_mode:world_writable",
+                        f"storage_api:{method_name}",
+                    )
+
+    if correlated_crypto_material:
+        record(
+            "CRYPTO-PREDICTABLE-RANDOM",
+            "medium",
+            "random_api:java_util_random_next_bytes",
+            "correlation:same_register",
+            *(f"crypto_material:{item}" for item in sorted(correlated_crypto_material)),
+        )
+    if javascript_enabled and javascript_bridge and remote_web_content:
+        record(
+            "WEBVIEW-JS-BRIDGE-REMOTE",
+            "high",
+            "webview:javascript_enabled",
+            "webview:javascript_interface",
+            "webview:remote_constant_content",
+            *(f"remote_scheme:{item}" for item in sorted(remote_web_content)),
+        )
+
+    return tuple(
+        _DexBehaviorSignal(
+            rule_id=rule_id,
+            confidence=confidence,
+            caller_class_descriptor=caller.class_descriptor,
+            caller_method_name=caller.method_name,
+            caller_prototype=caller.prototype,
+            indicators=tuple(sorted(indicators)),
+        )
+        for rule_id, (confidence, indicators) in sorted(detected.items())
+    )
+
+
+def _parse_dex_behavior(
+    data: bytes,
+    *,
+    limits: StaticApkPolicy,
+    strings: Sequence[str | None],
+    types: Sequence[str | None],
+    method_table: Sequence[DexMethodReference | None],
+) -> tuple[
+    tuple[_DexBehaviorSignal, ...],
+    tuple[str, ...],
+    tuple[tuple[str, int], ...],
+]:
+    class_count, class_offset = _uint32(data, 0x60), _uint32(data, 0x64)
+    _validate_table(
+        data,
+        name="class-def",
+        size=class_count,
+        offset=class_offset,
+        item_size=32,
+        maximum=limits.max_dex_strings,
+    )
+    metrics = {
+        "dex_class_defs_seen": class_count,
+        "dex_behavior_methods_scanned": 0,
+        "dex_behavior_code_units_scanned": 0,
+        "dex_behavior_invocations_scanned": 0,
+    }
+    limitations: list[str] = []
+
+    def limit(name: str) -> None:
+        if name not in limitations:
+            limitations.append(name)
+
+    class_scan_count = min(class_count, limits.max_dex_class_defs)
+    if class_count > class_scan_count:
+        limit("dex_class_defs")
+    encoded_methods_seen = 0
+    encoded_members_seen = 0
+    signals: list[_DexBehaviorSignal] = []
+    signal_keys: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
+
+    for class_position in range(class_scan_count):
+        class_base = class_offset + class_position * 32
+        class_index = _uint32(data, class_base)
+        class_data_offset = _uint32(data, class_base + 24)
+        if class_index >= len(types):
+            raise DexFormatError("DEX class definition has an invalid type index.")
+        class_descriptor = types[class_index]
+        if class_descriptor is not None and not _is_class_descriptor(class_descriptor):
+            raise DexFormatError("DEX class definition descriptor is malformed.")
+        if class_data_offset == 0:
+            continue
+        if class_data_offset < _DEX_HEADER_SIZE or class_data_offset >= len(data):
+            raise DexFormatError("DEX class data is outside the file bounds.")
+        cursor = class_data_offset
+        counts: list[int] = []
+        for _index in range(4):
+            count, cursor = _read_uleb128(data, cursor)
+            counts.append(count)
+        static_fields, instance_fields, direct_methods, virtual_methods = counts
+        class_members = static_fields + instance_fields + direct_methods + virtual_methods
+        if (
+            class_members > limits.max_dex_encoded_methods
+            or encoded_members_seen + class_members > limits.max_dex_encoded_methods
+        ):
+            limit("dex_encoded_methods")
+            continue
+        encoded_members_seen += class_members
+
+        for _field_position in range(static_fields + instance_fields):
+            _field_index_diff, cursor = _read_uleb128(data, cursor)
+            _access_flags, cursor = _read_uleb128(data, cursor)
+
+        for method_list_size in (direct_methods, virtual_methods):
+            method_index = 0
+            for method_position in range(method_list_size):
+                method_index_diff, cursor = _read_uleb128(data, cursor)
+                _access_flags, cursor = _read_uleb128(data, cursor)
+                code_offset, cursor = _read_uleb128(data, cursor)
+                if method_position == 0:
+                    method_index = method_index_diff
+                else:
+                    method_index += method_index_diff
+                if method_index >= len(method_table):
+                    raise DexFormatError("DEX encoded method has an invalid method index.")
+                caller = method_table[method_index]
+                if (
+                    caller is not None
+                    and class_descriptor is not None
+                    and caller.class_descriptor != class_descriptor
+                ):
+                    raise DexFormatError("DEX encoded method belongs to the wrong class.")
+                if code_offset == 0 or caller is None:
+                    continue
+                if encoded_methods_seen >= limits.max_dex_encoded_methods:
+                    limit("dex_encoded_methods")
+                    continue
+                encoded_methods_seen += 1
+                if code_offset + 16 > len(data):
+                    raise DexFormatError("DEX code item is outside the file bounds.")
+                insns_size = _uint32(data, code_offset + 12)
+                remaining_code_units = (
+                    limits.max_dex_code_units
+                    - metrics["dex_behavior_code_units_scanned"]
+                )
+                if insns_size > remaining_code_units:
+                    limit("dex_code_units")
+                    continue
+                remaining_invocations = (
+                    limits.max_dex_invocations
+                    - metrics["dex_behavior_invocations_scanned"]
+                )
+                if remaining_invocations <= 0:
+                    limit("dex_invocations")
+                    continue
+                invocations, code_units, unsupported, invocation_limited = (
+                    _scan_dex_invocations(
+                        data,
+                        code_offset=code_offset,
+                        method_table=method_table,
+                        string_count=len(strings),
+                        invocation_budget=remaining_invocations,
+                    )
+                )
+                metrics["dex_behavior_methods_scanned"] += 1
+                metrics["dex_behavior_code_units_scanned"] += code_units
+                metrics["dex_behavior_invocations_scanned"] += len(invocations)
+                if unsupported:
+                    limit("dex_behavior_unsupported_opcode")
+                if invocation_limited:
+                    limit("dex_invocations")
+                for signal in _behavior_signals_for_method(
+                    caller,
+                    invocations,
+                    strings,
+                    min_pbe_iterations=limits.min_pbe_iterations,
+                ):
+                    key = (
+                        signal.rule_id,
+                        signal.caller_class_descriptor,
+                        signal.caller_method_name,
+                        signal.caller_prototype,
+                        signal.indicators,
+                    )
+                    if key in signal_keys:
+                        continue
+                    if len(signals) >= limits.max_static_behavior_candidates:
+                        limit("static_behavior_candidates")
+                        continue
+                    signal_keys.add(key)
+                    signals.append(signal)
+
+    return (
+        tuple(signals),
+        tuple(limitations),
+        tuple(sorted(metrics.items())),
+    )
+
+
 def parse_dex_inventory(
     data: bytes,
     *,
@@ -1180,7 +2108,7 @@ def parse_dex_inventory(
         prototype_cache[prototype_key] = prototype
         prototypes.append(prototype)
 
-    methods: list[DexMethodReference] = []
+    method_table: list[DexMethodReference | None] = []
     for index in range(method_count):
         base = method_offset + index * 8
         class_index, proto_index, name_index = struct.unpack_from("<HHI", data, base)
@@ -1194,23 +2122,36 @@ def parse_dex_inventory(
         method_name = strings[name_index]
         prototype = prototypes[proto_index]
         if class_descriptor is None or method_name is None or prototype is None:
+            method_table.append(None)
             continue
         if not _is_reference_descriptor(class_descriptor):
             raise DexFormatError("DEX method class descriptor is malformed.")
         if not method_name or len(method_name) > 200:
             raise DexFormatError("DEX method name is malformed.")
-        methods.append(
+        method_table.append(
             DexMethodReference(
                 class_descriptor=class_descriptor,
                 method_name=method_name,
                 prototype=prototype,
             )
         )
+    behavior_signals, behavior_limitations, behavior_metrics = _parse_dex_behavior(
+        data,
+        limits=limits,
+        strings=strings,
+        types=types,
+        method_table=method_table,
+    )
     return DexInventory(
         strings=tuple(strings),
-        method_references=tuple(methods),
+        method_references=tuple(
+            reference for reference in method_table if reference is not None
+        ),
         oversized_strings=oversized,
         oversized_string_regions=tuple(oversized_regions),
+        behavior_signals=behavior_signals,
+        behavior_limitations=behavior_limitations,
+        behavior_metrics=behavior_metrics,
     )
 
 
@@ -1956,6 +2897,41 @@ def _record_method_reference(
         )
 
 
+def _record_behavior_signal(
+    collector: _Collector,
+    *,
+    source_id: str,
+    dex_entry: str,
+    signal: _DexBehaviorSignal,
+) -> None:
+    identity = (
+        signal.rule_id,
+        source_id,
+        dex_entry,
+        signal.caller_class_descriptor,
+        f"{signal.caller_method_name}{signal.caller_prototype}",
+    )
+    if identity in collector.behavior_keys:
+        return
+    if len(collector.behavior) >= collector.policy.max_static_behavior_candidates:
+        collector.limit("static_behavior_candidates")
+        return
+    collector.behavior_keys.add(identity)
+    collector.behavior.append(
+        StaticBehaviorCandidate(
+            rule_id=signal.rule_id,
+            confidence=signal.confidence,
+            source_id=source_id,
+            dex_entry=dex_entry,
+            caller_class_descriptor=signal.caller_class_descriptor,
+            caller_method_name=signal.caller_method_name,
+            caller_prototype=signal.caller_prototype,
+            indicators=signal.indicators,
+        )
+    )
+    collector.metrics["static_behavior_candidates"] += 1
+
+
 def _record_embedded(
     collector: _Collector,
     *,
@@ -2073,6 +3049,10 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
                     collector.metrics["dex_method_references"] += len(
                         inventory.method_references
                     )
+                    for metric_name, metric_value in inventory.behavior_metrics:
+                        collector.metrics[metric_name] += metric_value
+                    for limitation in inventory.behavior_limitations:
+                        collector.limit(limitation)
                     for index, value in enumerate(inventory.strings):
                         if value is not None:
                             _scan_text(
@@ -2097,6 +3077,13 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
                             source_id=item.source_id,
                             dex_entry=info.filename,
                             reference=reference,
+                        )
+                    for signal in inventory.behavior_signals:
+                        _record_behavior_signal(
+                            collector,
+                            source_id=item.source_id,
+                            dex_entry=info.filename,
+                            signal=signal,
                         )
                 elif _is_text_entry(info.filename):
                     data = _read_zip_entry(
@@ -2295,6 +3282,49 @@ def analyze_apks(
                     value.class_descriptor,
                     value.method_name,
                     value.prototype,
+                ),
+            )
+        ),
+        static_behavior_candidates=tuple(
+            replace(
+                item,
+                source_id=_safe_source_id(
+                    item.source_id,
+                    sensitive_values=sensitive_values,
+                ),
+                dex_entry=_safe_metadata_text(
+                    item.dex_entry,
+                    sensitive_values=sensitive_values,
+                ),
+                caller_class_descriptor=_safe_metadata_text(
+                    item.caller_class_descriptor,
+                    sensitive_values=sensitive_values,
+                ),
+                caller_method_name=_safe_metadata_text(
+                    item.caller_method_name,
+                    sensitive_values=sensitive_values,
+                ),
+                caller_prototype=_safe_metadata_text(
+                    item.caller_prototype,
+                    sensitive_values=sensitive_values,
+                ),
+                indicators=tuple(
+                    _safe_metadata_text(
+                        indicator,
+                        sensitive_values=sensitive_values,
+                    )
+                    for indicator in item.indicators
+                ),
+            )
+            for item in sorted(
+                collector.behavior,
+                key=lambda value: (
+                    value.source_id,
+                    value.dex_entry,
+                    value.rule_id,
+                    value.caller_class_descriptor,
+                    value.caller_method_name,
+                    value.caller_prototype,
                 ),
             )
         ),

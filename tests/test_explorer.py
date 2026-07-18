@@ -269,6 +269,59 @@ class FormRetryBackend(FakeBackend):
         self.has_input = True
 
 
+LOGIN_XML = _xml(
+    _node(
+        text="",
+        resource="org.lab.portal:id/username",
+        bounds="[10,20][500,110]",
+        class_name="android.widget.EditText",
+        editable=True,
+        hint="Username",
+        package="org.lab.portal",
+    ),
+    _node(
+        text="",
+        resource="org.lab.portal:id/password",
+        bounds="[10,120][500,210]",
+        class_name="android.widget.EditText",
+        editable=True,
+        password=True,
+        hint="Password",
+        package="org.lab.portal",
+    ),
+    _node(
+        text="",
+        resource="org.lab.portal:id/primary_action",
+        bounds="[10,230][500,320]",
+        package="org.lab.portal",
+    ),
+)
+
+
+class LoginBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pid = 919
+        self.login_taps = 0
+
+    def dump_ui(self) -> str:
+        self._command()
+        self.ui_dump_count += 1
+        return LOGIN_XML
+
+    def current_activity(self) -> tuple[str | None, str | None]:
+        self._command()
+        return "org.lab.portal", "org.lab.portal.LoginActivity"
+
+    def tap(self, x: int, y: int, *, long: bool = False) -> None:
+        self._command()
+        del x, long
+        if y >= 230:
+            self.login_taps += 1
+            self.categories.add("network")
+            self.methods.add("http.request")
+
+
 TERMINAL_XML = _xml(
     _node(
         text="Status",
@@ -402,12 +455,16 @@ def _scope(
     *,
     package: str = "com.example.app",
     hosts: frozenset[str] = frozenset({"10.0.2.2"}),
+    controlled_validation: bool = False,
 ) -> ScopeConfig:
+    actions = {"inspect", "autonomous_exploration"}
+    if controlled_validation:
+        actions.add("controlled_validation")
     return ScopeConfig(
         devices=frozenset({"FAKE_SERIAL"}),
         packages=frozenset({package}),
         api_hosts=hosts,
-        allowed_actions=frozenset({"inspect", "autonomous_exploration"}),
+        allowed_actions=frozenset(actions),
     )
 
 
@@ -423,21 +480,24 @@ def _run(
     clock = FakeClock()
     if isinstance(backend, SlowTerminalBackend):
         backend.clock = clock
+    selected_config = config or ExplorerConfig(
+        max_runtime_seconds=10,
+        plateau_seconds=1,
+        max_states=10,
+        max_actions=20,
+        per_action_timeout_seconds=1,
+        monkey_events=0,
+    )
     explorer = AndroidExplorer(
         backend,
         package=package,
         session_id="20260717-210000-abcdef",
         manifest=manifest or {},
-        scope=_scope(package=package),
-        config=config
-        or ExplorerConfig(
-            max_runtime_seconds=10,
-            plateau_seconds=1,
-            max_states=10,
-            max_actions=20,
-            per_action_timeout_seconds=1,
-            monkey_events=0,
+        scope=_scope(
+            package=package,
+            controlled_validation=selected_config.controlled_canary_delivery,
         ),
+        config=selected_config,
         feedback=lambda: RuntimeFeedback(
             frozenset(backend.categories),
             frozenset(backend.methods),
@@ -1223,6 +1283,36 @@ def test_explorer_service_accepts_autonomous_action_without_controlled_validatio
     assert result.status == "completed"
 
 
+def test_explorer_service_requires_controlled_scope_for_canary_delivery(
+    tmp_path: Path,
+) -> None:
+    paths = ProjectPaths(tmp_path / "lab")
+    paths.ensure_layout()
+    repository = SessionRepository(paths)
+    record = repository.initialize(serial="FAKE_SERIAL", package="com.example.app")
+    scope = ScopeConfig(
+        devices=frozenset({"FAKE_SERIAL"}),
+        packages=frozenset({"com.example.app"}),
+        api_hosts=frozenset({"10.0.2.2"}),
+        allowed_actions=frozenset({"inspect", "autonomous_exploration"}),
+    )
+
+    with pytest.raises(ScopeError, match="controlled_validation"):
+        ExplorerService(paths, repository).run(
+            record.session_id,
+            adb=object(),  # type: ignore[arg-type]
+            scope=scope,
+            config=ExplorerConfig(
+                max_runtime_seconds=1,
+                controlled_canary_delivery=True,
+            ),
+            feedback=lambda: RuntimeFeedback(),
+            stop_requested=lambda: False,
+            network_guard_active=True,
+            session_canary="THESIS_CANARY_20260718T010203Z_deadbeefcafe",
+        )
+
+
 def test_bounded_traversal_backtracks_and_activates_runtime_categories() -> None:
     backend = FakeBackend()
     result, _, explorer = _run(backend)
@@ -1283,6 +1373,92 @@ def test_form_aware_retry_uses_exact_session_canary_without_tracing_value() -> N
 
     assert backend.inputs == [canary]
     assert canary not in json.dumps(explorer.trace)
+
+
+def test_controlled_canary_refills_generic_auth_form_before_targeted_navigation() -> None:
+    backend = LoginBackend()
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    result, _, explorer = _run(
+        backend,
+        package="org.lab.portal",
+        session_canary=canary,
+        manifest={
+            "components": [
+                {
+                    "component_type": "activity",
+                    "name": "org.lab.portal.OtherActivity",
+                    "effective_exported": True,
+                }
+            ],
+            "deep_links": [
+                {
+                    "component": "org.lab.portal.OtherActivity",
+                    "scheme": "https",
+                    "host": "10.0.2.2",
+                    "path": "/auth",
+                }
+            ],
+        },
+        config=ExplorerConfig(
+            max_runtime_seconds=10,
+            plateau_seconds=1,
+            max_states=5,
+            max_actions=12,
+            per_action_timeout_seconds=1,
+            controlled_canary_delivery=True,
+        ),
+    )
+
+    assert backend.login_taps == 1
+    assert backend.inputs[-2:] == [canary, "123456"]
+    assert len(backend.inputs) == 4
+    assert result.controlled_canary_inputs == 1
+    assert backend.started_activities == ["org.lab.portal.OtherActivity"]
+    assert backend.deep_links == [f"https://10.0.2.2/auth?asl={canary}"]
+    assert len(result.activity_attempts) == 1
+    assert len(result.deep_link_attempts) == 1
+    assert canary not in json.dumps(explorer.trace)
+    event_names = [item.get("event") for item in explorer.trace]
+    assert event_names.index("controlled_canary_delivery") < event_names.index(
+        "targeted_navigation"
+    )
+    event = next(
+        item
+        for item in explorer.trace
+        if item.get("event") == "controlled_canary_delivery"
+    )
+    assert event["input_kind"] == "username"
+    assert event["supporting_input"] is True
+
+
+def test_default_exploration_never_uses_exact_canary_for_username() -> None:
+    backend = LoginBackend()
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    result, _, explorer = _run(
+        backend,
+        package="org.lab.portal",
+        session_canary=canary,
+        config=ExplorerConfig(
+            max_runtime_seconds=10,
+            plateau_seconds=1,
+            max_states=5,
+            max_actions=12,
+            per_action_timeout_seconds=1,
+        ),
+    )
+
+    assert canary not in backend.inputs
+    assert result.controlled_canary_inputs == 0
+    assert not any(
+        item.get("event") == "controlled_canary_delivery"
+        for item in explorer.trace
+    )
+
+
+def test_business_mutation_labels_remain_denied_in_controlled_mode() -> None:
+    assert is_safe_action_label("Register") is False
+    assert is_safe_action_label("Change password") is False
+    assert is_safe_action_label("Withdraw funds") is False
 
 
 def test_seeded_traversal_is_deterministic_and_deduplicates_actions() -> None:

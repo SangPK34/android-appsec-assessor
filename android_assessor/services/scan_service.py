@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -36,6 +37,57 @@ from .cleanup_service import CleanupService
 
 LOGGER = logging.getLogger(__name__)
 
+_EXPLORER_HARD_BOUND_TERMINATIONS = frozenset(
+    {"max_runtime", "max_actions", "max_states"}
+)
+_EXPLORER_LIMIT_BLOCK_REASONS = frozenset(
+    {"hard_limit", "insufficient_action_budget", "max_actions", "max_states"}
+)
+
+
+def _non_negative_count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _exploration_coverage_limitation(result: ExplorerResult) -> str | None:
+    raw_termination = getattr(result, "termination_reason", "")
+    termination = raw_termination if isinstance(raw_termination, str) else ""
+
+    def attempts(attribute: str) -> tuple[Mapping[str, Any], ...]:
+        raw_attempts = getattr(result, attribute, ())
+        if not isinstance(raw_attempts, (list, tuple)):
+            return ()
+        return tuple(item for item in raw_attempts if isinstance(item, Mapping))
+
+    activity_attempts = attempts("activity_attempts")
+    deep_link_attempts = attempts("deep_link_attempts")
+
+    def limit_blocked(items: tuple[Mapping[str, Any], ...]) -> int:
+        return sum(
+            item.get("status") == "blocked"
+            and item.get("reason") in _EXPLORER_LIMIT_BLOCK_REASONS
+            for item in items
+        )
+
+    blocked_activities = limit_blocked(activity_attempts)
+    blocked_deep_links = limit_blocked(deep_link_attempts)
+    if (
+        termination not in _EXPLORER_HARD_BOUND_TERMINATIONS
+        and blocked_activities == 0
+        and blocked_deep_links == 0
+    ):
+        return None
+
+    actions = _non_negative_count(getattr(result, "actions_executed", 0))
+    states = _non_negative_count(getattr(result, "states_visited", 0))
+    return (
+        "Autonomous exploration coverage was bounded: "
+        f"termination={termination or 'unknown'}; actions={actions}; states={states}; "
+        f"targeted activity attempts={len(activity_attempts)} "
+        f"(limit-blocked={blocked_activities}); targeted deep-link attempts="
+        f"{len(deep_link_attempts)} (limit-blocked={blocked_deep_links})."
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class ScanResult:
@@ -50,6 +102,8 @@ class ScanResult:
     effective_profile: str = "quick"
     autonomous_exploration_requested: bool = False
     autonomous_exploration_executed: bool = False
+    controlled_canary_requested: bool = False
+    controlled_canary_executed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +117,8 @@ class ScanResult:
             "effective_profile": self.effective_profile,
             "autonomous_exploration_requested": self.autonomous_exploration_requested,
             "autonomous_exploration_executed": self.autonomous_exploration_executed,
+            "controlled_canary_requested": self.controlled_canary_requested,
+            "controlled_canary_executed": self.controlled_canary_executed,
             "phase_timings": dict(self.phase_timings or {}),
             "report_path": self.report_path,
         }
@@ -115,6 +171,21 @@ def resolve_scan_profile(
     )
 
 
+def _require_explicit_controlled_canary_request(
+    *,
+    explorer_config: ExplorerConfig | None,
+    controlled_canary: bool,
+) -> None:
+    if (
+        explorer_config is not None
+        and explorer_config.controlled_canary_delivery
+        and not controlled_canary
+    ):
+        raise AndroidAssessorError(
+            "Controlled canary delivery must be requested via controlled_canary=True."
+        )
+
+
 class ScanService:
     DEFAULT_RUNTIME_SECONDS = 30
     DEFAULT_AUTONOMOUS_RUNTIME_SECONDS = 45
@@ -139,7 +210,12 @@ class ScanService:
         runtime_seconds: int | None = None,
         autonomous: bool | None = None,
         explorer_config: ExplorerConfig | None = None,
+        controlled_canary: bool = False,
     ) -> ScanResult:
+        _require_explicit_controlled_canary_request(
+            explorer_config=explorer_config,
+            controlled_canary=controlled_canary,
+        )
         inspection = AppInspectionService(self.context, self.repository).inspect(
             package=package,
             serial=serial,
@@ -150,6 +226,7 @@ class ScanService:
             runtime_seconds=runtime_seconds,
             autonomous=autonomous,
             explorer_config=explorer_config,
+            controlled_canary=controlled_canary,
         )
 
     def scan_session(
@@ -160,7 +237,12 @@ class ScanService:
         runtime_seconds: int | None = None,
         autonomous: bool | None = None,
         explorer_config: ExplorerConfig | None = None,
+        controlled_canary: bool = False,
     ) -> ScanResult:
+        _require_explicit_controlled_canary_request(
+            explorer_config=explorer_config,
+            controlled_canary=controlled_canary,
+        )
         resolution = resolve_scan_profile(
             profile,
             autonomous=autonomous,
@@ -169,6 +251,16 @@ class ScanService:
         record = self.repository.load(session_id)
         scope = load_scope(self.paths)
         scope.require_device_package(record.serial, record.package)
+        if controlled_canary:
+            if not resolution.autonomous_exploration_enabled:
+                raise AndroidAssessorError(
+                    "Controlled canary delivery requires an autonomous Full Assessment."
+                )
+            scope.require_device_package(
+                record.serial,
+                record.package,
+                action="controlled_validation",
+            )
         self.repository.require_modifying_session_slot(record.serial, record.session_id)
         try:
             with DeviceLock(
@@ -187,6 +279,7 @@ class ScanService:
                     resolution=resolution,
                     runtime_seconds=runtime_seconds,
                     explorer_config=explorer_config,
+                    controlled_canary=controlled_canary,
                 )
         except BaseException:
             if resolution.effective_profile is ScanProfile.FULL:
@@ -341,6 +434,7 @@ class ScanService:
         resolution: ScanProfileResolution,
         runtime_seconds: int | None = None,
         explorer_config: ExplorerConfig | None = None,
+        controlled_canary: bool = False,
     ) -> ScanResult:
         profile = resolution.effective_profile
         autonomous_enabled = resolution.autonomous_exploration_enabled
@@ -353,6 +447,7 @@ class ScanService:
             "autonomous_exploration": (
                 "pending" if resolution.autonomous_exploration_enabled else "skipped"
             ),
+            "controlled_canary": "pending" if controlled_canary else "skipped",
             "target_logcat": "pending",
             "private_storage": "skipped" if profile is ScanProfile.QUICK else "pending",
             "rules": "pending",
@@ -365,6 +460,7 @@ class ScanService:
         runtime_started_at: str | None = None
         exploration_result: ExplorerResult | None = None
         exploration_executed = False
+        controlled_canary_executed = False
         assessment_canary = (
             generate_session_canary() if profile is ScanProfile.FULL else None
         )
@@ -383,6 +479,8 @@ class ScanService:
                     resolution.autonomous_exploration_requested
                 ),
                 "autonomous_exploration_executed": False,
+                "controlled_canary_requested": controlled_canary,
+                "controlled_canary_executed": False,
                 "phase_timings": {},
             },
             root=self.paths.root,
@@ -477,6 +575,11 @@ class ScanService:
                     selected_config = explorer_config or ExplorerConfig(
                         max_runtime_seconds=wait_seconds,
                     )
+                    if controlled_canary:
+                        selected_config = replace(
+                            selected_config,
+                            controlled_canary_delivery=True,
+                        )
                     feedback_collector = RuntimeFeedbackCollector(paths)
                     exploration_started = time.perf_counter()
                     try:
@@ -507,9 +610,30 @@ class ScanService:
                         )
                         runtime_termination = exploration_result.termination_reason
                         steps["autonomous_exploration"] = exploration_result.status
+                        coverage_limitation = _exploration_coverage_limitation(
+                            exploration_result
+                        )
+                        if coverage_limitation is not None:
+                            limitations.append(coverage_limitation)
+                        controlled_canary_executed = (
+                            getattr(exploration_result, "controlled_canary_inputs", 0) > 0
+                        )
+                        if controlled_canary:
+                            steps["controlled_canary"] = (
+                                "completed"
+                                if controlled_canary_executed
+                                else "not_exercised"
+                            )
+                            if not controlled_canary_executed:
+                                limitations.append(
+                                    "Controlled canary delivery was not exercised because "
+                                    "no compatible bounded form action was reached."
+                                )
                     except (AndroidAssessorError, OSError, ValueError) as exc:
                         runtime_termination = "explorer_error"
                         steps["autonomous_exploration"] = "error"
+                        if controlled_canary:
+                            steps["controlled_canary"] = "error"
                         limitations.append(
                             f"Autonomous exploration failed: {redact_text(str(exc))[:300]}"
                         )
@@ -527,6 +651,8 @@ class ScanService:
                 phase_timings["runtime_observation"] = phase_timings["runtime_interaction"]
             else:
                 runtime_termination = "not_started"
+                if controlled_canary:
+                    steps["controlled_canary"] = "not_exercised"
         finally:
             analysis_started = time.perf_counter()
             if frida_started:
@@ -638,6 +764,8 @@ class ScanService:
                     resolution.autonomous_exploration_requested
                 ),
                 "autonomous_exploration_executed": exploration_executed,
+                "controlled_canary_requested": controlled_canary,
+                "controlled_canary_executed": controlled_canary_executed,
                 "phase_timings": phase_timings,
                 "runtime_termination": runtime_termination,
             },
@@ -663,6 +791,8 @@ class ScanService:
                     resolution.autonomous_exploration_requested
                 ),
                 "autonomous_exploration_executed": exploration_executed,
+                "controlled_canary_requested": controlled_canary,
+                "controlled_canary_executed": controlled_canary_executed,
                 "phase_timings": phase_timings,
                 "runtime_termination": runtime_termination,
                 "runtime_started_at": runtime_started_at,
@@ -697,6 +827,8 @@ class ScanService:
                         resolution.autonomous_exploration_requested
                     ),
                     "autonomous_exploration_executed": exploration_executed,
+                    "controlled_canary_requested": controlled_canary,
+                    "controlled_canary_executed": controlled_canary_executed,
                     "phase_timings": phase_timings,
                     "runtime_termination": runtime_termination,
                     "runtime_started_at": runtime_started_at,
@@ -755,5 +887,7 @@ class ScanService:
                 resolution.autonomous_exploration_requested
             ),
             autonomous_exploration_executed=exploration_executed,
+            controlled_canary_requested=controlled_canary,
+            controlled_canary_executed=controlled_canary_executed,
             report_path="report.html",
         )

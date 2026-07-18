@@ -215,6 +215,48 @@ rules:
     default_profile: quick
     implementation_status: partially_detected
 
+  - rule_id: ASL-STATIC-API-POLICY
+    <<: *coverage_defaults
+    id_kind: production_rule
+    vulnerability_class: banned_deprecated_api_policy_reference
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: true
+    runtime_support: false
+    root_required: false
+    frida_required: false
+    controlled_validation_available: false
+    default_profile: quick
+    implementation_status: partially_detected
+
+  - rule_id: ASL-STATIC-DYNAMIC-CODE
+    <<: *coverage_defaults
+    id_kind: production_rule
+    vulnerability_class: dynamic_code_loading_call_site_candidate
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: true
+    runtime_support: false
+    root_required: false
+    frida_required: false
+    controlled_validation_available: false
+    default_profile: quick
+    implementation_status: partially_detected
+
+  - rule_id: ASL-STATIC-DESERIALIZATION
+    <<: *coverage_defaults
+    id_kind: production_rule
+    vulnerability_class: unsafe_deserialization_call_site_candidate
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: true
+    runtime_support: false
+    root_required: false
+    frida_required: false
+    controlled_validation_available: false
+    default_profile: quick
+    implementation_status: partially_detected
+
   - rule_id: ASL-INVENTORY-ENDPOINTS
     <<: *coverage_defaults
     id_kind: inventory_only
@@ -291,7 +333,7 @@ rules:
     vulnerability_class: webview_javascript_bridge_remote_content
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: true
     root_required: false
     frida_required: true
@@ -306,7 +348,7 @@ rules:
     vulnerability_class: webview_unsafe_runtime_settings
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: true
     root_required: false
     frida_required: true
@@ -349,7 +391,7 @@ rules:
     vulnerability_class: insecure_cipher_mode
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: true
     root_required: false
     frida_required: true
@@ -363,7 +405,7 @@ rules:
     vulnerability_class: weak_cryptographic_algorithm
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: true
     root_required: false
     frida_required: true
@@ -447,7 +489,7 @@ rules:
     vulnerability_class: weak_digest_or_mac
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: true
     root_required: false
     frida_required: true
@@ -462,7 +504,7 @@ rules:
     vulnerability_class: low_password_derivation_iterations
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: true
     root_required: false
     frida_required: true
@@ -477,7 +519,7 @@ rules:
     vulnerability_class: predictable_random_cryptographic_material
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: true
     root_required: false
     frida_required: true
@@ -577,11 +619,11 @@ rules:
     vulnerability_class: world_readable_private_storage
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: true
     root_required: true
     frida_required: false
-    controlled_validation_available: false
+    controlled_validation_available: true
     default_profile: full
     implementation_status: detected
 
@@ -591,7 +633,7 @@ rules:
     vulnerability_class: world_writable_private_storage
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: true
     root_required: true
     frida_required: false

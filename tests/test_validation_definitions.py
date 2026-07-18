@@ -24,7 +24,7 @@ ALLOWED_TYPES = {
 def test_validation_registry_has_unique_complete_bounded_definitions() -> None:
     identifiers = [item.validation_id for item in VALIDATION_DEFINITIONS]
 
-    assert len(identifiers) == len(set(identifiers)) == 7
+    assert len(identifiers) == len(set(identifiers)) == 8
     for definition in VALIDATION_DEFINITIONS:
         assert definition.validation_type in ALLOWED_TYPES
         assert definition.preconditions
@@ -39,18 +39,18 @@ def test_validation_registry_has_unique_complete_bounded_definitions() -> None:
         assert definition.physical_validation_status == UNVERIFIED_PHYSICAL
 
 
-def test_existing_validations_are_adb_assisted_and_production_enabled() -> None:
+def test_existing_validations_are_registered_and_production_enabled() -> None:
     expected = {
         "ASL-MVP-002": "cleartext_canary",
         "ASL-MVP-003": "sensitive_logging_canary",
         "ASL-MVP-004": "exported_activity_canary",
+        "STORAGE-WORLD-READABLE": "world_readable_storage_receiver_probe",
     }
 
     for rule_id, validation_id in expected.items():
         definition = validation_for_rule(rule_id)
         assert definition is not None
         assert definition.validation_id == validation_id
-        assert definition.validation_type == "adb_assisted_validation"
         assert definition.production_enabled is True
 
 

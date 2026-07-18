@@ -48,11 +48,29 @@ _DANGEROUS_LABELS = (
     "uninstall",
     "logout all",
     "submit order",
+    "register",
+    "sign up",
+    "create account",
+    "change password",
+    "reset password",
+    "update password",
+    "deposit",
+    "withdraw",
     "send sms",
     "text message",
     "place call",
     "call",
     "dial",
+)
+_CONTROLLED_CANARY_ACTIONS = (
+    "login",
+    "sign in",
+    "authenticate",
+    "connect",
+    "request",
+    "search",
+    "lookup",
+    "check",
 )
 _DENY_PERMISSION_LABELS = ("deny", "don't allow", "cancel", "no thanks", "not now")
 _ALLOW_PERMISSION_LABELS = ("allow", "while using", "only this time")
@@ -132,6 +150,7 @@ class ExplorerConfig:
     per_action_timeout_seconds: int = 3
     seed: int = 1337
     monkey_events: int = 0
+    controlled_canary_delivery: bool = False
 
     def __post_init__(self) -> None:
         bounds = {
@@ -146,6 +165,8 @@ class ExplorerConfig:
         for name, (value, minimum, maximum) in bounds.items():
             if isinstance(value, bool) or not minimum <= value <= maximum:
                 raise ValueError(f"{name} must be between {minimum} and {maximum}.")
+        if not isinstance(self.controlled_canary_delivery, bool):
+            raise ValueError("controlled_canary_delivery must be a boolean.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +260,7 @@ class ExplorerResult:
     idle_ms: float = 0.0
     exploring_ms: float = 0.0
     runtime_wait_ms: float = 0.0
+    controlled_canary_inputs: int = 0
     trace_path: str | None = None
     summary_path: str | None = None
 
@@ -552,6 +574,11 @@ def _could_trigger_network(label: str) -> bool:
     )
 
 
+def _is_controlled_canary_action(label: str) -> bool:
+    normalized = _normalize_label(label)
+    return any(term in normalized for term in _CONTROLLED_CANARY_ACTIONS)
+
+
 def _node_identity(node: UiNode, activity: str) -> str:
     label = " ".join((node.content_description, node.hint)).strip() if node.editable else node.label
     geometry = "" if node.editable and node.resource_id else str(node.bounds)
@@ -568,6 +595,7 @@ def build_actions(
     feedback: RuntimeFeedback,
     allow_local_url: bool,
     network_guard_active: bool = False,
+    controlled_canary_delivery: bool = False,
     rng: random.Random,
     skipped: list[dict[str, str]] | None = None,
 ) -> list[ExplorerAction]:
@@ -659,6 +687,8 @@ def build_actions(
                 )
         elif node.clickable and not node.editable:
             priority = _action_priority(label, feedback)
+            if controlled_canary_delivery and _is_controlled_canary_action(label):
+                priority += 200
             heapq.heappush(
                 actions,
                 ExplorerAction(
@@ -1145,15 +1175,25 @@ class AndroidExplorer:
         state: UiState,
         action: ExplorerAction,
         executed: set[tuple[str, str]],
+        *,
+        include_executed: bool = False,
+        limit: int = 2,
     ) -> list[UiNode]:
         """Select a minimal generic input set by UI proximity, never app identity."""
         action_x, action_y = action.x or 0, action.y or 0
-        candidates = [
-            node
-            for node in state.nodes
-            if is_input_candidate(node)
-            and (state.fingerprint, _node_identity(node, state.activity)) not in executed
-        ]
+        candidates: list[UiNode] = []
+        for node in state.nodes:
+            if node.package and node.package != state.package:
+                continue
+            identity = (state.fingerprint, _node_identity(node, state.activity))
+            if identity in executed:
+                if not include_executed or not (
+                    node.editable and node.enabled and node.visible
+                ):
+                    continue
+            elif not is_input_candidate(node):
+                continue
+            candidates.append(node)
         candidates.sort(
             key=lambda node: (
                 abs(node.center[1] - action_y) + abs(node.center[0] - action_x),
@@ -1161,7 +1201,122 @@ class AndroidExplorer:
                 node.bounds,
             )
         )
-        return candidates[:2]
+        return candidates[:limit]
+
+    def _input_kind(self, node: UiNode) -> tuple[str, str]:
+        return classify_input(
+            node,
+            allow_local_url="10.0.2.2" in self.scope.api_hosts,
+        )
+
+    def _controlled_form_inputs(
+        self,
+        state: UiState,
+        action: ExplorerAction,
+        executed: set[tuple[str, str]],
+    ) -> tuple[UiNode | None, UiNode | None]:
+        nearby = self._nearby_inputs(
+            state,
+            action,
+            executed,
+            include_executed=True,
+            limit=4,
+        )
+        carrier = next(
+            (
+                node
+                for node in nearby
+                if self._input_kind(node)[0]
+                in {"username", "email", "text", "canary", "url"}
+            ),
+            None,
+        )
+        supporting = next(
+            (
+                node
+                for node in nearby
+                if node is not carrier
+                and self._input_kind(node)[0] in {"password", "number"}
+            ),
+            None,
+        )
+        return carrier, supporting
+
+    def _is_controlled_form_action(
+        self,
+        state: UiState,
+        action: ExplorerAction,
+        carrier: UiNode | None,
+        supporting: UiNode | None,
+    ) -> bool:
+        if carrier is None:
+            return False
+        if _is_controlled_canary_action(action.label):
+            return True
+        if supporting is None or action.kind != "tap" or action.y is None:
+            return False
+        action_node = next(
+            (
+                node
+                for node in state.nodes
+                if _node_identity(node, state.activity) == action.identity
+            ),
+            None,
+        )
+        button_like = action_node is not None and (
+            "button" in action_node.class_name.casefold()
+            or bool(
+                {"action", "btn", "button", "submit"}
+                & set(_identifier_tokens(action_node.resource_id))
+            )
+        )
+        return bool(
+            button_like
+            and self._input_kind(carrier)[0]
+            in {"username", "email", "text", "canary"}
+            and self._input_kind(supporting)[0] == "password"
+            and action.y >= max(carrier.bounds[3], supporting.bounds[3])
+        )
+
+    def _has_controlled_form_action(
+        self,
+        state: UiState,
+        executed: set[tuple[str, str]],
+    ) -> bool:
+        for node in state.nodes:
+            identity = _node_identity(node, state.activity)
+            if (
+                (state.fingerprint, identity) in executed
+                or (node.package and node.package != state.package)
+                or not node.clickable
+                or node.editable
+                or not node.enabled
+                or not node.visible
+                or not is_safe_action_label(node.label)
+                or (_could_trigger_network(node.label) and not self.network_guard_active)
+            ):
+                continue
+            action = ExplorerAction(
+                (0, 0.0, identity),
+                "tap",
+                identity,
+                *node.center,
+                node.label,
+                resource_id=node.resource_id,
+            )
+            carrier, supporting = self._controlled_form_inputs(
+                state,
+                action,
+                executed,
+            )
+            if self._is_controlled_form_action(
+                state,
+                action,
+                carrier,
+                supporting,
+            ):
+                return True
+        return False
 
     def _generated_input(
         self,
@@ -1169,11 +1324,19 @@ class AndroidExplorer:
         *,
         prefer_canary: bool = False,
     ) -> tuple[str, str]:
-        input_kind, value = classify_input(
-            node,
-            allow_local_url="10.0.2.2" in self.scope.api_hosts,
-        )
-        if self.session_canary is not None and (
+        input_kind, value = self._input_kind(node)
+        if (
+            self.session_canary is not None
+            and self.config.controlled_canary_delivery
+            and prefer_canary
+        ):
+            if input_kind in {"username", "text", "canary"}:
+                value = self.session_canary
+            elif input_kind == "email":
+                value = f"{self.session_canary}@example.test"
+            elif input_kind == "url":
+                value = f"https://10.0.2.2/{self.session_canary}"
+        elif self.session_canary is not None and (
             input_kind == "canary" or (prefer_canary and input_kind == "text")
         ):
             value = self.session_canary
@@ -1278,6 +1441,7 @@ class AndroidExplorer:
         scrolled: set[str] = set()
         history: list[str] = []
         actions_executed = input_actions = scroll_actions = backtracks = 0
+        controlled_canary_inputs = 0
         actions_succeeded = duplicate_actions_avoided = form_retries = 0
         process_restarts = crashes = 0
         idle_seconds = idle_plateau_seconds = runtime_wait_seconds = 0.0
@@ -1289,6 +1453,7 @@ class AndroidExplorer:
         activity_attempts: list[dict[str, Any]] = []
         deep_link_attempts: list[dict[str, Any]] = []
         pending_navigation: list[tuple[str, str, int]] = []
+        controlled_form_pending = False
 
         def reset_idle() -> None:
             nonlocal idle_plateau_seconds
@@ -1296,9 +1461,10 @@ class AndroidExplorer:
 
         def enter_input(node: UiNode, state: UiState, *, source: str) -> None:
             nonlocal actions_executed, actions_succeeded, input_actions, keyboard_open
+            nonlocal controlled_canary_inputs
             input_kind, value = self._generated_input(
                 node,
-                prefer_canary=source == "form_retry",
+                prefer_canary=source in {"form_retry", "controlled_canary"},
             )
             self.backend.input_text(*node.center, value)
             identity = _node_identity(node, state.activity)
@@ -1306,6 +1472,8 @@ class AndroidExplorer:
             actions_executed += 1
             actions_succeeded += 1
             input_actions += 1
+            if source == "controlled_canary":
+                controlled_canary_inputs += 1
             keyboard_open = True
             self._trace(
                 "action",
@@ -1344,6 +1512,11 @@ class AndroidExplorer:
             )
             pending_navigation.extend(
                 ("deep_link", target, index) for target, index in deep_link_targets
+            )
+            controlled_form_pending = bool(
+                self.config.controlled_canary_delivery
+                and self.session_canary is not None
+                and self._has_controlled_form_action(current, executed)
             )
             while True:
                 now = self.clock()
@@ -1395,7 +1568,7 @@ class AndroidExplorer:
                         traffic_host_count=len(latest_feedback.traffic_hosts),
                     )
                 feedback = latest_feedback
-                if pending_navigation and not history:
+                if pending_navigation and not history and not controlled_form_pending:
                     reset_idle()
                     kind, target, index = pending_navigation.pop(0)
                     attempts = activity_attempts if kind == "activity" else deep_link_attempts
@@ -1454,6 +1627,9 @@ class AndroidExplorer:
                     feedback=feedback,
                     allow_local_url="10.0.2.2" in self.scope.api_hosts,
                     network_guard_active=self.network_guard_active,
+                    controlled_canary_delivery=(
+                        self.config.controlled_canary_delivery
+                    ),
                     rng=self.rng,
                     skipped=skipped_actions,
                 )
@@ -1544,6 +1720,53 @@ class AndroidExplorer:
                         enter_input(node, current, source="traversal")
                         continue
                     else:
+                        controlled_form: tuple[UiNode | None, UiNode | None] | None = None
+                        if self.config.controlled_canary_delivery:
+                            carrier, supporting = self._controlled_form_inputs(
+                                current,
+                                action,
+                                executed,
+                            )
+                            if self._is_controlled_form_action(
+                                current,
+                                action,
+                                carrier,
+                                supporting,
+                            ):
+                                controlled_form = (carrier, supporting)
+                                controlled_form_pending = False
+                        if (
+                            self.session_canary is not None
+                            and controlled_form is not None
+                            and self.config.max_actions - actions_executed >= 3
+                        ):
+                            carrier, supporting = controlled_form
+                            if carrier is not None:
+                                enter_input(carrier, current, source="controlled_canary")
+                                if (
+                                    supporting is not None
+                                    and self.config.max_actions - actions_executed >= 3
+                                ):
+                                    enter_input(
+                                        supporting,
+                                        current,
+                                        source="controlled_support",
+                                    )
+                                if (
+                                    keyboard_open
+                                    and self.config.max_actions - actions_executed >= 2
+                                ):
+                                    self.backend.hide_keyboard()
+                                    keyboard_open = False
+                                    actions_executed += 1
+                                    actions_succeeded += 1
+                                self._trace(
+                                    "controlled_canary_delivery",
+                                    state=previous,
+                                    action=_trace_label(action.label),
+                                    input_kind=self._input_kind(carrier)[0],
+                                    supporting_input=supporting is not None,
+                                )
                         feedback_before = feedback
                         self.backend.tap(
                             action.x or 0,
@@ -1768,6 +1991,7 @@ class AndroidExplorer:
             idle_ms=round(idle_seconds * 1000, 2),
             exploring_ms=round(active_ms, 2),
             runtime_wait_ms=round(runtime_wait_seconds * 1000, 2),
+            controlled_canary_inputs=controlled_canary_inputs,
         )
 
 
@@ -1802,6 +2026,16 @@ class ExplorerService:
             record.package,
             action="autonomous_exploration",
         )
+        if config.controlled_canary_delivery:
+            scope.require_device_package(
+                record.serial,
+                record.package,
+                action="controlled_validation",
+            )
+            if session_canary is None:
+                raise ValueError(
+                    "Controlled canary delivery requires an exact session canary."
+                )
         session_paths = self.repository.paths_for(record.session_id)
         app = read_json_object(session_paths.app_json, root=self.paths.root)
         manifest = app.get("manifest") if isinstance(app.get("manifest"), dict) else {}
