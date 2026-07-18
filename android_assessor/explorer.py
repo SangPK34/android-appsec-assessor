@@ -279,6 +279,60 @@ def _normalize_label(value: str) -> str:
     return _VOLATILE_PATTERN.sub("<value>", normalized)[:160]
 
 
+def _identifier_tokens(value: str) -> tuple[str, ...]:
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    return tuple(token for token in re.split(r"[^a-zA-Z0-9]+", value.casefold()) if token)
+
+
+def _is_input_placeholder(
+    text: str,
+    *,
+    resource_id: str,
+    hint: str,
+    content_description: str,
+) -> bool:
+    """Recognize UIAutomator's hint-as-text representation for empty fields.
+
+    UIAutomator commonly exposes an empty EditText's hint through its ``text``
+    attribute (for example ``text="Username"``).  Treating that value as
+    entered data suppresses safe generated input and prevents generic form
+    exploration.  Only generic labels or values echoed by a node's own
+    metadata are considered placeholders; arbitrary prefilled values remain
+    untouched.
+    """
+    normalized = _normalize_label(text)
+    if not normalized:
+        return False
+    metadata = {
+        _normalize_label(value)
+        for value in (resource_id, hint, content_description)
+        if value
+    }
+    if normalized in metadata:
+        return True
+    prompt_tokens = list(_identifier_tokens(text))
+    while prompt_tokens and prompt_tokens[0] in {"enter", "input", "please", "type", "your"}:
+        prompt_tokens.pop(0)
+    resource_tokens = list(
+        _identifier_tokens(resource_id.rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+    )
+    while resource_tokens and resource_tokens[-1] in {
+        "edit",
+        "edittext",
+        "field",
+        "input",
+        "text",
+        "view",
+    }:
+        resource_tokens.pop()
+    if prompt_tokens and resource_tokens[-len(prompt_tokens) :] == prompt_tokens:
+        return True
+    compact_prompt = "".join(prompt_tokens)
+    return len(prompt_tokens) > 1 and any(
+        compact_prompt == token for token in resource_tokens
+    )
+
+
 def _is_transient_ui_automation_error(error: BaseException) -> bool:
     message = str(error).casefold()
     return any(marker in message for marker in _UIAUTOMATION_TRANSIENT_ERRORS)
@@ -345,7 +399,20 @@ def parse_ui_hierarchy(
                 for word in ("input", "edit", "username", "password", "email", "url")
             )
         )
-        text = "<password>" if password else attributes.get("text", "")
+        raw_text = attributes.get("text", "")
+        placeholder = editable and _is_input_placeholder(
+            raw_text,
+            resource_id=resource_id,
+            hint=attributes.get("hint", ""),
+            content_description=attributes.get("content-desc", ""),
+        )
+        inferred_hint = attributes.get("hint", "")
+        if placeholder and not inferred_hint:
+            inferred_hint = raw_text
+        if password:
+            text = "" if placeholder or not raw_text else "<password>"
+        else:
+            text = "" if placeholder else raw_text
         ancestor = parent_by_child.get(element)
         in_selectable_collection = False
         while ancestor is not None:
@@ -365,7 +432,7 @@ def parse_ui_hierarchy(
             resource_id=resource_id,
             text=text,
             content_description=attributes.get("content-desc", ""),
-            hint=attributes.get("hint", ""),
+            hint=inferred_hint,
             bounds=bounds,
             clickable=_truth(attributes.get("clickable")) or inferred_collection_click,
             long_clickable=_truth(attributes.get("long-clickable")),
@@ -523,7 +590,19 @@ def build_actions(
                 )
         if is_input_candidate(node):
             input_kind, _ = classify_input(node, allow_local_url=allow_local_url)
-            if not (_semantic_categories(label) & feedback.categories):
+            # Keep credential/form fields eligible even when an earlier
+            # runtime event already populated the same semantic category.
+            # Otherwise a generic resource id such as ``login_username``
+            # overlaps the logging category and prevents safe input generation.
+            category_overlap = _semantic_categories(label) & feedback.categories
+            if not category_overlap or input_kind in {
+                "username",
+                "password",
+                "email",
+                "number",
+                "url",
+                "canary",
+            }:
                 heapq.heappush(
                     actions,
                     ExplorerAction(

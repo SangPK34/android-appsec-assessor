@@ -478,6 +478,87 @@ def test_ui_xml_parsing_and_fingerprint_hide_editable_values() -> None:
     assert first.nodes[0].text == "old@example.test"
 
 
+def test_empty_edittext_hints_are_not_preserved_as_entered_values() -> None:
+    state = parse_ui_hierarchy(
+        _xml(
+            _node(
+                text="Username",
+                resource="com.example.app:id/login_username",
+                class_name="android.widget.EditText",
+                editable=True,
+            ),
+            _node(
+                text="Password",
+                resource="com.example.app:id/login_password",
+                class_name="android.widget.EditText",
+                editable=True,
+                password=True,
+            ),
+            _node(text="Login", resource="com.example.app:id/login_button"),
+        ),
+        expected_package="com.example.app",
+        activity="com.example.app.LoginActivity",
+    )
+
+    assert [node.text for node in state.nodes[:2]] == ["", ""]
+    assert all(is_input_candidate(node) for node in state.nodes[:2])
+    actions = build_actions(
+        state,
+        feedback=RuntimeFeedback(frozenset({"logging"})),
+        allow_local_url=True,
+        network_guard_active=True,
+        rng=__import__("random").Random(3),
+    )
+    assert {action.input_kind for action in actions if action.kind == "input"} == {
+        "username",
+        "password",
+    }
+
+
+def test_prefilled_edittext_values_are_not_mistaken_for_hints() -> None:
+    state = parse_ui_hierarchy(
+        _xml(
+            _node(
+                text="user",
+                resource="com.example.app:id/login_username",
+                class_name="android.widget.EditText",
+                editable=True,
+            ),
+            _node(
+                text="s3cret",
+                resource="com.example.app:id/login_password",
+                class_name="android.widget.EditText",
+                editable=True,
+                password=True,
+            ),
+            _node(
+                text="login",
+                resource="com.example.app:id/login_username",
+                class_name="android.widget.EditText",
+                editable=True,
+            ),
+            _node(
+                text="password",
+                resource="com.example.app:id/secret_value",
+                class_name="android.widget.EditText",
+                editable=True,
+                password=True,
+            ),
+        ),
+        expected_package="com.example.app",
+        activity="com.example.app.LoginActivity",
+    )
+
+    assert state.nodes[0].text == "user"
+    assert state.nodes[1].text == "<password>"
+    assert not is_input_candidate(state.nodes[0])
+    assert not is_input_candidate(state.nodes[1])
+    assert state.nodes[2].text == "login"
+    assert state.nodes[3].text == "<password>"
+    assert not is_input_candidate(state.nodes[2])
+    assert not is_input_candidate(state.nodes[3])
+
+
 def test_action_generation_is_safe_deduplicable_and_feedback_prioritized() -> None:
     state = parse_ui_hierarchy(
         MAIN_XML,
