@@ -262,7 +262,7 @@ def test_scan_profile_starts_only_planned_controllers(
         "packages: [com.example.app]\n"
         "api_hosts: [10.0.2.2]\n"
         "allowed_actions: [inspect, traffic_capture, frida_observe, "
-        "controlled_validation]\n",
+        "autonomous_exploration]\n",
         encoding="utf-8",
     )
     repository = SessionRepository(paths)

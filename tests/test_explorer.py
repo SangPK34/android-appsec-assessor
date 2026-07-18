@@ -12,6 +12,7 @@ from android_assessor.explorer import (
     AdbExplorerBackend,
     AndroidExplorer,
     ExplorerConfig,
+    ExplorerResult,
     ExplorerService,
     RuntimeFeedback,
     RuntimeFeedbackCollector,
@@ -43,6 +44,7 @@ def _node(
     password: bool = False,
     enabled: bool = True,
     visible: bool = True,
+    checked: bool = False,
     hint: str = "",
     input_type: str = "",
     package: str = "com.example.app",
@@ -53,7 +55,8 @@ def _node(
         f'clickable="{str(clickable).lower()}" long-clickable="false" '
         f'focusable="{str(editable).lower()}" scrollable="{str(scrollable).lower()}" '
         f'password="{str(password).lower()}" enabled="{str(enabled).lower()}" '
-        f'visible-to-user="{str(visible).lower()}" input-type="{input_type}" />'
+        f'visible-to-user="{str(visible).lower()}" checked="{str(checked).lower()}" '
+        f'input-type="{input_type}" />'
     )
 
 
@@ -404,7 +407,7 @@ def _scope(
         devices=frozenset({"FAKE_SERIAL"}),
         packages=frozenset({package}),
         api_hosts=hosts,
-        allowed_actions=frozenset({"inspect", "controlled_validation"}),
+        allowed_actions=frozenset({"inspect", "autonomous_exploration"}),
     )
 
 
@@ -726,6 +729,170 @@ def test_external_dialog_dismissal_is_limited_to_permission_controller(
     assert interactions == ["tap"]
 
 
+def test_review_permissions_turns_off_checked_switches_before_continue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Adb:
+        def shell(self, *_args: object, **_kwargs: object) -> object:
+            return SimpleNamespace(stdout="")
+
+    permission_package = "com.android.permissioncontroller"
+    backend = AdbExplorerBackend(
+        Adb(),  # type: ignore[arg-type]
+        serial="FAKE_SERIAL",
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        per_action_timeout=2,
+    )
+    checked = True
+    interactions: list[tuple[int, int]] = []
+
+    def review_xml() -> str:
+        return _xml(
+            _node(
+                text="Contacts",
+                resource=f"{permission_package}:id/permission_switch",
+                class_name="android.widget.Switch",
+                bounds="[10,10][300,100]",
+                checked=checked,
+                package=permission_package,
+            ),
+            _node(
+                text="Continue",
+                resource=f"{permission_package}:id/continue_button",
+                bounds="[10,120][300,210]",
+                package=permission_package,
+            ),
+        )
+
+    monkeypatch.setattr(
+        backend,
+        "current_activity",
+        lambda: (
+            permission_package,
+            f"{permission_package}.permission.ui.ReviewPermissionsActivity",
+        ),
+    )
+    monkeypatch.setattr(backend, "dump_ui", lambda: review_xml())
+
+    def tap(x: int, y: int, **_kwargs: object) -> None:
+        nonlocal checked
+        interactions.append((x, y))
+        if y < 110:
+            checked = False
+
+    monkeypatch.setattr(backend, "tap", tap)
+
+    assert backend.dismiss_external_dialog() is True
+    assert backend.dismiss_external_dialog() is True
+    assert interactions == [(155, 55), (155, 165)]
+
+
+def test_review_permissions_does_not_continue_without_permission_switch_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Adb:
+        def shell(self, *_args: object, **_kwargs: object) -> object:
+            return SimpleNamespace(stdout="")
+
+    permission_package = "com.android.permissioncontroller"
+    backend = AdbExplorerBackend(
+        Adb(),  # type: ignore[arg-type]
+        serial="FAKE_SERIAL",
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        per_action_timeout=2,
+    )
+    interactions: list[str] = []
+    review_xml = _xml(
+        _node(
+            text="Continue",
+            resource=f"{permission_package}:id/continue_button",
+            package=permission_package,
+        )
+    )
+    monkeypatch.setattr(
+        backend,
+        "current_activity",
+        lambda: (
+            permission_package,
+            f"{permission_package}.permission.ui.ReviewPermissionsActivity",
+        ),
+    )
+    monkeypatch.setattr(backend, "dump_ui", lambda: review_xml)
+    monkeypatch.setattr(backend, "tap", lambda *_args, **_kwargs: interactions.append("tap"))
+
+    assert backend.dismiss_external_dialog() is False
+    assert interactions == []
+
+
+def test_legacy_system_ack_dialog_is_dismissed_without_touching_foreign_ui(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Adb:
+        def shell(self, *_args: object, **_kwargs: object) -> object:
+            return SimpleNamespace(stdout="")
+
+    backend = AdbExplorerBackend(
+        Adb(),  # type: ignore[arg-type]
+        serial="FAKE_SERIAL",
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        per_action_timeout=2,
+    )
+    interactions: list[str] = []
+    system_xml = _xml(
+        _node(
+            text="OK",
+            resource="android:id/button1",
+            package="android",
+        )
+    )
+    monkeypatch.setattr(
+        backend,
+        "current_activity",
+        lambda: ("android", "android.app.DeprecatedTargetSdkVersionDialog"),
+    )
+    monkeypatch.setattr(backend, "dump_ui", lambda: system_xml)
+    monkeypatch.setattr(backend, "tap", lambda *_args, **_kwargs: interactions.append("tap"))
+
+    assert backend.dismiss_external_dialog() is True
+    assert interactions == ["tap"]
+
+
+def test_dump_ui_retries_transient_uiautomation_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    dump_attempts = 0
+
+    class Adb:
+        def shell(self, _serial: str, arguments: tuple[str, ...], **_kwargs: object) -> object:
+            nonlocal dump_attempts
+            calls.append(arguments)
+            if arguments[:2] == ("uiautomator", "dump"):
+                dump_attempts += 1
+                if dump_attempts == 1:
+                    raise AdbError("ADB failed: UiAutomationService already registered")
+            if arguments[:1] == ("cat",):
+                return SimpleNamespace(stdout="<hierarchy />")
+            return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr("android_assessor.explorer.time.sleep", lambda _seconds: None)
+    backend = AdbExplorerBackend(
+        Adb(),  # type: ignore[arg-type]
+        serial="FAKE_SERIAL",
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        per_action_timeout=2,
+    )
+
+    assert backend.dump_ui() == "<hierarchy />"
+    assert dump_attempts == 2
+    assert sum(arguments[:2] == ("uiautomator", "dump") for arguments in calls) == 2
+    assert sum(arguments[:1] == ("cat",) for arguments in calls) == 1
+
+
 def test_disabled_hidden_and_output_fields_are_not_input_candidates() -> None:
     xml = _xml(
         _node(
@@ -794,6 +961,81 @@ def test_parser_and_actions_enforce_package_boundary() -> None:
     assert all("foreign" not in action.label.casefold() for action in actions)
 
 
+def test_explorer_leaving_package_is_a_structured_termination() -> None:
+    class BoundaryBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.state = "main"
+            self.left_package = False
+
+        def dump_ui(self) -> str:
+            self._command()
+            self.ui_dump_count += 1
+            return _xml(
+                _node(
+                    text="Open",
+                    resource="com.example.app:id/open",
+                    bounds="[10,120][300,210]",
+                )
+            ) if self.state == "main" else _xml(
+                _node(
+                    text="Child screen",
+                    resource="com.example.app:id/title",
+                    clickable=False,
+                )
+            )
+
+        def current_activity(self) -> tuple[str | None, str | None]:
+            self._command()
+            if self.left_package:
+                return "com.android.launcher3", "com.android.launcher3.Launcher"
+            return "com.example.app", f"com.example.app.{self.state.title()}Activity"
+
+        def tap(self, x: int, y: int, *, long: bool = False) -> None:
+            self._command()
+            del x, y, long
+            if self.state == "main":
+                self.stack.append("main")
+                self.state = "child"
+
+        def back(self) -> None:
+            self._command()
+            if self.state == "child":
+                self.left_package = True
+                self.stack.clear()
+
+    backend = BoundaryBackend()
+    clock = FakeClock()
+    explorer = AndroidExplorer(
+        backend,
+        package="com.example.app",
+        session_id="20260717-210000-abcdef",
+        manifest={},
+        scope=ScopeConfig(
+            devices=frozenset({"FAKE_SERIAL"}),
+            packages=frozenset({"com.example.app"}),
+            api_hosts=frozenset(),
+            allowed_actions=frozenset({"inspect", "autonomous_exploration"}),
+        ),
+        config=ExplorerConfig(
+            max_runtime_seconds=4,
+            plateau_seconds=2,
+            max_states=5,
+            max_actions=10,
+        ),
+        network_guard_active=True,
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+
+    result = explorer.run()
+
+    assert result.status == "completed"
+    assert result.termination_reason == "package_boundary"
+    assert backend.cleanup_called is True
+    assert any(item["event"] == "exploration_stopped" for item in explorer.trace)
+
+
 def test_explorer_service_requires_strict_device_package_scope(tmp_path: Path) -> None:
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
@@ -824,7 +1066,7 @@ def test_explorer_service_requires_strict_device_package_scope(tmp_path: Path) -
     assert calls == [("FAKE_SERIAL", "com.example.app", "inspect")]
 
 
-def test_explorer_service_requires_active_interaction_action(tmp_path: Path) -> None:
+def test_explorer_service_requires_autonomous_exploration_action(tmp_path: Path) -> None:
     paths = ProjectPaths(tmp_path / "lab")
     paths.ensure_layout()
     repository = SessionRepository(paths)
@@ -833,10 +1075,10 @@ def test_explorer_service_requires_active_interaction_action(tmp_path: Path) -> 
         devices=frozenset({"FAKE_SERIAL"}),
         packages=frozenset({"com.example.app"}),
         api_hosts=frozenset({"10.0.2.2"}),
-        allowed_actions=frozenset({"inspect"}),
+        allowed_actions=frozenset({"inspect", "controlled_validation"}),
     )
 
-    with pytest.raises(ScopeError, match="controlled_validation"):
+    with pytest.raises(ScopeError, match="autonomous_exploration"):
         ExplorerService(paths, repository).run(
             record.session_id,
             adb=object(),  # type: ignore[arg-type]
@@ -845,6 +1087,59 @@ def test_explorer_service_requires_active_interaction_action(tmp_path: Path) -> 
             feedback=lambda: RuntimeFeedback(),
             stop_requested=lambda: False,
         )
+
+
+def test_explorer_service_accepts_autonomous_action_without_controlled_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = ProjectPaths(tmp_path / "lab")
+    paths.ensure_layout()
+    repository = SessionRepository(paths)
+    record = repository.initialize(serial="FAKE_SERIAL", package="com.example.app")
+    scope = ScopeConfig(
+        devices=frozenset({"FAKE_SERIAL"}),
+        packages=frozenset({"com.example.app"}),
+        api_hosts=frozenset({"10.0.2.2"}),
+        allowed_actions=frozenset({"inspect", "autonomous_exploration"}),
+    )
+
+    class Explorer:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.trace: list[dict[str, object]] = []
+
+        def run(self) -> ExplorerResult:
+            return ExplorerResult(
+                session_id=record.session_id,
+                status="completed",
+                termination_reason="coverage_plateau",
+                duration_ms=1.0,
+                states_visited=1,
+                activities_visited=("com.example.app.MainActivity",),
+                actions_executed=0,
+                input_actions=0,
+                scroll_actions=0,
+                backtracks=0,
+                process_restarts=0,
+                crashes=0,
+                runtime_categories=(),
+                runtime_methods=0,
+                runtime_events=0,
+                activity_attempts=(),
+                deep_link_attempts=(),
+            )
+
+    monkeypatch.setattr("android_assessor.explorer.AndroidExplorer", Explorer)
+    result = ExplorerService(paths, repository).run(
+        record.session_id,
+        adb=object(),  # type: ignore[arg-type]
+        scope=scope,
+        config=ExplorerConfig(max_runtime_seconds=1),
+        feedback=lambda: RuntimeFeedback(),
+        stop_requested=lambda: False,
+    )
+
+    assert result.status == "completed"
 
 
 def test_bounded_traversal_backtracks_and_activates_runtime_categories() -> None:

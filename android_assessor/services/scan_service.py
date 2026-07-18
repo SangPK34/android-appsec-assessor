@@ -489,7 +489,7 @@ class ScanService:
                         explorer_scope.require_device_package(
                             record.serial,
                             record.package,
-                            action="controlled_validation",
+                            action="autonomous_exploration",
                         )
                         exploration_executed = True
                         exploration_result = ExplorerService(

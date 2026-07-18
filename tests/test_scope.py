@@ -246,6 +246,28 @@ def test_valid_scope_loads_actions_limits_hosts_and_ports(tmp_path: Path) -> Non
     assert scope.limits.max_evidence_size_mb == 25
 
 
+def test_scope_accepts_autonomous_exploration_without_controlled_validation(
+    tmp_path: Path,
+) -> None:
+    paths, _repository, _session_id = active_session(tmp_path)
+    paths.scope_file.write_text(
+        "devices: [ABC123]\n"
+        "packages: [com.example.app]\n"
+        "api_hosts: []\n"
+        "allowed_actions: [inspect, autonomous_exploration]\n",
+        encoding="utf-8",
+    )
+
+    scope = load_scope(paths)
+    scope.require_device_package(
+        "ABC123",
+        "com.example.app",
+        action="autonomous_exploration",
+    )
+    with pytest.raises(ScopeError, match="controlled_validation"):
+        scope.require_action("controlled_validation")
+
+
 @pytest.mark.parametrize(
     "url",
     (
@@ -320,6 +342,7 @@ def test_read_only_inspection_outside_target_scope_requires_explicit_opt_in(
     "payload",
     (
         "allowed_actions: [unknown_action]\n",
+        "allowed_actions: [autonomous-exploration]\n",
         "allowed_actions: []\nlimits: {command_timeout_seconds: 0}\n",
         "allowed_actions: []\nlimits: {max_evidence_size_mb: huge}\n",
     ),

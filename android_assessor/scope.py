@@ -27,6 +27,7 @@ _ALLOWED_ACTIONS = {
     "root_storage_read",
     "frida_observe",
     "traffic_capture",
+    "autonomous_exploration",
     "controlled_validation",
 }
 

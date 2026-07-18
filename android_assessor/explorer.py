@@ -56,6 +56,15 @@ _DANGEROUS_LABELS = (
 )
 _DENY_PERMISSION_LABELS = ("deny", "don't allow", "cancel", "no thanks", "not now")
 _ALLOW_PERMISSION_LABELS = ("allow", "while using", "only this time")
+_REVIEW_CONTINUE_LABELS = ("continue", "next", "done", "finish")
+_REVIEW_CONTINUE_RESOURCE_MARKERS = (
+    "continue_button",
+    "next_button",
+    "done_button",
+    "finish_button",
+)
+_SYSTEM_ACK_LABELS = ("ok", "got it", "continue")
+_SYSTEM_ACK_RESOURCE_MARKERS = ("android:id/button1", "android:id/ok")
 _PERMISSION_CONTROLLER_PACKAGES = frozenset(
     {
         "com.android.packageinstaller",
@@ -63,6 +72,10 @@ _PERMISSION_CONTROLLER_PACKAGES = frozenset(
         "com.google.android.permissioncontroller",
     }
 )
+_SYSTEM_DIALOG_PACKAGES = frozenset({"android", "com.android.systemui"})
+_REVIEW_ACTIVITY_MARKER = "reviewpermissionsactivity"
+_LEGACY_ACK_ACTIVITY_MARKERS = ("deprecatedtargetsdkversiondialog",)
+_UIAUTOMATION_TRANSIENT_ERRORS = ("already registered",)
 _KEYWORD_CATEGORIES = {
     "crypto": (
         "encrypt",
@@ -94,6 +107,19 @@ _KEYWORD_CATEGORIES = {
 
 class _ExplorerDeadlineReached(Exception):
     pass
+
+
+class _ExplorerPackageBoundary(AndroidAssessorError):
+    """The scoped application is no longer the resumed package."""
+
+    def __init__(self, package: str | None, activity: str | None) -> None:
+        self.package = package
+        self.activity = activity
+        observed = "/".join(part for part in (package, activity) if part) or "unknown"
+        super().__init__(
+            "Explorer left the scoped package boundary "
+            f"(observed {observed})."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +165,7 @@ class UiNode:
     input_type: str
     enabled: bool = True
     visible: bool = True
+    checked: bool = False
 
     @property
     def label(self) -> str:
@@ -252,6 +279,11 @@ def _normalize_label(value: str) -> str:
     return _VOLATILE_PATTERN.sub("<value>", normalized)[:160]
 
 
+def _is_transient_ui_automation_error(error: BaseException) -> bool:
+    message = str(error).casefold()
+    return any(marker in message for marker in _UIAUTOMATION_TRANSIENT_ERRORS)
+
+
 def _trace_label(value: str) -> str:
     """Retain only generic semantics, never arbitrary UI text, in redacted evidence."""
     normalized = _normalize_label(redact_text(value))
@@ -343,6 +375,7 @@ def parse_ui_hierarchy(
             input_type=attributes.get("input-type", ""),
             enabled=str(attributes.get("enabled", "true")).casefold() != "false",
             visible=str(attributes.get("visible-to-user", "true")).casefold() != "false",
+            checked=_truth(attributes.get("checked")),
         )
         nodes.append(node)
         normalized.append(
@@ -356,6 +389,7 @@ def parse_ui_hierarchy(
                 node.scrollable,
                 node.enabled,
                 node.visible,
+                node.checked,
             )
         )
     digest = hashlib.sha256(
@@ -659,16 +693,23 @@ class AdbExplorerBackend:
         if not self._workspace_ready:
             self._shell(("mkdir", "-p", "--", self.remote_dir), "creating explorer workspace")
             self._workspace_ready = True
-        self._shell(
-            ("uiautomator", "dump", "--compressed", self.remote_xml),
-            "capturing bounded UI hierarchy",
-            timeout=self.timeout,
-        )
-        return self._shell(
-            ("cat", "--", self.remote_xml),
-            "reading UI hierarchy",
-            timeout=self.timeout,
-        )
+        for attempt in range(2):
+            try:
+                self._shell(
+                    ("uiautomator", "dump", "--compressed", self.remote_xml),
+                    "capturing bounded UI hierarchy",
+                    timeout=self.timeout,
+                )
+                return self._shell(
+                    ("cat", "--", self.remote_xml),
+                    "reading UI hierarchy",
+                    timeout=self.timeout,
+                )
+            except AdbError as exc:
+                if attempt or not _is_transient_ui_automation_error(exc):
+                    raise
+                time.sleep(0.05)
+        raise AdbError("UI hierarchy capture failed after transient retry.")
 
     def current_activity(self) -> tuple[str | None, str | None]:
         output = self._shell(
@@ -775,7 +816,13 @@ class AdbExplorerBackend:
         package, activity = self.current_activity()
         if package in {None, self.package}:
             return False
-        if package not in _PERMISSION_CONTROLLER_PACKAGES:
+        activity_key = (activity or "").casefold()
+        is_permission_controller = package in _PERMISSION_CONTROLLER_PACKAGES
+        is_system_ack = (
+            package in _SYSTEM_DIALOG_PACKAGES
+            and any(marker in activity_key for marker in _LEGACY_ACK_ACTIVITY_MARKERS)
+        )
+        if not is_permission_controller and not is_system_ack:
             return False
         try:
             xml = self.dump_ui()
@@ -786,14 +833,74 @@ class AdbExplorerBackend:
             )
         except (AndroidAssessorError, OSError, ValueError):
             return False
+        is_review = is_permission_controller and _REVIEW_ACTIVITY_MARKER in activity_key
+        permission_switch_seen = False
+        checked_permission_switch_seen = False
+        if is_review:
+            # Legacy permission review starts compatible runtime permissions as
+            # checked.  Turn every permission switch off before acknowledging
+            # the screen so the default remains deny; never tap an allow control.
+            for node in state.nodes:
+                class_key = node.class_name.casefold()
+                resource_key = node.resource_id.casefold()
+                is_switch = (
+                    class_key.endswith(("switch", "checkbox", "togglebutton"))
+                    or any(
+                        marker in resource_key
+                        for marker in (
+                            "permission_switch",
+                            "permission_toggle",
+                            "grant_switch",
+                            "grant_toggle",
+                        )
+                    )
+                )
+                if not is_switch:
+                    continue
+                permission_switch_seen = True
+                if node.checked:
+                    checked_permission_switch_seen = True
+                    if node.clickable and node.enabled and node.visible:
+                        self.tap(*node.center)
+                        return True
+            if checked_permission_switch_seen:
+                return False
         for node in state.nodes:
             label = _normalize_label(node.label)
-            if node.clickable and any(term in label for term in _DENY_PERMISSION_LABELS):
+            resource_key = node.resource_id.casefold()
+            resource_tail = resource_key.rsplit("/", 1)[-1]
+            semantic_labels = {
+                _normalize_label(value)
+                for value in (node.text, node.content_description, node.hint)
+                if value
+            }
+            if not node.clickable or not node.enabled or not node.visible:
+                continue
+            if any(term in label for term in _DENY_PERMISSION_LABELS):
                 x, y = node.center
                 self.tap(x, y)
                 return True
-            if node.clickable and any(term in label for term in _ALLOW_PERMISSION_LABELS):
+            if any(term in label for term in _ALLOW_PERMISSION_LABELS):
                 continue
+            review_continue = (
+                is_review
+                and permission_switch_seen
+                and not checked_permission_switch_seen
+                and (
+                    any(term in semantic_labels for term in _REVIEW_CONTINUE_LABELS)
+                    or resource_tail in _REVIEW_CONTINUE_RESOURCE_MARKERS
+                )
+            )
+            if review_continue:
+                self.tap(*node.center)
+                return True
+            system_ack = is_system_ack and (
+                any(term in semantic_labels for term in _SYSTEM_ACK_LABELS)
+                or resource_key in _SYSTEM_ACK_RESOURCE_MARKERS
+            )
+            if system_ack:
+                self.tap(*node.center)
+                return True
         return False
 
     def hide_keyboard(self) -> None:
@@ -890,7 +997,7 @@ class AndroidExplorer:
                         else "outside_scope"
                     ),
                 )
-            raise AdbError("Explorer target package is not the resumed application.")
+            raise _ExplorerPackageBoundary(package, activity)
         self._ui_dump_count += 1
         xml = self.backend.dump_ui()
         if self.clock() >= getattr(self, "_hard_deadline", float("inf")):
@@ -921,6 +1028,14 @@ class AndroidExplorer:
                     return current
                 if stable_count >= 2:
                     return current
+            except _ExplorerPackageBoundary:
+                try:
+                    if self.backend.dismiss_external_dialog():
+                        self.sleeper(0.15)
+                        continue
+                except (AndroidAssessorError, OSError, ValueError):
+                    pass
+                raise
             except (AndroidAssessorError, OSError, ValueError):
                 try:
                     self.backend.dismiss_external_dialog()
@@ -1516,6 +1631,15 @@ class AndroidExplorer:
         except _ExplorerDeadlineReached:
             termination = "max_runtime"
             block_pending_navigation("hard_limit")
+        except _ExplorerPackageBoundary as exc:
+            termination = "package_boundary"
+            block_pending_navigation("package_boundary")
+            self._trace(
+                "exploration_stopped",
+                reason=termination,
+                observed_package=exc.package,
+                observed_activity=exc.activity,
+            )
         finally:
             self.backend.cleanup()
         final_feedback = self.feedback()
@@ -1597,7 +1721,7 @@ class ExplorerService:
         scope.require_device_package(
             record.serial,
             record.package,
-            action="controlled_validation",
+            action="autonomous_exploration",
         )
         session_paths = self.repository.paths_for(record.session_id)
         app = read_json_object(session_paths.app_json, root=self.paths.root)
