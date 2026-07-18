@@ -1,0 +1,65 @@
+schema_version: 1
+scenario_id: login
+total_timeout_seconds: 90
+
+preconditions:
+  network_guard: true
+  required_observers:
+    - frida
+    - traffic
+    - logcat
+    - private_storage
+
+steps:
+  - id: launch
+    action: launch
+    timeout_seconds: 8
+    expected_activity: com.android.insecurebankv2.LoginActivity
+
+  - id: wait-login
+    action: wait_for
+    timeout_seconds: 10
+    selector_ref: username
+    max_read_retries: 2
+
+  - id: baseline
+    action: collect_observations
+    timeout_seconds: 5
+    observers:
+      - private_storage
+
+  - id: input-username
+    action: input
+    timeout_seconds: 8
+    selector_ref: username
+    value_ref: username
+
+  - id: input-password
+    action: input
+    timeout_seconds: 8
+    selector_ref: password
+    value_ref: password
+
+  - id: submit
+    action: click
+    timeout_seconds: 8
+    selector_ref: submit
+
+  - id: await-authenticated
+    action: wait_for_transition
+    timeout_seconds: 20
+    transition_ref: authenticated
+    max_read_retries: 3
+
+  - id: collect-runtime
+    action: collect_observations
+    timeout_seconds: 10
+    observers:
+      - frida
+      - traffic
+      - logcat
+      - private_storage
+
+  - id: cleanup
+    action: cleanup
+    timeout_seconds: 8

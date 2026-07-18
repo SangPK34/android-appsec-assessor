@@ -107,6 +107,15 @@ def _static_api_ids(static_analysis: dict[str, Any] | None) -> set[str]:
     }
 
 
+def _timestamp_key(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
+    except ValueError:
+        return value
+
+
 _SYMMETRIC_CIPHERS = {
     "AES",
     "DES",
@@ -689,11 +698,29 @@ class RuleEngine:
                 False,
                 False,
             )
+        scenario_traffic = [
+            {
+                **(
+                    dict(item.get("attributes", {}))
+                    if isinstance(item.get("attributes"), dict)
+                    else {}
+                ),
+                "event": (
+                    item.get("attributes", {}).get("event", "request")
+                    if isinstance(item.get("attributes"), dict)
+                    else "request"
+                ),
+                "evidence_id": item.get("evidence_id"),
+                "scenario_id": item.get("scenario_id"),
+            }
+            for item in context.get("scenario_events", [])
+            if item.get("observer") == "traffic"
+        ]
         attributed_traffic = [
             item
             for item in traffic
             if item.get("attribution") in {"target", "validation_canary"}
-        ]
+        ] + scenario_traffic
         if definition.evaluator == "app_debuggable":
             if manifest is None:
                 return (
@@ -933,7 +960,31 @@ class RuleEngine:
                     else ["explicit manifest policy or attributed cleartext request"]
                 ),
             }
-            ids = evidence("traffic_events") if observed else evidence("manifest_tree")
+            ids = (
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *evidence("traffic_events"),
+                            *evidence("scenario_correlation"),
+                        )
+                    )
+                )
+                if observed
+                else evidence("manifest_tree")
+            )
+            if context.get("scenario_correlation") is not None:
+                details["scenario_correlation"] = {
+                    "accepted_count": context["scenario_correlation"].get(
+                        "accepted_count", 0
+                    ),
+                    "rejected_count": context["scenario_correlation"].get(
+                        "rejected_count", 0
+                    ),
+                }
+            if context.get("scenario_correlation_errors"):
+                details["scenario_correlation_errors"] = list(
+                    context["scenario_correlation_errors"]
+                )
             return status, analysis, details, ids, False, False
 
         if definition.evaluator == "sensitive_token":
@@ -1220,7 +1271,20 @@ class RuleEngine:
                 bool(frida_tls),
             )
         if definition.evaluator == "crypto_runtime":
-            values = [SimpleNamespace(**item) for item in frida]
+            crypto_events = frida
+            if context.get("scenario_correlation") is not None:
+                eligible_keys = {
+                    (_timestamp_key(item.get("timestamp")), item.get("pid"))
+                    for item in context.get("scenario_events_all", [])
+                    if item.get("observer") == "frida"
+                }
+                crypto_events = [
+                    item
+                    for item in frida
+                    if (_timestamp_key(item.get("timestamp")), item.get("pid"))
+                    in eligible_keys
+                ]
+            values = [SimpleNamespace(**item) for item in crypto_events]
             extraction = operations_from_frida_events(
                 values,
                 source=str(context["frida_source"]),
@@ -1245,9 +1309,16 @@ class RuleEngine:
                             "events match the assessment session and package",
                         ],
                     },
-                    evidence("frida_events"),
+                    tuple(
+                        dict.fromkeys(
+                            (
+                                *evidence("frida_events"),
+                                *evidence("scenario_correlation"),
+                            )
+                        )
+                    ),
                     False,
-                    bool(frida),
+                    bool(crypto_events),
                 )
             operation_kind = {
                 "CRYPTO-WEAK-DIGEST": {"digest", "mac"},
@@ -1357,7 +1428,14 @@ class RuleEngine:
                         ],
                         "finding_eligible": context["frida_finding_eligible"],
                     },
-                    evidence("frida_events"),
+                    tuple(
+                        dict.fromkeys(
+                            (
+                                *evidence("frida_events"),
+                                *evidence("scenario_correlation"),
+                            )
+                        )
+                    ),
                     False,
                     bool(extraction.operations),
                 )
@@ -1392,7 +1470,14 @@ class RuleEngine:
                 matched.status,
                 "instrumentation",
                 details,
-                evidence("frida_events"),
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *evidence("frida_events"),
+                            *evidence("scenario_correlation"),
+                        )
+                    )
+                ),
                 False,
                 bool(extraction.operations),
             )
@@ -2162,6 +2247,48 @@ class RuleEngine:
             paths.redacted_dir / "storage" / "private-storage.json", self.paths.root
         )
         scan_state = _optional_json(paths.scan_json, self.paths.root)
+        scenario_correlation: dict[str, Any] | None = None
+        scenario_correlation_errors: list[str] = []
+        if isinstance(scan_state, dict):
+            correlation_relative = scan_state.get("scenario_correlation_path")
+            if isinstance(correlation_relative, str) and correlation_relative:
+                try:
+                    correlation_path = require_under_root(
+                        paths.root / correlation_relative,
+                        paths.root,
+                    )
+                    registered = next(
+                        (
+                            item
+                            for item in self.evidence.list(session_id)
+                            if item.get("evidence_type") == "scenario_correlation"
+                            and item.get("relative_path")
+                            == correlation_path.relative_to(paths.root).as_posix()
+                        ),
+                        None,
+                    )
+                    if registered is None:
+                        scenario_correlation_errors.append(
+                            "Scenario correlation evidence is not registered."
+                        )
+                    elif not correlation_path.is_file() or sha256_file(correlation_path) != str(
+                        registered.get("sha256", "")
+                    ):
+                        scenario_correlation_errors.append(
+                            "Scenario correlation evidence integrity mismatch."
+                        )
+                    else:
+                        payload = _optional_json(correlation_path, self.paths.root)
+                        if isinstance(payload, dict) and payload.get("session_id") == session_id:
+                            scenario_correlation = payload
+                        else:
+                            scenario_correlation_errors.append(
+                                "Scenario correlation identity does not match the session."
+                            )
+                except (AndroidAssessorError, OSError, ValueError) as exc:
+                    scenario_correlation_errors.append(
+                        f"Scenario correlation could not be loaded: {redact_text(str(exc))[:200]}"
+                    )
         device_state = _optional_json(paths.device_json, self.paths.root) or {}
         capability_values = device_state.get("capabilities", {}).get("capabilities", [])
         available_capabilities = {
@@ -2267,10 +2394,34 @@ class RuleEngine:
                 if item.get("evidence_type") == evidence_type
             )
 
+        scenario_events_all = (
+            [
+                dict(item)
+                for item in scenario_correlation.get("events", [])
+                if isinstance(item, dict)
+            ]
+            if isinstance(scenario_correlation, dict)
+            and isinstance(scenario_correlation.get("events"), list)
+            else []
+        )
+        scenario_events = (
+            [
+                dict(item)
+                for item in scenario_events_all
+                if item.get("eligible_for_confirmation") is True
+            ]
+            if scenario_events_all
+            else []
+        )
+
         context = {
             "manifest": manifest,
             "static_analysis": static_analysis,
             "traffic_events": traffic_events,
+            "scenario_events_all": scenario_events_all,
+            "scenario_events": scenario_events,
+            "scenario_correlation": scenario_correlation,
+            "scenario_correlation_errors": scenario_correlation_errors,
             "logcat": logcat,
             "frida_events": frida_events,
             "frida_state": frida_state,

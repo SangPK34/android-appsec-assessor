@@ -236,6 +236,55 @@ def test_traffic_uses_lazy_upstream_and_exact_host_allowlist(
     assert "android_assessor_allowed_hosts=10.0.2.2" in commands[0]
 
 
+def test_scenario_traffic_is_metadata_only_and_secrets_stay_off_command_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _repository, session_id, _adb, process, executable = prepared_service(
+        tmp_path,
+        "none",
+    )
+    command_and_env: list[tuple[list[str], dict[str, str]]] = []
+    secret = "fixture-owned-password"
+    fingerprint = "a" * 64
+    monkeypatch.setattr(
+        "android_assessor.traffic.resolve_binary",
+        lambda *_args, **_kwargs: BinaryResolution(executable, "test"),
+    )
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        command_and_env.append((command, dict(kwargs["env"])))  # type: ignore[arg-type]
+        return process
+
+    monkeypatch.setattr("android_assessor.traffic.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        TrafficCaptureService,
+        "_wait_ready",
+        staticmethod(lambda *_args, **_kwargs: None),
+    )
+
+    state = service.start(
+        session_id,
+        launch_app=False,
+        retain_raw_flows=False,
+        owned_value_fingerprints={fingerprint: secret},
+    )
+
+    command, process_env = command_and_env[0]
+    assert "-w" not in command
+    assert secret not in " ".join(command)
+    assert secret in process_env["ANDROID_ASSESSOR_OWNED_VALUES"]
+    assert state.flow_path is None
+    assert state.retained_raw_flows is False
+
+    stopped = service.stop(session_id)
+    evidence_types = {
+        item["evidence_type"] for item in service.evidence.list(session_id)
+    }
+    assert stopped.status == "stopped"
+    assert "traffic_flow" not in evidence_types
+
+
 @pytest.mark.parametrize("frida_stop_error", [False, True])
 def test_scan_stops_started_resources_when_wait_is_interrupted(
     tmp_path: Path,

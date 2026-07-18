@@ -114,6 +114,8 @@ def test_mitm_attributes_exact_canary_in_query_header_and_bounded_body(
     )
     monkeypatch.setattr(mitm_capture, "_write", events.append)
     flow = _flow("10.0.2.2")
+    flow.request.port = 8888
+    flow.request.scheme = "http"
     flow.request.pretty_url += f"?value={canary}"
     flow.request.headers = http.Headers(authorization=f"Bearer {canary}")
     flow.request.raw_content = f"value={canary}&kind=lab".encode()
@@ -156,3 +158,72 @@ def test_mitm_rejects_canary_shape_and_skips_oversized_body(monkeypatch) -> None
     assert event["attribution"] == "unattributed"
     assert event["canary_sink_types"] == []
     assert event["canary_body_scan_status"] == "skipped_size_limit"
+
+
+def test_mitm_attributes_owned_fixture_value_by_fingerprint_without_leaking_raw(
+    monkeypatch,
+) -> None:
+    events: list[dict[str, object]] = []
+    secret = "fixture-owned-password"
+    fingerprint = "b" * 64
+    monkeypatch.setenv(
+        "ANDROID_ASSESSOR_OWNED_VALUES",
+        f'{{"{fingerprint}":"{secret}"}}',
+    )
+    monkeypatch.setattr(
+        mitm_capture.ctx,
+        "options",
+        SimpleNamespace(
+            android_assessor_events="",
+            android_assessor_canary="",
+            android_assessor_allowed_hosts="10.0.2.2",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(mitm_capture, "_write", events.append)
+    flow = _flow("10.0.2.2")
+    flow.request.pretty_url += f"?password={secret}"
+    flow.request.raw_content = f"username=fixture&password={secret}".encode()
+
+    mitm_capture.request(flow)  # type: ignore[arg-type]
+
+    event = events[0]
+    assert event["attribution"] == "scenario_owned_value"
+    assert event["owned_value_fingerprints"] == [fingerprint]
+    assert event["owned_value_sink_types"] == {
+        fingerprint: ["http_body", "url_query"]
+    }
+    assert secret not in str(event)
+
+
+def test_mitm_maps_declared_scoped_local_backend_without_changing_attribution_host(
+    monkeypatch,
+) -> None:
+    events: list[dict[str, object]] = []
+    monkeypatch.setenv(
+        "ANDROID_ASSESSOR_UPSTREAM_MAP",
+        '{"10.0.2.2:8888":"127.0.0.1:8888"}',
+    )
+    monkeypatch.setattr(
+        mitm_capture.ctx,
+        "options",
+        SimpleNamespace(
+            android_assessor_events="",
+            android_assessor_canary="",
+            android_assessor_allowed_hosts="10.0.2.2",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(mitm_capture, "_write", events.append)
+    flow = _flow("10.0.2.2")
+    flow.request.port = 8888
+    flow.request.scheme = "http"
+
+    mitm_capture.request(flow)  # type: ignore[arg-type]
+
+    event = events[0]
+    assert event["host"] == "10.0.2.2"
+    assert event["backend_id"] == "10.0.2.2:8888"
+    assert event["backend_scope"] == "scoped_local"
+    assert flow.request.host == "127.0.0.1"
+    assert flow.request.port == 8888

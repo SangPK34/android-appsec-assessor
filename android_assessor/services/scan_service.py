@@ -15,6 +15,7 @@ from ..app_context import AppContext
 from ..device_lock import DeviceLock
 from ..errors import AndroidAssessorError
 from ..explorer import (
+    AdbExplorerBackend,
     ExplorerConfig,
     ExplorerResult,
     ExplorerService,
@@ -27,6 +28,7 @@ from ..private_storage import AdbPrivateStorageBackend, PrivateStorageService
 from ..redaction import redact_text
 from ..report import ReportService
 from ..rules import RuleEngine
+from ..scenario_correlation import correlate_scenario_events
 from ..scope import load_scope
 from ..session import SessionRecord, SessionRepository
 from ..storage import read_json_object, write_json_atomic
@@ -34,6 +36,7 @@ from ..traffic import TrafficCaptureService
 from ..validation import generate_session_canary
 from .app_inspection_service import AppInspectionService
 from .cleanup_service import CleanupService
+from .scenario_service import ScenarioPlan, ScenarioRequest, ScenarioService
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,6 +65,26 @@ _EXPLORER_LIMIT_BLOCK_REASONS = frozenset(
         "process_restart_failed",
     }
 )
+
+
+def _read_redacted_jsonl(path: Any, *, maximum: int = 20_000) -> list[dict[str, Any]]:
+    """Read a bounded redacted JSONL observer stream without retaining raw data."""
+
+    if not hasattr(path, "is_file") or not path.is_file():
+        return []
+    output: list[dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            if len(output) >= maximum:
+                break
+            value = json.loads(line)
+            if isinstance(value, dict):
+                output.append(value)
+    except (OSError, ValueError):
+        return []
+    return output
 
 
 def _non_negative_count(value: Any) -> int:
@@ -241,6 +264,7 @@ class ScanService:
         autonomous: bool | None = None,
         explorer_config: ExplorerConfig | None = None,
         controlled_canary: bool = False,
+        scenario_request: ScenarioRequest | None = None,
     ) -> ScanResult:
         _require_explicit_controlled_canary_request(
             explorer_config=explorer_config,
@@ -257,6 +281,7 @@ class ScanService:
             autonomous=autonomous,
             explorer_config=explorer_config,
             controlled_canary=controlled_canary,
+            scenario_request=scenario_request,
         )
 
     def scan_session(
@@ -268,6 +293,7 @@ class ScanService:
         autonomous: bool | None = None,
         explorer_config: ExplorerConfig | None = None,
         controlled_canary: bool = False,
+        scenario_request: ScenarioRequest | None = None,
     ) -> ScanResult:
         _require_explicit_controlled_canary_request(
             explorer_config=explorer_config,
@@ -295,6 +321,16 @@ class ScanService:
                 record.package,
                 action="controlled_validation",
             )
+        if scenario_request is not None:
+            if resolution.effective_profile is not ScanProfile.FULL:
+                raise AndroidAssessorError(
+                    "Deterministic scenarios require a Full Assessment."
+                )
+            scope.require_device_package(
+                record.serial,
+                record.package,
+                action="controlled_validation",
+            )
         self.repository.require_modifying_session_slot(record.serial, record.session_id)
         try:
             with DeviceLock(
@@ -314,6 +350,7 @@ class ScanService:
                     runtime_seconds=runtime_seconds,
                     explorer_config=explorer_config,
                     controlled_canary=controlled_canary,
+                    scenario_request=scenario_request,
                 )
         except BaseException:
             if resolution.effective_profile is ScanProfile.FULL:
@@ -461,6 +498,129 @@ class ScanService:
             except (OSError, ValueError, TypeError):
                 return False
 
+    def _finalize_scenario_correlation(
+        self,
+        record: SessionRecord,
+        *,
+        scenario_result: Any,
+        scenario_plan: ScenarioPlan,
+        scenario_service: ScenarioService,
+    ) -> dict[str, Any] | None:
+        """Join completed scenario windows to redacted observer evidence."""
+
+        if getattr(scenario_result, "outcome", None) is None:
+            return None
+        summary = scenario_result.to_dict()
+        verified_pids = summary.get("verified_pids", [])
+        verified_processes = summary.get("verified_processes", [])
+        if not isinstance(verified_pids, list) or not verified_pids:
+            return None
+        pid = verified_pids[0]
+        process = (
+            verified_processes[0]
+            if isinstance(verified_processes, list) and verified_processes
+            else record.package
+        )
+        evidence_values = scenario_service.evidence.list(record.session_id)
+
+        def evidence_id(evidence_type: str) -> str | None:
+            for item in evidence_values:
+                if item.get("evidence_type") == evidence_type:
+                    value = item.get("evidence_id")
+                    return str(value) if value else None
+            return None
+
+        summary.update(
+            {
+                "process": process,
+                "owned_value_fingerprints": sorted(scenario_plan.owned_values),
+                "scoped_backend_ids": sorted(scenario_plan.upstream_mapping),
+                "evidence_ids": {
+                    key: value
+                    for key, value in (
+                        ("traffic", evidence_id("traffic_events")),
+                        ("frida", evidence_id("frida_events")),
+                    )
+                    if value is not None
+                },
+            }
+        )
+        scenario_service.persist_summary(
+            record.session_id,
+            str(summary["scenario_id"]),
+            summary,
+        )
+        paths = self.repository.paths_for(record.session_id)
+
+        def state_events(state_path: Any) -> list[dict[str, Any]]:
+            try:
+                state = read_json_object(state_path, root=self.paths.root)
+                relative = state.get("events_path")
+                if not isinstance(relative, str) or not relative:
+                    return []
+                event_path = self.paths.require_inside_root(paths.root / relative)
+                return _read_redacted_jsonl(event_path)
+            except (AndroidAssessorError, OSError, ValueError):
+                return []
+
+        traffic_events = state_events(paths.traffic_dir / "state.json")
+        frida_events = state_events(paths.frida_dir / "state.json")
+        normalized_traffic = []
+        for event in traffic_events:
+            value = dict(event)
+            value.update(
+                {
+                    "observer": "traffic",
+                    "session_id": record.session_id,
+                    "scenario_id": summary["scenario_id"],
+                    "package": record.package,
+                    "pid": pid,
+                    "process": process,
+                }
+            )
+            normalized_traffic.append(value)
+        normalized_frida = []
+        for event in frida_events:
+            value = dict(event)
+            value.update(
+                {
+                    "observer": "frida",
+                    "session_id": record.session_id,
+                    "scenario_id": summary["scenario_id"],
+                    "package": record.package,
+                    "pid": value.get("pid", pid),
+                    "process": value.get("process") or process,
+                }
+            )
+            normalized_frida.append(value)
+        try:
+            correlation = correlate_scenario_events(
+                summary,
+                traffic_events=normalized_traffic,
+                frida_events=normalized_frida,
+            )
+            payload = correlation.to_dict()
+        except (TypeError, ValueError) as exc:
+            payload = {
+                "events": [],
+                "rejected": [],
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "correlation_error": redact_text(str(exc))[:300],
+            }
+        payload = {
+            "schema_version": 1,
+            "session_id": record.session_id,
+            "scenario_id": summary["scenario_id"],
+            **payload,
+        }
+        scenario_service.persist_correlation(
+            record.session_id,
+            str(summary["scenario_id"]),
+            payload,
+        )
+        return payload
+
     def _scan_session_locked(
         self,
         record: SessionRecord,
@@ -469,6 +629,7 @@ class ScanService:
         runtime_seconds: int | None = None,
         explorer_config: ExplorerConfig | None = None,
         controlled_canary: bool = False,
+        scenario_request: ScenarioRequest | None = None,
     ) -> ScanResult:
         profile = resolution.effective_profile
         autonomous_enabled = resolution.autonomous_exploration_enabled
@@ -480,6 +641,9 @@ class ScanService:
             "frida_observation": "skipped" if profile is ScanProfile.QUICK else "pending",
             "autonomous_exploration": (
                 "pending" if resolution.autonomous_exploration_enabled else "skipped"
+            ),
+            "deterministic_scenario": (
+                "pending" if scenario_request is not None else "skipped"
             ),
             "controlled_canary": "pending" if controlled_canary else "skipped",
             "target_logcat": "pending",
@@ -495,9 +659,27 @@ class ScanService:
         exploration_result: ExplorerResult | None = None
         exploration_executed = False
         controlled_canary_executed = False
+        scenario_result = None
+        scenario_plan: ScenarioPlan | None = None
+        scenario_correlation: dict[str, Any] | None = None
+        scenario_service = (
+            ScenarioService(self.context, self.repository)
+            if scenario_request is not None
+            else None
+        )
         assessment_canary = (
             generate_session_canary() if profile is ScanProfile.FULL else None
         )
+        if scenario_service is not None and scenario_request is not None:
+            try:
+                scenario_plan = scenario_service.prepare(
+                    scenario_request,
+                    session_canary=assessment_canary,
+                )
+            except (AndroidAssessorError, OSError, ValueError) as exc:
+                limitations.append(
+                    f"Deterministic scenario preparation failed: {redact_text(str(exc))[:300]}"
+                )
         paths.runtime_control_json.unlink(missing_ok=True)
         write_json_atomic(
             paths.scan_json,
@@ -540,11 +722,27 @@ class ScanService:
             if profile is ScanProfile.FULL:
                 traffic_started_at = time.perf_counter()
                 try:
-                    traffic.start(
-                        record.session_id,
-                        launch_app=False,
-                        canary=assessment_canary,
-                    )
+                    traffic_kwargs: dict[str, Any] = {
+                        "launch_app": False,
+                        "canary": assessment_canary,
+                    }
+                    if scenario_request is not None:
+                        traffic_kwargs.update(
+                            {
+                                "retain_raw_flows": False,
+                                "owned_value_fingerprints": (
+                                    scenario_plan.owned_values
+                                    if scenario_plan is not None
+                                    else None
+                                ),
+                                "upstream_mapping": (
+                                    scenario_plan.upstream_mapping
+                                    if scenario_plan is not None
+                                    else None
+                                ),
+                            }
+                        )
+                    traffic.start(record.session_id, **traffic_kwargs)
                     traffic_started = True
                     steps["traffic_capture"] = "running"
                 except (AndroidAssessorError, OSError, ValueError) as exc:
@@ -716,6 +914,50 @@ class ScanService:
                             f"Autonomous exploration failed: {redact_text(str(exc))[:300]}"
                         )
                     timed("exploration", exploration_started)
+                elif scenario_service is not None and scenario_plan is not None:
+                    scenario_started = time.perf_counter()
+                    try:
+                        scenario_scope = load_scope(self.paths)
+                        scenario_result = scenario_service.run(
+                            record.session_id,
+                            plan=scenario_plan,
+                            adb=AdbExplorerBackend(
+                                adb,
+                                serial=record.serial,
+                                package=record.package,
+                                session_id=record.session_id,
+                                per_action_timeout=min(10, self.DEFAULT_RUNTIME_SECONDS),
+                            ),
+                            scope=scenario_scope,
+                            network_guard_active=traffic_started,
+                            available_observers=tuple(
+                                observer
+                                for observer, active in (
+                                    ("frida", frida_started),
+                                    ("traffic", traffic_started),
+                                    ("logcat", True),
+                                    ("private_storage", profile is ScanProfile.FULL),
+                                )
+                                if active
+                            ),
+                        )
+                        steps["deterministic_scenario"] = scenario_result.outcome.value
+                        runtime_termination = "scenario_" + scenario_result.outcome.value
+                        if scenario_result.outcome.value != "completed":
+                            limitations.append(
+                                "Deterministic scenario did not complete: "
+                                + scenario_result.outcome.value
+                            )
+                    except (AndroidAssessorError, OSError, ValueError) as exc:
+                        steps["deterministic_scenario"] = "error"
+                        runtime_termination = "scenario_error"
+                        limitations.append(
+                            f"Deterministic scenario failed: {redact_text(str(exc))[:300]}"
+                        )
+                    timed("scenario", scenario_started)
+                elif scenario_service is not None:
+                    steps["deterministic_scenario"] = "failed_precondition"
+                    runtime_termination = "scenario_failed_precondition"
                 else:
                     deadline = time.monotonic() + wait_seconds
                     while time.monotonic() < deadline:
@@ -823,6 +1065,39 @@ class ScanService:
             limitations.append(f"Target logcat skipped: {redact_text(str(exc))[:300]}")
         timed("logcat", logcat_started)
 
+        if (
+            scenario_result is not None
+            and scenario_plan is not None
+            and scenario_service is not None
+        ):
+            correlation_started = time.perf_counter()
+            try:
+                scenario_correlation = self._finalize_scenario_correlation(
+                    record,
+                    scenario_result=scenario_result,
+                    scenario_plan=scenario_plan,
+                    scenario_service=scenario_service,
+                )
+            except (AndroidAssessorError, OSError, ValueError) as exc:
+                limitations.append(
+                    "Scenario evidence correlation failed: "
+                    f"{redact_text(str(exc))[:300]}"
+                )
+            timed("scenario_correlation", correlation_started)
+
+        scenario_metadata = {
+            "scenario_id": (
+                scenario_result.scenario_id if scenario_result is not None else None
+            ),
+            "scenario_correlation_path": (
+                "redacted/scenario/"
+                + scenario_result.scenario_id
+                + "/correlation.json"
+                if scenario_correlation is not None and scenario_result is not None
+                else None
+            ),
+        }
+
         # Persist the execution outcome before rule evaluation so capability-
         # dependent rules can distinguish an unavailable module from a failed
         # planned execution. The final scan artifact is still written below.
@@ -846,6 +1121,7 @@ class ScanService:
                 "controlled_canary_executed": controlled_canary_executed,
                 "phase_timings": phase_timings,
                 "runtime_termination": runtime_termination,
+                **scenario_metadata,
             },
             root=self.paths.root,
         )
@@ -880,6 +1156,7 @@ class ScanService:
                 "autonomous_exploration": (
                     exploration_result.to_dict() if exploration_result is not None else None
                 ),
+                **scenario_metadata,
             },
             root=self.paths.root,
         )
@@ -916,6 +1193,7 @@ class ScanService:
                     "autonomous_exploration": (
                         exploration_result.to_dict() if exploration_result is not None else None
                     ),
+                    **scenario_metadata,
                 },
                 root=self.paths.root,
             )

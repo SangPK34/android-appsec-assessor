@@ -37,7 +37,8 @@ _ACTIVITY_PATTERNS = (
     re.compile(r"topResumedActivity=.*?\s([A-Za-z0-9_.]+)/(\.?[A-Za-z0-9_.$]+)"),
 )
 _VOLATILE_PATTERN = re.compile(r"(?:ASL|THESIS)_\S+|\b\d{2,}\b", re.IGNORECASE)
-_SAFE_TEXT_PATTERN = re.compile(r"^[A-Za-z0-9@._:/-]{1,160}$")
+_SAFE_TEXT_PATTERN = re.compile(r"^[A-Za-z0-9@._:/+\-=$%,!#^~?]{1,160}$")
+_SHELL_EXPANSION_PATTERN = re.compile(r"\$(?:[A-Za-z_{(])")
 _DANGEROUS_LABELS = (
     "delete",
     "remove",
@@ -918,7 +919,7 @@ class AdbExplorerBackend:
             self._shell(("input", "tap", str(x), str(y)), "clicking UI control")
 
     def input_text(self, x: int, y: int, value: str) -> None:
-        if not _SAFE_TEXT_PATTERN.fullmatch(value):
+        if not _SAFE_TEXT_PATTERN.fullmatch(value) or _SHELL_EXPANSION_PATTERN.search(value):
             raise AdbError("Generated explorer input contains unsupported characters.")
         with self.logical_operation(self.timeout):
             self.tap(x, y)

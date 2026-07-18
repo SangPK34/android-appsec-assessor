@@ -47,6 +47,9 @@ logcat/
 config/scope.yaml
 config/secrets.yaml
 config/credentials.yaml
+benchmarks/**/profile.local.yaml
+benchmarks/**/variables.local.yaml
+benchmarks/**/secrets.local.yaml
 Thumbs.db
 Desktop.ini
 !runtime/downloads/.gitkeep

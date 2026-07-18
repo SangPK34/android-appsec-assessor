@@ -1,0 +1,33 @@
+schema_version: 1
+profile_id: insecurebankv2-login
+package: com.android.insecurebankv2
+launch_activity: com.android.insecurebankv2.LoginActivity
+
+selectors:
+  username:
+    resource_id: com.android.insecurebankv2:id/loginscreen_username
+  password:
+    resource_id: com.android.insecurebankv2:id/loginscreen_password
+  submit:
+    resource_id: com.android.insecurebankv2:id/login_button
+  post_login:
+    class_name: android.widget.TextView
+    index: 0
+
+values:
+  username:
+    secret_ref: benchmark.login.username
+  password:
+    secret_ref: benchmark.login.password
+
+transitions:
+  authenticated:
+    activity: com.android.insecurebankv2.PostLogin
+
+local_backend_url: http://10.0.2.2:8888
+upstream_backend_url: http://127.0.0.1:8888
+expected_vulnerability_classes:
+  - sensitive_logging
+  - cleartext_transport
+  - sensitive_local_storage
+  - weak_cryptography

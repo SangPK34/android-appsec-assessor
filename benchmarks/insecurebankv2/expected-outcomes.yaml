@@ -1,0 +1,20 @@
+schema_version: 1
+benchmark_id: insecurebankv2-login
+scenario_id: login
+classes:
+  - class: sensitive_logging
+    expected_outcome: evidence_dependent
+    activation_step: submit
+    confirmation_requirement: exact owned fixture value in package-attributed log within completed scenario window
+  - class: cleartext_transport
+    expected_outcome: evidence_dependent
+    activation_step: submit
+    confirmation_requirement: scoped local HTTP request with exact owned fixture fingerprint
+  - class: sensitive_local_storage
+    expected_outcome: evidence_dependent
+    activation_step: submit
+    confirmation_requirement: completed write plus package-owned plaintext post-write delta
+  - class: weak_cryptography
+    expected_outcome: evidence_dependent
+    activation_step: submit
+    confirmation_requirement: completed package-attributed crypto event in submit/transition window

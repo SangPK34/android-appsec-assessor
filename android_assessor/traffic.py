@@ -8,6 +8,7 @@ import re
 import socket
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,7 +54,7 @@ class TrafficCaptureState:
     reverse_created: bool
     proxy_changed: bool
     cleanup_action_ids: dict[str, str]
-    flow_path: str
+    flow_path: str | None
     events_path: str
     ca_path: str
     evidence_registered: bool = False
@@ -62,6 +63,7 @@ class TrafficCaptureState:
     flow_count: int = 0
     attributed_flow_count: int = 0
     usable_evidence_count: int = 0
+    retained_raw_flows: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -90,7 +92,8 @@ def summarize_traffic_events(
     attributed = sum(
         1
         for item in requests
-        if str(item.get("attribution", "")) in {"target", "validation_canary"}
+        if str(item.get("attribution", ""))
+        in {"target", "validation_canary", "scenario_owned_value"}
     )
     result = "completed" if requests or usable_evidence_count else "completed_no_data"
     return len(requests), attributed, result
@@ -177,6 +180,8 @@ class TrafficCaptureService:
         ProcessIdentity.from_dict(state.process_identity)
         session_root = self.repository.paths_for(session_id).root
         for relative in (state.flow_path, state.events_path, state.ca_path):
+            if relative is None:
+                continue
             if not isinstance(relative, str) or Path(relative).is_absolute():
                 raise SessionError("Traffic state path must be session-relative.")
             require_under_root(session_root / relative, session_root)
@@ -188,6 +193,9 @@ class TrafficCaptureService:
         *,
         launch_app: bool = True,
         canary: str | None = None,
+        retain_raw_flows: bool = True,
+        owned_value_fingerprints: Mapping[str, str] | None = None,
+        upstream_mapping: Mapping[str, str] | None = None,
     ) -> TrafficCaptureState:
         record = self.repository.load(session_id)
         scope = load_scope(self.paths)
@@ -217,6 +225,18 @@ class TrafficCaptureService:
             r"THESIS_CANARY_\d{8}T\d{6}Z_[a-f0-9]{12}", canary
         ):
             raise ProxyError("Controlled-validation canary has an invalid format.")
+        owned_values = dict(owned_value_fingerprints or {})
+        for fingerprint, value in owned_values.items():
+            if not re.fullmatch(r"(?:hmac-sha256:)?[a-f0-9]{64}", fingerprint):
+                raise ProxyError("Owned-value fingerprint has an invalid format.")
+            if not isinstance(value, str) or not 1 <= len(value) <= 4096:
+                raise ProxyError("Owned scenario value has an invalid size.")
+        upstream_values = dict(upstream_mapping or {})
+        for source, target in upstream_values.items():
+            if not re.fullmatch(r"[A-Za-z0-9.:-]{3,255}", source) or not re.fullmatch(
+                r"(?:127\.0\.0\.1|localhost):[0-9]{1,5}", target
+            ):
+                raise ProxyError("Scenario upstream mapping is invalid.")
         paths = self.repository.paths_for(record.session_id)
         port = self._free_port()
         endpoint = f"tcp:{port}"
@@ -224,7 +244,7 @@ class TrafficCaptureService:
         redacted_traffic = paths.redacted_dir / "traffic"
         raw_traffic.mkdir(parents=True, exist_ok=True)
         redacted_traffic.mkdir(parents=True, exist_ok=True)
-        flow_path = raw_traffic / "capture.mitm"
+        flow_path = raw_traffic / "capture.mitm" if retain_raw_flows else None
         events_path = redacted_traffic / "events.jsonl"
         stdout_path = raw_traffic / "mitmdump.stdout.log"
         stderr_path = raw_traffic / "mitmdump.stderr.log"
@@ -245,8 +265,6 @@ class TrafficCaptureService:
             "connection_strategy=lazy",
             "--set",
             f"confdir={confdir}",
-            "-w",
-            str(flow_path),
             "-s",
             str(addon),
             "--set",
@@ -254,8 +272,34 @@ class TrafficCaptureService:
             "--set",
             "android_assessor_allowed_hosts=" + ",".join(sorted(scope.api_hosts)),
         ]
+        if flow_path is not None:
+            script_index = command.index("-s")
+            command[script_index:script_index] = ["-w", str(flow_path)]
+        process_env = os.environ.copy()
+        for name in (
+            "ANDROID_ASSESSOR_CANARY",
+            "ANDROID_ASSESSOR_OWNED_VALUES",
+            "ANDROID_ASSESSOR_ALLOWED_HOSTS",
+            "ANDROID_ASSESSOR_UPSTREAM_MAP",
+        ):
+            process_env.pop(name, None)
         if canary is not None:
-            command.extend(("--set", f"android_assessor_canary={canary}"))
+            process_env["ANDROID_ASSESSOR_CANARY"] = canary
+        if owned_values:
+            process_env["ANDROID_ASSESSOR_OWNED_VALUES"] = json.dumps(
+                owned_values,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+        process_env["ANDROID_ASSESSOR_ALLOWED_HOSTS"] = ",".join(
+            sorted(scope.api_hosts)
+        )
+        if upstream_values:
+            process_env["ANDROID_ASSESSOR_UPSTREAM_MAP"] = json.dumps(
+                upstream_values,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
         creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         process: subprocess.Popen[bytes] | None = None
         identity: ProcessIdentity | None = None
@@ -297,6 +341,7 @@ class TrafficCaptureService:
                         stdout=stdout_handle,
                         stderr=stderr_handle,
                         shell=False,
+                        env=process_env,
                         creationflags=creation_flags,
                         close_fds=True,
                     )
@@ -350,10 +395,15 @@ class TrafficCaptureService:
                     reverse_created=reverse_created,
                     proxy_changed=proxy_changed,
                     cleanup_action_ids=cleanup_ids,
-                    flow_path=flow_path.relative_to(paths.root).as_posix(),
+                    flow_path=(
+                        flow_path.relative_to(paths.root).as_posix()
+                        if flow_path is not None
+                        else None
+                    ),
                     events_path=events_path.relative_to(paths.root).as_posix(),
                     ca_path=(confdir / "mitmproxy-ca-cert.cer").relative_to(paths.root).as_posix(),
                     result="running",
+                    retained_raw_flows=retain_raw_flows,
                 )
                 write_json_atomic(
                     self._state_path(record.session_id),
@@ -551,7 +601,7 @@ class TrafficCaptureService:
                                 ),
                                 root=self.paths.root,
                             )
-                    for relative, evidence_type, description, sensitive, redacted in (
+                    evidence_candidates = (
                         (
                             state.flow_path,
                             "traffic_flow",
@@ -594,7 +644,11 @@ class TrafficCaptureService:
                             True,
                             True,
                         ),
+                    )
+                    for relative, evidence_type, description, sensitive, redacted in (
+                        item for item in evidence_candidates if item[0] is not None
                     ):
+                        assert isinstance(relative, str)
                         target = paths.root / relative
                         if target.is_file() and target.stat().st_size > 0:
                             self.evidence.register_file(

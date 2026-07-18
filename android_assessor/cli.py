@@ -25,6 +25,7 @@ from .services.app_inspection_service import AppInspectionResult, AppInspectionS
 from .services.cleanup_service import CleanupService
 from .services.device_service import DeviceInspection, DeviceService
 from .services.scan_service import ScanProfile, ScanResult, ScanService
+from .services.scenario_service import ScenarioRequest
 from .services.session_service import SessionService
 from .services.validation_service import ValidationService
 from .session import SessionRepository
@@ -97,6 +98,21 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--max-states", type=int, default=40)
     scan.add_argument("--plateau-seconds", type=int, default=8)
     scan.add_argument("--seed", type=int, default=1337)
+    scan.add_argument(
+        "--scenario-profile",
+        type=Path,
+        help="Tracked generic scenario profile used for deterministic activation.",
+    )
+    scan.add_argument(
+        "--scenario",
+        type=Path,
+        help="Tracked scenario definition used for deterministic activation.",
+    )
+    scan.add_argument(
+        "--scenario-vars",
+        type=Path,
+        help="Ignored local YAML overlay containing fixture-owned scenario values.",
+    )
     scan.add_argument(
         "--controlled-canary",
         action="store_true",
@@ -309,12 +325,36 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
     if bool(args.package) == bool(args.session_id):
         raise AndroidAssessorError("Provide exactly one of --package or --session.")
     service = ScanService(context)
+    if bool(args.scenario_profile) != bool(args.scenario):
+        raise AndroidAssessorError(
+            "Use --scenario-profile and --scenario together for deterministic activation."
+        )
+    scenario_request = None
+    if args.scenario_profile is not None:
+        if args.profile != ScanProfile.FULL.value:
+            raise AndroidAssessorError("Deterministic scenarios require a Full Assessment.")
+        if args.autonomous is True:
+            raise AndroidAssessorError(
+                "Deterministic scenarios and autonomous exploration are mutually exclusive."
+            )
+        scenario_request = ScenarioRequest(
+            profile_path=context.paths.from_config(str(args.scenario_profile))
+            or args.scenario_profile,
+            scenario_path=context.paths.from_config(str(args.scenario)) or args.scenario,
+            variables_path=(
+                context.paths.from_config(str(args.scenario_vars))
+                if args.scenario_vars is not None
+                else None
+            ),
+        )
     if args.runtime_seconds is not None and args.max_runtime is not None:
         raise AndroidAssessorError("Use only one of --runtime-seconds or --max-runtime.")
     max_runtime = args.max_runtime if args.max_runtime is not None else args.runtime_seconds
     if max_runtime == 0 and args.autonomous is True:
         raise AndroidAssessorError("--autonomous requires a runtime greater than zero.")
     autonomous = False if max_runtime == 0 and args.autonomous is None else args.autonomous
+    if scenario_request is not None:
+        autonomous = False
     if args.controlled_canary and (
         args.profile != ScanProfile.FULL.value
         or autonomous is False
@@ -348,6 +388,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
             autonomous=autonomous,
             explorer_config=explorer_config,
             controlled_canary=args.controlled_canary,
+            scenario_request=scenario_request,
         )
     else:
         result = service.scan(
@@ -358,6 +399,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
             autonomous=autonomous,
             explorer_config=explorer_config,
             controlled_canary=args.controlled_canary,
+            scenario_request=scenario_request,
         )
     payload = result.to_dict()
     _write_output(payload, args.output, context.paths)
