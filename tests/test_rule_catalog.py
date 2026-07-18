@@ -68,9 +68,20 @@ def test_machine_readable_coverage_registry_has_complete_unique_rows() -> None:
         "controlled_validation_available",
         "default_profile",
         "implementation_status",
+        "detection_mode",
+        "activation_required",
+        "manual_interaction_required",
+        "auto_confirm_possible",
+        "runtime_sources",
     }
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
+    assert set(payload["detection_modes"]) == {
+        "static",
+        "autonomous_runtime",
+        "controlled_validation",
+        "guided",
+    }
     assert set(payload["id_kinds"]) == {
         "production_rule",
         "analyzer_result",
@@ -86,6 +97,10 @@ def test_machine_readable_coverage_registry_has_complete_unique_rows() -> None:
     )
     assert all(row["default_profile"] in {"quick", "full"} for row in rows)
     assert all(row["id_kind"] in payload["id_kinds"] for row in rows)
+    assert all(row["detection_mode"] in payload["detection_modes"] for row in rows)
+    assert all(isinstance(row["manual_interaction_required"], bool) for row in rows)
+    assert all(isinstance(row["auto_confirm_possible"], bool) for row in rows)
+    assert all(isinstance(row["runtime_sources"], list) for row in rows)
 
 
 def test_coverage_registry_id_kinds_do_not_overstate_finding_support() -> None:
@@ -172,6 +187,35 @@ def test_partial_coverage_claims_match_current_production_boundaries() -> None:
     assert by_id["ASL-RUNTIME-LOGGING"]["frida_required"] is True
 
 
+def test_phase2_registry_does_not_overstate_static_or_auto_confirm_support() -> None:
+    registry_path = Path(__file__).parents[1] / "rules" / "coverage.yaml"
+    rows = yaml.safe_load(registry_path.read_text(encoding="utf-8"))["rules"]
+    by_id = {row["rule_id"]: row for row in rows}
+
+    for rule_id in {
+        "WEBVIEW-JS-BRIDGE-REMOTE",
+        "WEBVIEW-UNSAFE-SETTINGS",
+        "ASL-MVP-005",
+        "CRYPTO-ECB",
+        "CRYPTO-WEAK-ALGORITHM",
+        "CRYPTO-SHORT-KEY",
+        "CRYPTO-ZERO-IV",
+        "CRYPTO-REUSED-IV",
+        "CRYPTO-WEAK-DIGEST",
+        "CRYPTO-LOW-PBE-ITERATIONS",
+    }:
+        assert by_id[rule_id]["static_support"] is False
+    for rule_id in {
+        "WEBVIEW-JS-BRIDGE-REMOTE",
+        "WEBVIEW-UNSAFE-SETTINGS",
+        "CRYPTO-WEAK-DIGEST",
+        "CRYPTO-LOW-PBE-ITERATIONS",
+    }:
+        assert by_id[rule_id]["auto_confirm_possible"] is False
+    assert by_id["ASL-INVENTORY-SECURITY-API"]["static_support"] is True
+    assert by_id["ASL-INVENTORY-PENDING-INTENT"]["default_profile"] == "quick"
+
+
 def test_inventory_and_unsupported_registry_rows_do_not_claim_findings() -> None:
     registry_path = Path(__file__).parents[1] / "rules" / "coverage.yaml"
     rows = yaml.safe_load(registry_path.read_text(encoding="utf-8"))["rules"]
@@ -186,6 +230,10 @@ def test_inventory_and_unsupported_registry_rows_do_not_claim_findings() -> None
     assert by_id["ASL-PLANNED-PATH-TRAVERSAL"]["implementation_status"] == (
         "not_supported"
     )
+    assert by_id["ASL-INVENTORY-PENDING-INTENT"]["implementation_status"] == (
+        "observable_only"
+    )
+    assert by_id["ASL-INVENTORY-PENDING-INTENT"]["id_kind"] == "inventory_only"
 
 
 def test_coverage_registry_matches_production_rule_and_validation_catalog() -> None:
@@ -197,6 +245,7 @@ def test_coverage_registry_matches_production_rule_and_validation_catalog() -> N
         (root / "rules" / "mvp.yaml").read_text(encoding="utf-8")
     )["rules"]
     coverage_by_id = {row["rule_id"]: row for row in coverage}
+    production_by_id = {row["id"]: row for row in production}
     production_ids = {row["id"] for row in production}
 
     assert production_ids <= coverage_by_id.keys()
@@ -204,6 +253,12 @@ def test_coverage_registry_matches_production_rule_and_validation_catalog() -> N
         row["rule_id"] for row in coverage if row["id_kind"] == "production_rule"
     } == production_ids
     for rule in production:
+        assert coverage_by_id[rule["id"]]["root_required"] is bool(
+            rule.get("root_required", False)
+        )
+        assert coverage_by_id[rule["id"]]["frida_required"] is bool(
+            rule.get("frida_required", False)
+        )
         expected = rule.get("validation_type", "none") in {
             "natural_validation",
             "adb_assisted_validation",
@@ -212,3 +267,10 @@ def test_coverage_registry_matches_production_rule_and_validation_catalog() -> N
             coverage_by_id[rule["id"]]["controlled_validation_available"]
             is expected
         )
+    assert production_by_id["STORAGE-SENSITIVE-CANARY"]["validation_type"] == (
+        "evidence_correlation"
+    )
+    assert production_by_id["WEBVIEW-SSL-ERROR-PROCEED"]["frida_required"] is False
+    assert production_by_id["WEBVIEW-SSL-ERROR-PROCEED"]["validation_type"] == (
+        "evidence_correlation"
+    )

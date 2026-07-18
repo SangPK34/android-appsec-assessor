@@ -11,6 +11,7 @@ import pytest
 from android_assessor.frida_controller import FridaController
 from android_assessor.frida_events import (
     CANARY_PLACEHOLDER,
+    OBSERVER_VERSION,
     PACKAGE_PLACEHOLDER,
     SESSION_PLACEHOLDER,
     FridaHandshakeStatus,
@@ -80,6 +81,7 @@ def test_frida_parser_accepts_cli_prefix_and_nested_payload() -> None:
         ("thread_id", -1, "non-negative"),
         ("canary_match", "yes", "boolean"),
         ("observer_version", "latest", "observer_version"),
+        ("observer_version", "0.7.0", "incompatible"),
     ),
 )
 def test_frida_parser_rejects_wrong_attribution_or_schema(
@@ -100,7 +102,30 @@ def test_frida_parser_rejects_wrong_attribution_or_schema(
 
     assert result.events == ()
     assert message in result.errors[0]
-    assert result.handshake_status is FridaHandshakeStatus.MISSING
+
+
+def test_frida_parser_redacts_nested_values_under_sensitive_parent_keys() -> None:
+    event = json.loads(fixture_events().splitlines()[2])
+    event["arguments_redacted"] = [
+        {"password": {"pin": 123456}},
+        {"client_secret": {"bytes": [65, 66]}},
+        {"key_sha256": "a" * 64},
+    ]
+
+    result = parse_frida_jsonl(
+        json.dumps(event),
+        expected_session_id=SESSION_ID,
+        expected_package=PACKAGE,
+        source="fixture",
+        environment="simulated",
+    )
+
+    assert result.errors == ()
+    arguments = result.events[0].arguments_redacted
+    assert arguments[0]["password"] == "<redacted>"
+    assert arguments[1]["client_secret"] == "<redacted>"
+    assert arguments[2]["key_sha256"] == "a" * 64
+    assert result.handshake_status is FridaHandshakeStatus.VALID
 
 
 def test_frida_parser_reports_missing_json_and_oversized_lines() -> None:
@@ -207,7 +232,8 @@ def test_observer_hook_staging_without_canary_disables_matching(tmp_path: Path) 
 
     source = destination.read_text(encoding="utf-8")
     assert "const OBSERVER_CANARY = '';" in source
-    assert "OBSERVER_CANARY.length > 0" in source
+    assert "OBSERVER_CANARY.length === 0" in source
+    assert "containsExactCanaryText" in source
     assert "CANARY_PREFIX" not in source
 
 
@@ -223,6 +249,60 @@ def test_observer_hook_has_no_hardcoded_target_and_compiles() -> None:
     compiled = frida.Compiler().build(str(hook), project_root=str(hook.parent.parent))
     assert isinstance(compiled, str)
     assert compiled
+
+
+def test_observer_hook_uses_conservative_webview_and_sink_correlation() -> None:
+    hook = Path(__file__).resolve().parent.parent / "hooks" / "basic_observer.js"
+    source = hook.read_text(encoding="utf-8")
+
+    assert "args[0] === 0 ? 'always_allow'" in source
+    assert "args[0] === 1 ? 'never_allow'" in source
+    assert "webview.javascript_interface_removed" in source
+    assert "knownJavaText(value)" in source
+    assert "java.lang.String" in source
+    assert "System.identityHashCode(value)" in source
+    assert ".hashCode()" not in source
+    assert "containsCanaryByteRange(args[0], Number(args[1]), Number(args[2]))" in source
+    assert "MAX_TRACKED_OBJECTS = 512" in source
+    assert "delete fileStreams[objectId(this, 'file-stream')]" in source
+    assert "bundleContainsCanary" in source
+    assert "sensitive.content_provider_" in source
+    assert "sensitive.intent_" in source
+    assert "sensitive.notification." in source
+    assert "weakRandomOutputs[state.iv_sha256]" in source
+    assert "weakRandomOutputs[state.key_sha256]" in source
+    assert "instrumentTrustManager" in source
+    assert "instrumentHostnameVerifier" in source
+    assert "tls.check_server_trusted" in source
+    assert "tls.hostname_verify" in source
+    assert "instrumentWebViewClient(args[0])" in source
+    assert "webview.ssl_error_callback.dynamic" in source
+    assert "webViewClientInstrumentedClasses" in source
+    assert "package_scoped: packageScoped" in source
+    assert "userRoot[0] + TARGET_PACKAGE" in source
+
+
+def test_observer_bounds_random_fingerprints_and_retries_tls_instrumentation() -> None:
+    hook = Path(__file__).resolve().parent.parent / "hooks" / "basic_observer.js"
+    source = hook.read_text(encoding="utf-8")
+
+    assert "MAX_RANDOM_FINGERPRINT_BYTES = 65536" in source
+    assert "outputLength <= MAX_RANDOM_FINGERPRINT_BYTES" in source
+    assert "output_sha256: digest" in source
+    assert "fingerprint_status: fingerprintStatus" in source
+    assert "'size_limit'" in source
+
+    assert source.count(
+        "boundedPut(tlsInstrumentedClasses, instrumentationId, 'installing')"
+    ) == 2
+    assert source.count(
+        "tlsInstrumentedClasses[instrumentationId] = 'installed'"
+    ) == 2
+    assert source.count("delete tlsInstrumentedClasses[instrumentationId]") == 2
+    assert "className !== 'unknown'" in source
+    assert "className === 'unknown'" in source
+    assert "com.android.okhttp.internal.tls.okhostnameverifier" in source
+    assert "com.squareup.okhttp.internal.tls.okhostnameverifier" in source
 
 
 def test_observer_hook_rejects_non_session_canary(tmp_path: Path) -> None:
@@ -260,7 +340,7 @@ def loading_event(*, pid: int = 4242, package: str = PACKAGE) -> str:
             "arguments_redacted": [],
             "return_value_redacted": None,
             "canary_match": False,
-            "observer_version": "0.5.1",
+            "observer_version": OBSERVER_VERSION,
         }
     )
 

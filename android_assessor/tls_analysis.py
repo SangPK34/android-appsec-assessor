@@ -9,12 +9,62 @@ from typing import Any
 
 from .findings import FindingStatus
 
+_TLS_CLASS_KEYS = (
+    "class_name",
+    "implementation_class",
+    "implementation_class_name",
+    "trust_manager_class",
+    "verifier_class",
+    "hostname_verifier_class",
+)
+_PLATFORM_TLS_CLASS_PREFIXES = (
+    "javax.net.ssl.",
+    "com.android.org.conscrypt.",
+    "org.conscrypt.",
+    "sun.security.ssl.",
+)
+_PLATFORM_HOSTNAME_VERIFIERS = frozenset(
+    {
+        "com.android.okhttp.internal.tls.okhostnameverifier",
+        "com.squareup.okhttp.internal.tls.okhostnameverifier",
+        "okhttp3.internal.tls.okhostnameverifier",
+    }
+)
+_UNKNOWN_TLS_CLASSES = frozenset({"", "unknown", "<unknown>", "object"})
+
+
+def _metadata_marks_custom(
+    metadata: Mapping[str, Any],
+    marker: str,
+) -> bool:
+    """Honor custom markers only when available class provenance supports them."""
+    if metadata.get(marker) is not True:
+        return False
+    class_name = next(
+        (
+            str(metadata[key]).strip().casefold()
+            for key in _TLS_CLASS_KEYS
+            if isinstance(metadata.get(key), str)
+        ),
+        None,
+    )
+    # Existing observers may expose only a class hash. Preserve those explicit
+    # markers while treating an explicit unknown/platform class conservatively.
+    if class_name is None:
+        return True
+    if class_name in _UNKNOWN_TLS_CLASSES:
+        return False
+    if class_name.startswith(_PLATFORM_TLS_CLASS_PREFIXES):
+        return False
+    return class_name not in _PLATFORM_HOSTNAME_VERIFIERS
+
 
 class TlsBehaviorState(StrEnum):
     MITM_ACCEPTED = "MITM_ACCEPTED"
     MITM_REJECTED = "MITM_REJECTED"
     PINNING_OBSERVED = "PINNING_OBSERVED"
     TRUST_MANAGER_OBSERVED = "TRUST_MANAGER_OBSERVED"
+    CUSTOM_TRUST_CONFIGURED = "CUSTOM_TRUST_CONFIGURED"
     NO_TRAFFIC = "NO_TRAFFIC"
     NETWORK_ERROR = "NETWORK_ERROR"
     UNATTRIBUTED_TRAFFIC = "UNATTRIBUTED_TRAFFIC"
@@ -30,7 +80,14 @@ class TlsEvidence:
     explicit_certificate_rejection: bool = False
     pinning_observed: bool = False
     trust_manager_observed: bool = False
+    custom_trust_manager_observed: bool = False
+    custom_hostname_verifier_observed: bool = False
+    webview_ssl_proceed_observed: bool = False
     network_error_observed: bool = False
+    trust_manager_accept_observed: bool = False
+    trust_manager_reject_observed: bool = False
+    hostname_verifier_accept_observed: bool = False
+    hostname_verifier_reject_observed: bool = False
     source: str = "unknown"
     environment: str = "unknown"
 
@@ -77,11 +134,6 @@ class TlsBehaviorAnalyzer:
             status = FindingStatus.CONFIRMED
             confidence = "high"
             rationale = "A uniquely attributed validation canary completed through MITM."
-        elif evidence.canary_request_count > 0 and evidence.pinning_observed:
-            state = TlsBehaviorState.PINNING_OBSERVED
-            status = FindingStatus.PASS
-            confidence = "medium"
-            rationale = "Pinning behavior was observed for a target canary attempt."
         elif (
             evidence.canary_request_count > 0
             and evidence.explicit_certificate_rejection
@@ -90,6 +142,45 @@ class TlsBehaviorAnalyzer:
             status = FindingStatus.PASS
             confidence = "high"
             rationale = "An explicit certificate rejection followed a target canary attempt."
+        elif evidence.canary_request_count > 0 and evidence.pinning_observed:
+            state = TlsBehaviorState.PINNING_OBSERVED
+            status = FindingStatus.INCONCLUSIVE
+            confidence = "medium"
+            rationale = (
+                "A certificate-pinning method ran for the target attempt, but no "
+                "explicit accept or reject outcome was attributed."
+            )
+        elif (
+            evidence.custom_trust_manager_observed
+            or evidence.custom_hostname_verifier_observed
+        ):
+            state = TlsBehaviorState.CUSTOM_TRUST_CONFIGURED
+            accepted = (
+                evidence.trust_manager_accept_observed
+                or evidence.hostname_verifier_accept_observed
+            )
+            rejected = (
+                evidence.trust_manager_reject_observed
+                or evidence.hostname_verifier_reject_observed
+            )
+            status = (
+                FindingStatus.POTENTIAL
+                if accepted or not rejected
+                else FindingStatus.INCONCLUSIVE
+            )
+            confidence = "medium"
+            rationale = (
+                "A custom trust component accepted a runtime verification call, but no "
+                "controlled invalid certificate or hostname was attributed."
+                if accepted
+                else (
+                    "The observed custom trust component rejected its runtime verification "
+                    "call; permissive certificate or hostname behavior was not shown."
+                    if rejected
+                    else "A custom trust component was installed at runtime, but permissive "
+                    "certificate or hostname behavior was not deterministically proven."
+                )
+            )
         elif evidence.target_request_count == 0 and evidence.unattributed_request_count > 0:
             state = TlsBehaviorState.UNATTRIBUTED_TRAFFIC
             status = FindingStatus.INCONCLUSIVE
@@ -194,8 +285,72 @@ class TlsBehaviorAnalyzer:
             for item in frida
         )
         trust_manager = any(
+            item.get("method") in {
+                "tls.check_server_trusted",
+                "tls.trust_manager_observed",
+            }
+            or item.get("event") == "trust_manager_observed"
+            for item in frida
+        )
+        metadata = [
+            argument
+            for item in frida
+            for argument in item.get("arguments_redacted", [])
+            if isinstance(argument, Mapping)
+        ]
+        custom_trust_manager = any(
+            _metadata_marks_custom(item, "custom_trust_manager") for item in metadata
+        )
+        custom_hostname_verifier = any(
+            _metadata_marks_custom(item, "custom_hostname_verifier") for item in metadata
+        )
+        webview_ssl_proceed = any(
+            item.get("category") == "webview"
+            and item.get("method") == "webview.ssl_error_proceed"
+            for item in frida
+        )
+        trust_manager_accept = any(
             item.get("category") == "tls"
-            or item.get("event") in {"ssl_context_init", "trust_manager_observed"}
+            and item.get("method") == "tls.check_server_trusted"
+            and any(
+                isinstance(argument, Mapping)
+                and argument.get("decision") == "returned"
+                and _metadata_marks_custom(argument, "custom_trust_manager")
+                for argument in item.get("arguments_redacted", [])
+            )
+            for item in frida
+        )
+        trust_manager_reject = any(
+            item.get("category") == "tls"
+            and item.get("method") == "tls.check_server_trusted"
+            and any(
+                isinstance(argument, Mapping)
+                and argument.get("decision") == "threw"
+                and _metadata_marks_custom(argument, "custom_trust_manager")
+                for argument in item.get("arguments_redacted", [])
+            )
+            for item in frida
+        )
+        hostname_verifier_accept = any(
+            item.get("category") == "tls"
+            and item.get("method") == "tls.hostname_verify"
+            and any(
+                isinstance(argument, Mapping)
+                and argument.get("decision") == "accepted"
+                and _metadata_marks_custom(argument, "custom_hostname_verifier")
+                for argument in item.get("arguments_redacted", [])
+            )
+            for item in frida
+        )
+        hostname_verifier_reject = any(
+            item.get("category") == "tls"
+            and item.get("method") == "tls.hostname_verify"
+            and any(
+                isinstance(argument, Mapping)
+                and argument.get("decision") == "rejected"
+                and _metadata_marks_custom(argument, "custom_hostname_verifier")
+                for argument in item.get("arguments_redacted", [])
+            )
             for item in frida
         )
         return TlsBehaviorAnalyzer.analyze(
@@ -207,7 +362,14 @@ class TlsBehaviorAnalyzer:
                 explicit_certificate_rejection=certificate_rejection,
                 pinning_observed=pinning,
                 trust_manager_observed=trust_manager,
+                custom_trust_manager_observed=custom_trust_manager,
+                custom_hostname_verifier_observed=custom_hostname_verifier,
+                webview_ssl_proceed_observed=webview_ssl_proceed,
                 network_error_observed=network_error,
+                trust_manager_accept_observed=trust_manager_accept,
+                trust_manager_reject_observed=trust_manager_reject,
+                hostname_verifier_accept_observed=hostname_verifier_accept,
+                hostname_verifier_reject_observed=hostname_verifier_reject,
                 source=source,
                 environment=environment,
             )

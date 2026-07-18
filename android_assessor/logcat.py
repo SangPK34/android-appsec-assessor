@@ -21,6 +21,16 @@ _SENSITIVE_LOG_PATTERN = re.compile(
 _THREADTIME_LINE_PATTERN = re.compile(
     r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+(\d+)\s+\d+\s+[A-Z]\s"
 )
+_SESSION_CANARY = re.compile(r"THESIS_CANARY_\d{8}T\d{6}Z_[a-f0-9]{12}")
+
+
+def _contains_exact_canary(value: str, canary: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(canary)}(?![A-Za-z0-9_])",
+            value,
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +83,8 @@ class LogcatCollector:
         return "\n".join(selected) + ("\n" if selected else "")
 
     def collect(self, session_id: str, *, canary: str | None = None) -> LogcatState:
+        if canary is not None and _SESSION_CANARY.fullmatch(canary) is None:
+            raise ValueError("Logcat session canary has an invalid format.")
         record = self.repository.load(session_id)
         paths = self.repository.paths_for(record.session_id)
         adb = self.context.adb_client(command_log=paths.commands_jsonl)
@@ -127,6 +139,8 @@ class LogcatCollector:
         matches = list(_SENSITIVE_LOG_PATTERN.finditer(raw))
         marker_types = tuple(sorted({match.group(1).casefold() for match in matches}))
         output = redact_text(raw)
+        if canary:
+            output = output.replace(canary, "<session-canary-redacted>")
         stamp = now.strftime("%Y%m%d-%H%M%S")
         log_path = paths.redacted_dir / "logcat" / f"target-{stamp}.log"
         write_text_atomic(log_path, output, root=self.paths.root)
@@ -147,7 +161,7 @@ class LogcatCollector:
             relative_path=log_path.relative_to(paths.root).as_posix(),
             sensitive_marker_types=marker_types,
             sensitive_match_count=len(matches),
-            canary_observed=bool(canary and canary in raw),
+            canary_observed=bool(canary and _contains_exact_canary(raw, canary)),
             evidence_id=evidence.evidence_id,
         )
         write_json_atomic(state_path, state.to_dict(), root=self.paths.root)

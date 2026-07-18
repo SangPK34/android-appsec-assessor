@@ -16,7 +16,7 @@ from .redaction import REDACTED, is_sensitive_name, redact_data, redact_text
 from .storage import write_text_atomic
 from .validation import validate_package_name
 
-OBSERVER_VERSION = "0.5.1"
+OBSERVER_VERSION = "0.6.0"
 SESSION_PLACEHOLDER = "__ANDROID_ASSESSOR_SESSION_ID__"
 PACKAGE_PLACEHOLDER = "__ANDROID_ASSESSOR_PACKAGE__"
 CANARY_PLACEHOLDER = "__ANDROID_ASSESSOR_CANARY__"
@@ -31,6 +31,19 @@ _LIFECYCLE_METHODS = {
     "hook_installed",
     "hook_error",
     "observer_stopped",
+}
+_SAFE_SENSITIVE_METADATA_KEYS = {
+    "key_sha256",
+    "key_length_bits",
+    "key_origin",
+    "interface_name_sha256",
+    "interface_name_length",
+    "manager_class_hashes",
+    "verifier_class_sha256",
+    "salt_sha256",
+    "salt_length",
+    "seed_sha256",
+    "implementation_class_sha256",
 }
 
 
@@ -149,8 +162,8 @@ def _parse_event(payload: dict[str, Any]) -> FridaObserverEvent:
     if not isinstance(canary, bool):
         raise ValueError("canary_match must be boolean")
     observer_version = str(payload.get("observer_version", ""))
-    if not _VERSION.fullmatch(observer_version):
-        raise ValueError("observer_version is invalid")
+    if observer_version != OBSERVER_VERSION:
+        raise ValueError("observer_version is incompatible")
     return FridaObserverEvent(
         timestamp=_timestamp(payload.get("timestamp")),
         session_id=_safe_id(payload.get("session_id"), "session_id"),
@@ -170,19 +183,35 @@ def _parse_event(payload: dict[str, Any]) -> FridaObserverEvent:
 
 
 def _redact_observer_value(value: Any, *, key: str | None = None) -> Any:
+    if (
+        key is not None
+        and is_sensitive_name(key)
+        and key not in _SAFE_SENSITIVE_METADATA_KEYS
+    ):
+        return REDACTED
     if isinstance(value, list):
-        return [_redact_observer_value(item) for item in value]
+        return [_redact_observer_value(item, key=key) for item in value]
     if isinstance(value, dict):
         return {
             str(name): _redact_observer_value(item, key=str(name))
             for name, item in value.items()
         }
+    if value is None:
+        return None
     if key in {
         "key_sha256",
         "iv_sha256",
         "input_sha256",
         "output_sha256",
         "indicator_hash",
+        "host_sha256",
+        "interface_name_sha256",
+        "manager_class_hashes",
+        "verifier_class_sha256",
+        "path_sha256",
+        "salt_sha256",
+        "seed_sha256",
+        "implementation_class_sha256",
     }:
         return value if isinstance(value, str) and _SHA256.fullmatch(value) else "<redacted>"
     if key in {
@@ -198,15 +227,61 @@ def _redact_observer_value(value: Any, *, key: str | None = None) -> Any:
         "indicator_type",
         "response",
         "type",
+        "operation_kind",
+        "url_scheme",
+        "content_origin",
+        "setting",
+        "mixed_content_mode",
+        "decision",
+        "sink_type",
+        "storage_area",
+        "random_source",
+        "webview_id",
+        "settings_id",
+        "handler_id",
+        "ssl_context_id",
+        "editor_id",
+        "content_values_id",
+        "stream_id",
+        "clip_id",
+        "call_sequence",
+        "delivery_kind",
+        "target_scope",
+        "exposure_confidence",
     }:
         return (
             value
             if isinstance(value, str) and _SAFE_METADATA.fullmatch(value)
             else "<redacted>"
         )
-    if key in {"length", "key_length_bits"}:
+    if key in {
+        "length",
+        "key_length_bits",
+        "iv_length",
+        "salt_length",
+        "iteration_count",
+        "interface_name_length",
+        "data_length",
+        "script_length",
+        "trust_manager_count",
+    }:
         return value if isinstance(value, int) and not isinstance(value, bool) else None
-    if key in {"executed", "canary_match", "detected", "bypass_instrumented"}:
+    if key in {
+        "executed",
+        "canary_match",
+        "detected",
+        "bypass_instrumented",
+        "iv_zero",
+        "enabled",
+        "is_remote",
+        "is_file",
+        "custom_trust_manager",
+        "custom_hostname_verifier",
+        "ssl_error_callback",
+        "persisted",
+        "boundary_exposed",
+        "package_scoped",
+    }:
         if value is None and key == "detected":
             return None
         return value if isinstance(value, bool) else False

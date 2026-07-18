@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import json
 import struct
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
@@ -337,6 +337,192 @@ def test_inventory_redacts_secrets_endpoints_and_matches_exact_apis(
         "ANDROID-WEBSETTINGS-SAVE-PASSWORD"
     ]
     assert result.embedded_code[0].archive_entry == "assets/plugin.jar"
+
+
+def test_security_api_inventory_matches_exact_references_only(tmp_path: Path) -> None:
+    apk = tmp_path / "security-api-inventory.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("setAllowFileAccessFromFileURLs",),
+            methods=(
+                (
+                    "Landroid/webkit/WebSettings;",
+                    "setJavaScriptEnabled",
+                    ("Z",),
+                    "V",
+                ),
+                (
+                    "Ljavax/net/ssl/SSLContext;",
+                    "init",
+                    (
+                        "[Ljavax/net/ssl/KeyManager;",
+                        "[Ljavax/net/ssl/TrustManager;",
+                        "Ljava/security/SecureRandom;",
+                    ),
+                    "V",
+                ),
+                (
+                    "Ljava/security/MessageDigest;",
+                    "getInstance",
+                    ("Ljava/lang/String;",),
+                    "Ljava/security/MessageDigest;",
+                ),
+                (
+                    "Landroid/app/PendingIntent;",
+                    "getActivity",
+                    (
+                        "Landroid/content/Context;",
+                        "I",
+                        "Landroid/content/Intent;",
+                        "I",
+                    ),
+                    "Landroid/app/PendingIntent;",
+                ),
+                # Same method name on another class is not an Android API match.
+                ("Lcom/example/WebSettings;", "setJavaScriptEnabled", ("Z",), "V"),
+                # Exact class/name with a wrong prototype is also not a match.
+                (
+                    "Landroid/webkit/WebSettings;",
+                    "setJavaScriptEnabled",
+                    ("I",),
+                    "V",
+                ),
+                (
+                    "Ljava/security/MessageDigest;",
+                    "getInstance",
+                    ("Ljava/lang/String;",),
+                    "Ljava/lang/Object;",
+                ),
+            ),
+        ),
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "apk/security"),))
+    serialized = result.to_dict()
+
+    assert serialized["schema_version"] == 2
+    assert [item.inventory_id for item in result.security_api_candidates] == [
+        "CRYPTO_MESSAGE_DIGEST_INSTANCE",
+        "PENDING_INTENT_ACTIVITY",
+        "TLS_SSL_CONTEXT_INIT",
+        "WEBVIEW_JAVASCRIPT_ENABLED",
+    ]
+    assert {item.category for item in result.security_api_candidates} == {
+        "crypto",
+        "pending_intent",
+        "tls",
+        "webview",
+    }
+    assert len(serialized["security_api_candidates"]) == 4
+
+
+@pytest.mark.parametrize(
+    ("inventory_id", "category", "class_descriptor", "method_name", "prototype"),
+    tuple(
+        (
+            inventory_id,
+            category,
+            class_descriptor,
+            method_name,
+            prototype,
+        )
+        for (
+            inventory_id,
+            category,
+            class_descriptor,
+            method_name,
+            prototypes,
+        ) in static_analysis._SECURITY_API_PATTERNS
+        for prototype in sorted(prototypes)
+    ),
+)
+def test_every_security_api_pattern_requires_an_exact_prototype(
+    inventory_id: str,
+    category: str,
+    class_descriptor: str,
+    method_name: str,
+    prototype: str,
+) -> None:
+    collector = static_analysis._Collector(StaticApkPolicy(), ())
+    static_analysis._record_method_reference(
+        collector,
+        source_id="fixture/source",
+        dex_entry="classes.dex",
+        reference=static_analysis.DexMethodReference(
+            class_descriptor=class_descriptor,
+            method_name=method_name,
+            prototype=prototype,
+        ),
+    )
+    rejected = static_analysis._Collector(StaticApkPolicy(), ())
+    static_analysis._record_method_reference(
+        rejected,
+        source_id="fixture/source",
+        dex_entry="classes.dex",
+        reference=static_analysis.DexMethodReference(
+            class_descriptor=class_descriptor,
+            method_name=method_name,
+            prototype=prototype + "invalid",
+        ),
+    )
+
+    assert [(item.inventory_id, item.category) for item in collector.security] == [
+        (inventory_id, category)
+    ]
+    assert rejected.security == []
+
+
+def test_security_inventory_limit_is_appended_for_positional_policy_compatibility() -> None:
+    assert fields(StaticApkPolicy)[-1].name == "max_security_api_matches"
+
+
+def test_security_api_inventory_is_deduplicated_ordered_and_bounded(
+    tmp_path: Path,
+) -> None:
+    duplicate = (
+        "Landroid/webkit/WebView;",
+        "loadUrl",
+        ("Ljava/lang/String;",),
+        "V",
+    )
+    first = tmp_path / "first.apk"
+    second = tmp_path / "second.apk"
+    write_apk(first, build_dex(methods=(duplicate, duplicate)))
+    write_apk(
+        second,
+        build_dex(
+            methods=(
+                (
+                    "Ljavax/net/ssl/HostnameVerifier;",
+                    "verify",
+                    ("Ljava/lang/String;", "Ljavax/net/ssl/SSLSession;"),
+                    "Z",
+                ),
+            ),
+        ),
+    )
+    inputs = (
+        StaticApkInput(second, "z/source"),
+        StaticApkInput(first, "a/source"),
+    )
+
+    complete = analyze_apks(inputs)
+    bounded = analyze_apks(
+        inputs,
+        policy=replace(StaticApkPolicy(), max_security_api_matches=1),
+    )
+
+    assert [
+        (item.source_id, item.inventory_id)
+        for item in complete.security_api_candidates
+    ] == [
+        ("a/source", "WEBVIEW_LOAD_URL"),
+        ("z/source", "TLS_HOSTNAME_VERIFY"),
+    ]
+    assert len(bounded.security_api_candidates) == 1
+    assert bounded.status == "partial"
+    assert "limit:security_api_matches" in bounded.limitations
 
 
 def test_placeholder_values_do_not_become_secret_candidates(tmp_path: Path) -> None:
@@ -897,6 +1083,12 @@ def test_detected_secret_is_redacted_across_all_static_inventory_categories(
                     "Ljava/lang/Class;",
                 ),
                 ("Landroid/webkit/WebSettings;", "setSavePassword", ("Z",), "V"),
+                (
+                    "Landroid/webkit/WebView;",
+                    "loadUrl",
+                    ("Ljava/lang/String;",),
+                    "V",
+                ),
             ),
         ),
         entries={
@@ -911,6 +1103,7 @@ def test_detected_secret_is_redacted_across_all_static_inventory_categories(
     assert result.secret_candidates
     assert result.endpoints
     assert result.dynamic_loading_apis
+    assert result.security_api_candidates
     assert result.api_policy_matches
     assert result.embedded_code
     assert secret not in payload
@@ -918,6 +1111,7 @@ def test_detected_secret_is_redacted_across_all_static_inventory_categories(
     assert result.endpoints[0].source_id.startswith("<redacted>:")
     assert result.endpoints[0].location == "assets/<redacted>.txt:line:1"
     assert result.dynamic_loading_apis[0].source_id.startswith("<redacted>:")
+    assert result.security_api_candidates[0].source_id.startswith("<redacted>:")
     assert result.api_policy_matches[0].source_id.startswith("<redacted>:")
     assert result.embedded_code[0].source_id.startswith("<redacted>:")
     assert result.embedded_code[0].archive_entry == "assets/<redacted>.jar"

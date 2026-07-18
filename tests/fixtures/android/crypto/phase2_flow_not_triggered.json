@@ -1,0 +1,8 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "operations": [
+    {"operation_id": "cipher-not-executed", "operation_kind": "cipher", "transformation": "DES/CBC/PKCS5Padding", "purpose": "encrypt", "executed": false, "key_length_bits": 64, "key_sha256": null, "iv_sha256": null, "iv_source": "unknown", "key_origin": "unknown", "canary_match": false, "call_sequence": []},
+    {"operation_id": "digest-not-executed", "operation_kind": "digest", "transformation": "MD5", "purpose": "digest", "executed": false, "key_length_bits": null, "key_sha256": null, "iv_sha256": null, "iv_source": "none", "key_origin": "unknown", "canary_match": false, "call_sequence": []}
+  ]
+}

@@ -32,18 +32,18 @@ rules:
 
   - id: ASL-MVP-003
     evaluator: sensitive_token
-    title: Sensitive token exposed in URL or application log
+    title: Sensitive canary reached an exposed runtime sink
     category: data-storage
-    description: A sensitive token-shaped value was observed in a URL query or target-process log.
+    description: Correlates an exact session canary with package-attributed traffic, log, WebView, clipboard, notification, intent, broadcast, or provider sinks; persisted application storage is evaluated by its dedicated rule family.
     severity: high
     confidence: high
-    required_capabilities: [LOGCAT_ACCESS]
-    inputs: [traffic.events.sensitive_query_keys, logcat.sensitive_marker_types]
+    required_capabilities: [ADB_AUTHORIZED]
+    inputs: [traffic.events, logcat.sensitive_marker_types, frida.events]
     validation_type: adb_assisted_validation
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
     cwe_mapping: mapping_pending
-    remediation: Keep tokens out of URLs and logs; use protected headers and remove sensitive logging.
+    remediation: Keep sensitive values out of exposed sinks and enforce an explicit, protected trust boundary before sharing data.
 
   - id: ASL-MVP-004
     evaluator: exported_component
@@ -66,7 +66,7 @@ rules:
     title: TLS interception and certificate trust behavior
     category: network
     description: Records whether HTTPS completed through the configured lab interception proxy.
-    severity: info
+    severity: medium
     confidence: medium
     required_capabilities: [MITMPROXY_AVAILABLE]
     inputs: [traffic.events, frida.events]
@@ -201,6 +201,7 @@ rules:
     severity: medium
     confidence: high
     validation_type: instrumented_validation
+    frida_required: true
     observation_only: false
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
@@ -215,11 +216,179 @@ rules:
     severity: high
     confidence: high
     validation_type: instrumented_validation
+    frida_required: true
     observation_only: false
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
     cwe_mapping: mapping_pending
     remediation: Replace weak algorithms with a modern, policy-approved primitive.
+
+  - id: CRYPTO-SHORT-KEY
+    evaluator: crypto_runtime
+    title: Symmetric key length below policy observed at runtime
+    category: crypto
+    description: Evaluates normalized runtime key-length metadata for completed symmetric operations.
+    severity: high
+    confidence: high
+    validation_type: instrumented_validation
+    frida_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Use a policy-approved key size and managed key generation.
+
+  - id: CRYPTO-ZERO-IV
+    evaluator: crypto_runtime
+    title: All-zero IV observed at runtime
+    category: crypto
+    description: Detects an all-zero IV on a completed encryption operation without retaining IV material.
+    severity: medium
+    confidence: high
+    validation_type: instrumented_validation
+    frida_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Generate a fresh unpredictable IV of the required length for every encryption operation.
+
+  - id: CRYPTO-REUSED-IV
+    evaluator: crypto_runtime
+    title: IV reused with the same key at runtime
+    category: crypto
+    description: Correlates IV and key fingerprints across completed encryption operations in one session.
+    severity: high
+    confidence: high
+    validation_type: instrumented_validation
+    frida_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Never reuse an IV with the same key where the selected mode requires uniqueness.
+
+  - id: CRYPTO-WEAK-DIGEST
+    evaluator: crypto_runtime
+    title: Weak digest or MAC observed at runtime
+    category: crypto
+    description: Correlates completed MD5, SHA-1, or HMAC-SHA1 operations while preserving context uncertainty.
+    severity: medium
+    confidence: medium
+    validation_type: instrumented_validation
+    frida_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Replace weak digest and MAC algorithms in security-sensitive flows.
+
+  - id: CRYPTO-LOW-PBE-ITERATIONS
+    evaluator: crypto_runtime
+    title: Password-based derivation iteration count below policy
+    category: crypto
+    description: Evaluates bounded runtime PBE salt-length and iteration-count metadata.
+    severity: medium
+    confidence: medium
+    validation_type: instrumented_validation
+    frida_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Use a policy-approved password-based KDF and iteration count.
+
+  - id: CRYPTO-PREDICTABLE-RANDOM
+    evaluator: crypto_runtime
+    title: Weak random output used as cryptographic material
+    category: crypto
+    description: Correlates java.util.Random output fingerprints with key or IV material used by a completed runtime cipher operation.
+    severity: medium
+    confidence: high
+    validation_type: instrumented_validation
+    frida_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Generate cryptographic keys and IVs with SecureRandom or a platform key-management API.
+
+  - id: WEBVIEW-JS-BRIDGE-REMOTE
+    evaluator: webview_security
+    title: JavaScript bridge exposed to remote WebView content
+    category: webview
+    description: Correlates JavaScript enablement, a JavaScript interface, and remote content on the same WebView instance.
+    severity: high
+    confidence: medium
+    validation_type: instrumented_validation
+    frida_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Remove unnecessary bridges and expose them only to strictly trusted content.
+
+  - id: WEBVIEW-UNSAFE-SETTINGS
+    evaluator: webview_security
+    title: Security-relevant WebView setting enabled at runtime
+    category: webview
+    description: Evaluates unsafe file-URL access, permissive mixed content, and WebView debugging runtime settings.
+    severity: medium
+    confidence: medium
+    validation_type: instrumented_validation
+    frida_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Disable permissive WebView settings unless a reviewed application requirement exists.
+
+  - id: WEBVIEW-SSL-ERROR-PROCEED
+    evaluator: webview_security
+    title: WebView continued after an SSL certificate error
+    category: network
+    description: Detects package-attributed SslErrorHandler.proceed behavior and retains static references as candidates only.
+    severity: high
+    confidence: high
+    validation_type: evidence_correlation
+    frida_required: false
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Cancel WebView SSL errors and correct the server or trust configuration.
+
+  - id: STORAGE-WORLD-READABLE
+    evaluator: storage_security
+    title: World-readable private-storage file
+    category: data-storage
+    description: Evaluates bounded package storage metadata for read permission granted to other Android UIDs.
+    severity: medium
+    confidence: high
+    validation_type: root_assisted_validation
+    root_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Restrict private application files to the owning application UID.
+
+  - id: STORAGE-WORLD-WRITABLE
+    evaluator: storage_security
+    title: World-writable private-storage file
+    category: data-storage
+    description: Evaluates bounded package storage metadata for write permission granted to other Android UIDs.
+    severity: high
+    confidence: high
+    validation_type: root_assisted_validation
+    root_required: true
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Remove other-UID write access from application-owned files.
+
+  - id: STORAGE-SENSITIVE-CANARY
+    evaluator: storage_security
+    title: Exact session canary persisted in plaintext package storage
+    category: data-storage
+    description: Correlates runtime storage writes or a bounded exact-canary match with package-owned storage without treating root readability as a weakness.
+    severity: high
+    confidence: high
+    validation_type: evidence_correlation
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    cwe_mapping: mapping_pending
+    remediation: Avoid persisting sensitive values in plaintext and apply appropriate cryptographic protection.
 
   - id: ASL-RUNTIME-WEBVIEW
     evaluator: runtime_observation
@@ -230,6 +399,7 @@ rules:
     confidence: medium
     observation_only: true
     validation_type: instrumented_validation
+    frida_required: true
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
     cwe_mapping: mapping_pending
@@ -244,6 +414,7 @@ rules:
     confidence: medium
     observation_only: true
     validation_type: instrumented_validation
+    frida_required: true
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
     cwe_mapping: mapping_pending
@@ -258,6 +429,7 @@ rules:
     confidence: medium
     observation_only: true
     validation_type: post_compromise_observation
+    root_required: true
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
     cwe_mapping: mapping_pending
@@ -272,6 +444,7 @@ rules:
     confidence: medium
     observation_only: true
     validation_type: instrumented_validation
+    frida_required: true
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
     cwe_mapping: mapping_pending

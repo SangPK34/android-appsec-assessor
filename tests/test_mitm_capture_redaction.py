@@ -47,6 +47,7 @@ def _flow(host: str) -> SimpleNamespace:
         port=443,
         http_version="HTTP/2",
         headers=http.Headers(),
+        raw_content=b"",
     )
     return SimpleNamespace(request=request, metadata={}, response=None, id="flow-1")
 
@@ -94,3 +95,64 @@ def test_mitm_allows_exact_scoped_host(monkeypatch) -> None:
     assert flow.response is None
     assert events[0]["scope_allowed"] is True
     assert events[0]["blocked"] is False
+
+
+def test_mitm_attributes_exact_canary_in_query_header_and_bounded_body(
+    monkeypatch,
+) -> None:
+    events: list[dict[str, object]] = []
+    canary = "THESIS_CANARY_20260718T010203Z_abcdef123456"
+    monkeypatch.setattr(
+        mitm_capture.ctx,
+        "options",
+        SimpleNamespace(
+            android_assessor_events="",
+            android_assessor_canary=canary,
+            android_assessor_allowed_hosts="10.0.2.2",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(mitm_capture, "_write", events.append)
+    flow = _flow("10.0.2.2")
+    flow.request.pretty_url += f"?value={canary}"
+    flow.request.headers = http.Headers(authorization=f"Bearer {canary}")
+    flow.request.raw_content = f"value={canary}&kind=lab".encode()
+
+    mitm_capture.request(flow)  # type: ignore[arg-type]
+
+    event = events[0]
+    assert event["attribution"] == "validation_canary"
+    assert event["canary_sink_types"] == ["http_body", "http_header", "url_query"]
+    assert event["canary_body_scan_status"] == "completed"
+    assert canary not in str(event)
+
+
+def test_mitm_rejects_canary_shape_and_skips_oversized_body(monkeypatch) -> None:
+    events: list[dict[str, object]] = []
+    canary = "THESIS_CANARY_20260718T010203Z_abcdef123456"
+    monkeypatch.setattr(
+        mitm_capture.ctx,
+        "options",
+        SimpleNamespace(
+            android_assessor_events="",
+            android_assessor_canary=canary,
+            android_assessor_allowed_hosts="10.0.2.2",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(mitm_capture, "_write", events.append)
+    flow = _flow("10.0.2.2")
+    flow.request.pretty_url += f"?value=x{canary}"
+    flow.request.headers = http.Headers(x_lab=f"{canary}x")
+    flow.request.raw_content = (
+        canary.encode()
+        + b"x"
+        + b"0" * mitm_capture._MAX_CANARY_BODY_SCAN_BYTES
+    )
+
+    mitm_capture.request(flow)  # type: ignore[arg-type]
+
+    event = events[0]
+    assert event["attribution"] == "unattributed"
+    assert event["canary_sink_types"] == []
+    assert event["canary_body_scan_status"] == "skipped_size_limit"

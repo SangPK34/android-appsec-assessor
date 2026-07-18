@@ -156,7 +156,7 @@ def test_root_observer_avoids_generic_call_attribution_and_duplicate_hooks() -> 
     source = hook.read_text(encoding="utf-8")
 
     assert source.count(
-        "['android.webkit.WebView', 'setWebContentsDebuggingEnabled'"
+        "WebView.setWebContentsDebuggingEnabled.overloads.forEach"
     ) == 1
     assert "if (indicator !== null)" in source
     assert "if (relevant)" in source

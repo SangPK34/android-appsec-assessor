@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
-from urllib.parse import quote, urlunsplit
+from urllib.parse import quote, urlencode, urlunsplit
 from xml.etree import ElementTree
 
 from .adb import AdbClient
@@ -26,6 +26,7 @@ from .validation import (
     validate_component_name,
     validate_managed_remote_path,
     validate_package_name,
+    validate_session_canary,
     validate_session_id,
 )
 
@@ -63,12 +64,31 @@ _PERMISSION_CONTROLLER_PACKAGES = frozenset(
     }
 )
 _KEYWORD_CATEGORIES = {
-    "crypto": ("encrypt", "decrypt", "crypto", "cipher", "hash", "md5", "sha", "aes"),
+    "crypto": (
+        "encrypt",
+        "decrypt",
+        "crypto",
+        "cipher",
+        "hash",
+        "digest",
+        "random",
+        "md5",
+        "sha",
+        "aes",
+    ),
     "webview": ("web", "url", "browser", "html"),
     "storage": ("save", "database", "sqlite", "preference", "storage", "file"),
     "logging": ("login", "sign in", "token", "log", "username", "password"),
     "root_detection": ("root", "superuser", "magisk", "su "),
-    "network": ("network", "http", "tls", "ssl", "connect", "request"),
+    "network": (
+        "network",
+        "http",
+        "tls",
+        "ssl",
+        "certificate",
+        "connect",
+        "request",
+    ),
 }
 
 
@@ -817,6 +837,7 @@ class AndroidExplorer:
         feedback: Callable[[], RuntimeFeedback] | None = None,
         stop_requested: Callable[[], bool] | None = None,
         network_guard_active: bool = False,
+        session_canary: str | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -827,6 +848,11 @@ class AndroidExplorer:
         self.scope = scope
         self.config = config
         self.network_guard_active = network_guard_active
+        self.session_canary = (
+            validate_session_canary(session_canary)
+            if session_canary is not None
+            else None
+        )
         self.feedback = feedback or (lambda: RuntimeFeedback())
         self.stop_requested = stop_requested or (lambda: False)
         self.clock = clock
@@ -943,12 +969,21 @@ class AndroidExplorer:
         )
         return candidates[:2]
 
-    def _generated_input(self, node: UiNode) -> tuple[str, str]:
+    def _generated_input(
+        self,
+        node: UiNode,
+        *,
+        prefer_canary: bool = False,
+    ) -> tuple[str, str]:
         input_kind, value = classify_input(
             node,
             allow_local_url="10.0.2.2" in self.scope.api_hosts,
         )
-        if input_kind == "canary":
+        if self.session_canary is not None and (
+            input_kind == "canary" or (prefer_canary and input_kind == "text")
+        ):
+            value = self.session_canary
+        elif input_kind == "canary":
             value = f"ASL_{self.session_id[-6:]}"
         return input_kind, value
 
@@ -1013,8 +1048,12 @@ class AndroidExplorer:
                 )
                 continue
             authority = f"{host}:{port}" if port else host
+            query = urlencode(
+                {"asl": self.session_canary or "canary"},
+                safe="",
+            )
             uri = urlunsplit(
-                (scheme, authority, path if path.startswith("/") else "/" + path, "asl=canary", "")
+                (scheme, authority, path if path.startswith("/") else "/" + path, query, "")
             )
             try:
                 self.scope.require_url(uri)
@@ -1063,7 +1102,10 @@ class AndroidExplorer:
 
         def enter_input(node: UiNode, state: UiState, *, source: str) -> None:
             nonlocal actions_executed, actions_succeeded, input_actions, keyboard_open
-            input_kind, value = self._generated_input(node)
+            input_kind, value = self._generated_input(
+                node,
+                prefer_canary=source == "form_retry",
+            )
             self.backend.input_text(*node.center, value)
             identity = _node_identity(node, state.activity)
             executed.add((state.fingerprint, identity))
@@ -1544,6 +1586,7 @@ class ExplorerService:
         feedback: Callable[[], RuntimeFeedback],
         stop_requested: Callable[[], bool],
         network_guard_active: bool = False,
+        session_canary: str | None = None,
     ) -> ExplorerResult:
         record = self.repository.load(session_id)
         scope.require_device_package(
@@ -1576,6 +1619,7 @@ class ExplorerService:
             feedback=feedback,
             stop_requested=stop_requested,
             network_guard_active=network_guard_active,
+            session_canary=session_canary,
         )
         result = explorer.run()
         output_dir = session_paths.redacted_dir / "explorer"

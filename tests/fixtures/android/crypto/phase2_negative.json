@@ -1,0 +1,10 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "operations": [
+    {"operation_id": "different-key-1", "operation_kind": "cipher", "transformation": "AES/GCM/NoPadding", "purpose": "encrypt", "executed": true, "key_length_bits": 256, "key_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iv_sha256": "1111111111111111111111111111111111111111111111111111111111111111", "iv_source": "random", "iv_length": 12, "iv_zero": false, "key_origin": "generated", "canary_match": false, "call_sequence": ["cipher.do_final"]},
+    {"operation_id": "different-key-2", "operation_kind": "cipher", "transformation": "AES/GCM/NoPadding", "purpose": "encrypt", "executed": true, "key_length_bits": 256, "key_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "iv_sha256": "1111111111111111111111111111111111111111111111111111111111111111", "iv_source": "random", "iv_length": 12, "iv_zero": false, "key_origin": "generated", "canary_match": false, "call_sequence": ["cipher.do_final"]},
+    {"operation_id": "sha256-1", "operation_kind": "digest", "transformation": "SHA-256", "purpose": "digest", "executed": true, "key_length_bits": null, "key_sha256": null, "iv_sha256": null, "iv_source": "none", "key_origin": "unknown", "canary_match": false, "call_sequence": ["digest.digest"]},
+    {"operation_id": "pbe-safe-1", "operation_kind": "pbe", "transformation": "PBKDF2WithHmacSHA256", "purpose": "derive", "executed": true, "key_length_bits": 256, "key_sha256": null, "iv_sha256": null, "iv_source": "none", "key_origin": "derived", "salt_length": 16, "iteration_count": 310000, "canary_match": false, "call_sequence": ["pbe.key_spec"]}
+  ]
+}

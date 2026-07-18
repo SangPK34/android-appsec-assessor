@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import secrets
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
 from .errors import SessionError
@@ -17,6 +19,9 @@ _COMPONENT_PATTERN = re.compile(
     r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_$]*)+$"
 )
 _REMOTE_TEMP_PREFIX = PurePosixPath("/data/local/tmp/android-security-lab")
+_SESSION_CANARY_PATTERN = re.compile(
+    r"^THESIS_CANARY_\d{8}T\d{6}Z_[a-f0-9]{12}$"
+)
 
 
 def validate_package_name(package: str) -> str:
@@ -30,6 +35,19 @@ def validate_session_id(session_id: str) -> str:
     value = session_id.strip()
     if not _SESSION_PATTERN.fullmatch(value):
         raise SessionError("Session ID has an invalid format.")
+    return value
+
+
+def generate_session_canary() -> str:
+    """Create an opaque marker for one assessment or validation session."""
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"THESIS_CANARY_{stamp}_{secrets.token_hex(6)}"
+
+
+def validate_session_canary(canary: str) -> str:
+    value = canary.strip()
+    if not _SESSION_CANARY_PATTERN.fullmatch(value):
+        raise SessionError("Session canary has an invalid format.")
     return value
 
 

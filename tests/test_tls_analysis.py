@@ -25,7 +25,11 @@ from tests.fakes import load_fixture
     (
         ("mitm_accepted", TlsBehaviorState.MITM_ACCEPTED, FindingStatus.CONFIRMED),
         ("mitm_rejected", TlsBehaviorState.MITM_REJECTED, FindingStatus.PASS),
-        ("pinning_observed", TlsBehaviorState.PINNING_OBSERVED, FindingStatus.PASS),
+        (
+            "pinning_observed",
+            TlsBehaviorState.PINNING_OBSERVED,
+            FindingStatus.INCONCLUSIVE,
+        ),
         (
             "trust_manager_observed",
             TlsBehaviorState.TRUST_MANAGER_OBSERVED,
@@ -169,8 +173,160 @@ def test_trust_manager_call_without_outcome_is_inconclusive() -> None:
         environment="simulated",
     )
 
-    assert result.state is TlsBehaviorState.TRUST_MANAGER_OBSERVED
+    assert result.state is TlsBehaviorState.INCONCLUSIVE
     assert result.finding_status is FindingStatus.INCONCLUSIVE
+
+
+@pytest.mark.parametrize(
+    ("method", "marker", "decision", "class_name"),
+    (
+        (
+            "tls.check_server_trusted",
+            "custom_trust_manager",
+            "returned",
+            "unknown",
+        ),
+        (
+            "tls.check_server_trusted",
+            "custom_trust_manager",
+            "returned",
+            "com.android.org.conscrypt.TrustManagerImpl",
+        ),
+        (
+            "tls.hostname_verify",
+            "custom_hostname_verifier",
+            "accepted",
+            "com.android.okhttp.internal.tls.OkHostnameVerifier",
+        ),
+        (
+            "tls.hostname_verify",
+            "custom_hostname_verifier",
+            "accepted",
+            "okhttp3.internal.tls.OkHostnameVerifier",
+        ),
+    ),
+)
+def test_unknown_or_platform_tls_class_is_not_classified_custom(
+    method: str,
+    marker: str,
+    decision: str,
+    class_name: str,
+) -> None:
+    result = TlsBehaviorAnalyzer.from_events(
+        [
+            {
+                "event": "request",
+                "flow_id": "target",
+                "scheme": "https",
+                "attribution": "target",
+            }
+        ],
+        [
+            {
+                "category": "tls",
+                "method": method,
+                "arguments_redacted": [
+                    {
+                        marker: True,
+                        "implementation_class_name": class_name,
+                        "decision": decision,
+                    }
+                ],
+            }
+        ],
+        source="fixture",
+        environment="simulated",
+    )
+
+    assert result.state is not TlsBehaviorState.CUSTOM_TRUST_CONFIGURED
+    assert result.finding_status is FindingStatus.INCONCLUSIVE
+    assert result.evidence.custom_trust_manager_observed is False
+    assert result.evidence.custom_hostname_verifier_observed is False
+
+
+@pytest.mark.parametrize(
+    ("method", "marker", "decision"),
+    (
+        ("tls.check_server_trusted", "custom_trust_manager", "threw"),
+        ("tls.hostname_verify", "custom_hostname_verifier", "rejected"),
+    ),
+)
+def test_custom_tls_component_that_only_rejects_is_not_potential(
+    method: str,
+    marker: str,
+    decision: str,
+) -> None:
+    result = TlsBehaviorAnalyzer.from_events(
+        [
+            {
+                "event": "request",
+                "flow_id": "target",
+                "scheme": "https",
+                "attribution": "target",
+            }
+        ],
+        [
+            {
+                "category": "tls",
+                "method": method,
+                "arguments_redacted": [
+                    {
+                        marker: True,
+                        "implementation_class_name": "com.example.security.StrictVerifier",
+                        "decision": decision,
+                    }
+                ],
+            }
+        ],
+        source="fixture",
+        environment="simulated",
+    )
+
+    assert result.state is TlsBehaviorState.CUSTOM_TRUST_CONFIGURED
+    assert result.finding_status is FindingStatus.INCONCLUSIVE
+    assert "rejected" in result.rationale
+
+
+@pytest.mark.parametrize(
+    ("method", "marker", "decision"),
+    (
+        ("tls.check_server_trusted", "custom_trust_manager", "returned"),
+        ("tls.hostname_verify", "custom_hostname_verifier", "accepted"),
+    ),
+)
+def test_custom_tls_acceptance_remains_potential_without_controlled_proof(
+    method: str,
+    marker: str,
+    decision: str,
+) -> None:
+    result = TlsBehaviorAnalyzer.from_events(
+        [
+            {
+                "event": "request",
+                "flow_id": "target",
+                "scheme": "https",
+                "attribution": "target",
+            }
+        ],
+        [
+            {
+                "category": "tls",
+                "method": method,
+                "arguments_redacted": [
+                    {
+                        marker: True,
+                        "implementation_class_name": "com.example.security.CustomVerifier",
+                        "decision": decision,
+                    }
+                ],
+            }
+        ],
+        source="fixture",
+        environment="simulated",
+    )
+
+    assert result.state is TlsBehaviorState.CUSTOM_TRUST_CONFIGURED
+    assert result.finding_status is FindingStatus.POTENTIAL
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,7 @@ import pytest
 from android_assessor.evidence import EvidenceRepository
 from android_assessor.explorer import ExplorerConfig
 from android_assessor.findings import FindingStatus
+from android_assessor.frida_events import OBSERVER_VERSION
 from android_assessor.paths import ProjectPaths
 from android_assessor.redaction import redact_report_data
 from android_assessor.report import (
@@ -28,6 +29,7 @@ from android_assessor.services.scan_service import (
 )
 from android_assessor.session import SessionRepository
 from android_assessor.storage import read_json_object, write_json_atomic
+from android_assessor.validation import validate_session_canary
 
 
 def _rule_session(tmp_path: Path) -> tuple[ProjectPaths, SessionRepository, str]:
@@ -267,6 +269,8 @@ def test_scan_profile_starts_only_planned_controllers(
     record = repository.initialize(serial="FAKE_SERIAL", package="com.example.app")
     repository.activate(record.session_id, snapshot={}, device={}, environment={})
     calls: list[str] = []
+    canaries: dict[str, str | None] = {}
+    scan_seen_by_rules: dict[str, object] = {}
 
     class Adb:
         def force_stop_package(self, _serial: str, _package: str) -> None:
@@ -288,6 +292,7 @@ def test_scan_profile_starts_only_planned_controllers(
 
         def start(self, *_args: object, **_kwargs: object) -> None:
             calls.append("traffic")
+            canaries["traffic"] = _kwargs.get("canary")  # type: ignore[assignment]
             if traffic_fails:
                 raise ValueError("synthetic traffic guard failure")
 
@@ -297,6 +302,7 @@ def test_scan_profile_starts_only_planned_controllers(
     class Frida(Traffic):
         def start(self, *_args: object, **_kwargs: object) -> None:
             calls.append("frida")
+            canaries["frida"] = _kwargs.get("canary")  # type: ignore[assignment]
 
     class Storage:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -304,12 +310,16 @@ def test_scan_profile_starts_only_planned_controllers(
 
         def collect(self, *_args: object, **_kwargs: object) -> None:
             calls.append("storage")
+            canaries["storage"] = _kwargs.get(  # type: ignore[assignment]
+                "session_canary"
+            )
 
     class Logcat:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
         def collect(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            canaries["logcat"] = _kwargs.get("canary")  # type: ignore[assignment]
             return SimpleNamespace(status="completed", error=None)
 
     class Explorer:
@@ -318,6 +328,9 @@ def test_scan_profile_starts_only_planned_controllers(
 
         def run(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
             calls.append("explorer")
+            canaries["explorer"] = _kwargs.get(  # type: ignore[assignment]
+                "session_canary"
+            )
             return SimpleNamespace(
                 status="completed",
                 termination_reason="coverage_plateau",
@@ -330,6 +343,12 @@ def test_scan_profile_starts_only_planned_controllers(
             pass
 
         def evaluate(self, *_args: object) -> list[object]:
+            scan_seen_by_rules.update(
+                read_json_object(
+                    repository.paths_for(record.session_id).scan_json,
+                    root=paths.root,
+                )
+            )
             return []
 
     class Report:
@@ -365,6 +384,12 @@ def test_scan_profile_starts_only_planned_controllers(
     assert calls == expected_dynamic_calls
     assert result.profile == profile.value
     assert "rule_evaluation" in result.phase_timings
+    assert scan_seen_by_rules["effective_profile"] == profile.value
+    assert scan_seen_by_rules["dynamic_steps"]["rules"] == "running"  # type: ignore[index]
+    assert "pending" not in {
+        scan_seen_by_rules["dynamic_steps"][name]  # type: ignore[index]
+        for name in ("frida_observation", "private_storage")
+    }
     scan = read_json_object(repository.paths_for(record.session_id).scan_json, root=paths.root)
     assert scan["requested_profile"] == profile.value
     assert scan["effective_profile"] == profile.value
@@ -378,61 +403,105 @@ def test_scan_profile_starts_only_planned_controllers(
         "not_started",
     }
     assert "runtime_analysis" in result.phase_timings
+    if profile is ScanProfile.FULL:
+        propagated = [value for value in canaries.values() if value is not None]
+        assert propagated
+        assert len(set(propagated)) == 1
+        assert validate_session_canary(propagated[0]) == propagated[0]
+    else:
+        assert set(canaries) == {"logcat"}
+        assert canaries["logcat"] is None
 
 
 def test_crypto_analyzer_output_is_consumed_by_rule_engine(tmp_path: Path) -> None:
     paths, repository, session_id = _rule_session(tmp_path)
     session_paths = repository.paths_for(session_id)
-    event = {
-        "category": "crypto",
-        "method": "cipher.do_final",
-        "arguments_redacted": [{
-            "operation_id": "pivaa-crypto-1",
-            "transformation": "AES/ECB/PKCS5Padding",
-            "purpose": "encrypt",
-            "executed": True,
+    def event(
+        index: int,
+        *,
+        category: str,
+        method: str,
+        arguments: list[dict[str, object]],
+    ) -> dict[str, object]:
+        return {
+            "timestamp": f"2026-07-18T10:00:{index:02d}+00:00",
+            "session_id": session_id,
+            "package": "com.example.app",
+            "pid": 4242,
+            "thread_id": 7,
+            "hook_id": f"assessment.fixture.{index}",
+            "category": category,
+            "method": method,
+            "arguments_redacted": arguments,
+            "return_value_redacted": None,
             "canary_match": False,
-            "key_length_bits": 128,
-            "iv_sha256": "<redacted>",
-            "iv_source": "none",
-            "key_origin": "generated",
-        }],
-    }
-    event_path = session_paths.frida_dir / "events.jsonl"
-    event_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
-    previous_path = session_paths.redacted_dir / "frida" / "previous.jsonl"
-    previous_path.parent.mkdir(parents=True, exist_ok=True)
-    previous_path.write_text(
-        json.dumps(
-            {
-                "category": "webview",
-                "method": "webview.load_url",
-                "arguments_redacted": [],
-            }
-        )
-        + "\n",
+            "observer_version": OBSERVER_VERSION,
+        }
+
+    events = [
+        event(0, category="lifecycle", method="observer_started", arguments=[]),
+        event(
+            1,
+            category="crypto",
+            method="cipher.do_final",
+            arguments=[{
+                "operation_id": "crypto-operation-1",
+                "transformation": "AES/ECB/PKCS5Padding",
+                "purpose": "encrypt",
+                "executed": True,
+                "canary_match": False,
+                "key_length_bits": 128,
+                "iv_sha256": "<redacted>",
+                "iv_source": "none",
+                "key_origin": "generated",
+            }],
+        ),
+        event(2, category="webview", method="webview.load_url", arguments=[]),
+    ]
+    event_path = session_paths.redacted_dir / "frida" / "events.jsonl"
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    event_path.write_text(
+        "".join(json.dumps(item) + "\n" for item in events),
         encoding="utf-8",
     )
     EvidenceRepository(paths, repository).register_file(
         session_id,
-        previous_path,
+        event_path,
         evidence_type="frida_events",
         source="frida_observer",
-        description="Prior normalized observer phase.",
+        description="Attributed normalized observer phase.",
         sensitive=True,
         redacted=True,
     )
     write_json_atomic(
         session_paths.frida_dir / "state.json",
-        {"events_path": "frida/events.jsonl", "server_started_by_framework": True},
+        {
+            "events_path": event_path.relative_to(session_paths.root).as_posix(),
+            "server_started_by_framework": True,
+            "status": "stopped",
+            "handshake_status": "VALID",
+        },
         root=paths.root,
     )
 
     findings = {item.rule_id: item for item in RuleEngine(paths, repository).evaluate(session_id)}
 
     assert findings["CRYPTO-ECB"].status is FindingStatus.CONFIRMED
-    assert findings["CRYPTO-ECB"].details["operation_ids"] == ["pivaa-crypto-1"]
+    assert findings["CRYPTO-ECB"].details["operation_ids"] == ["crypto-operation-1"]
     assert findings["ASL-RUNTIME-WEBVIEW"].status is FindingStatus.PASS
+
+
+def test_rule_results_include_reasoning_contract(tmp_path: Path) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+
+    findings = RuleEngine(paths, repository).evaluate(session_id)
+
+    assert findings
+    for finding in findings:
+        assert isinstance(finding.details.get("reason"), str), finding.rule_id
+        assert isinstance(finding.details.get("method"), str), finding.rule_id
+        assert isinstance(finding.details.get("preconditions"), list), finding.rule_id
+        assert isinstance(finding.details.get("missing_evidence"), list), finding.rule_id
 
 
 @pytest.mark.parametrize(

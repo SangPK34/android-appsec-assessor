@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import secrets
 import time
 from datetime import UTC, datetime
 from urllib.parse import urlencode, urlunsplit
@@ -26,6 +25,7 @@ from ..scope import load_scope
 from ..session import SessionRepository
 from ..storage import read_json_object, require_under_root, write_text_atomic
 from ..traffic import TrafficCaptureService, load_traffic_events
+from ..validation import generate_session_canary
 from ..validation_definitions import validation_for_rule
 
 _HOST_PATTERN = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
@@ -46,8 +46,7 @@ class ValidationService:
 
     @staticmethod
     def _canary() -> str:
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        return f"THESIS_CANARY_{stamp}_{secrets.token_hex(6)}"
+        return generate_session_canary()
 
     def _app(self, session_id: str) -> dict[str, object]:
         paths = self.repository.paths_for(session_id)

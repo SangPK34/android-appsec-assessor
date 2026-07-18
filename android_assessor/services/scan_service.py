@@ -30,6 +30,7 @@ from ..scope import load_scope
 from ..session import SessionRecord, SessionRepository
 from ..storage import read_json_object, write_json_atomic
 from ..traffic import TrafficCaptureService
+from ..validation import generate_session_canary
 from .app_inspection_service import AppInspectionService
 from .cleanup_service import CleanupService
 
@@ -364,6 +365,9 @@ class ScanService:
         runtime_started_at: str | None = None
         exploration_result: ExplorerResult | None = None
         exploration_executed = False
+        assessment_canary = (
+            generate_session_canary() if profile is ScanProfile.FULL else None
+        )
         paths.runtime_control_json.unlink(missing_ok=True)
         write_json_atomic(
             paths.scan_json,
@@ -404,7 +408,11 @@ class ScanService:
             if profile is ScanProfile.FULL:
                 traffic_started_at = time.perf_counter()
                 try:
-                    traffic.start(record.session_id, launch_app=False)
+                    traffic.start(
+                        record.session_id,
+                        launch_app=False,
+                        canary=assessment_canary,
+                    )
                     traffic_started = True
                     steps["traffic_capture"] = "running"
                 except (AndroidAssessorError, OSError, ValueError) as exc:
@@ -423,7 +431,11 @@ class ScanService:
                     )
                 else:
                     try:
-                        frida.start(record.session_id, spawn=True)
+                        frida.start(
+                            record.session_id,
+                            spawn=True,
+                            canary=assessment_canary,
+                        )
                         frida_started = True
                         launched = True
                         steps["frida_observation"] = "running"
@@ -491,6 +503,7 @@ class ScanService:
                             feedback=feedback_collector.poll,
                             stop_requested=lambda: self._runtime_stop_requested(record.session_id),
                             network_guard_active=traffic_started,
+                            session_canary=assessment_canary,
                         )
                         runtime_termination = exploration_result.termination_reason
                         steps["autonomous_exploration"] = exploration_result.status
@@ -582,7 +595,10 @@ class ScanService:
                 backend = AdbPrivateStorageBackend(adb)
                 if record.serial.startswith("emulator-"):
                     backend.environment_type = "emulator"
-                PrivateStorageService(self.repository, backend).collect(record.session_id)
+                PrivateStorageService(self.repository, backend).collect(
+                    record.session_id,
+                    session_canary=assessment_canary,
+                )
                 steps["private_storage"] = "completed"
             except (AndroidAssessorError, OSError, ValueError) as exc:
                 steps["private_storage"] = "skipped"
@@ -591,7 +607,10 @@ class ScanService:
 
         logcat_started = time.perf_counter()
         try:
-            logcat = LogcatCollector(self.context, self.repository).collect(record.session_id)
+            logcat = LogcatCollector(self.context, self.repository).collect(
+                record.session_id,
+                canary=assessment_canary,
+            )
             steps["target_logcat"] = logcat.status
             if logcat.error:
                 limitations.append(logcat.error)
@@ -600,6 +619,30 @@ class ScanService:
             limitations.append(f"Target logcat skipped: {redact_text(str(exc))[:300]}")
         timed("logcat", logcat_started)
 
+        # Persist the execution outcome before rule evaluation so capability-
+        # dependent rules can distinguish an unavailable module from a failed
+        # planned execution. The final scan artifact is still written below.
+        steps["rules"] = "running"
+        write_json_atomic(
+            paths.scan_json,
+            {
+                "schema_version": 1,
+                "session_id": record.session_id,
+                "status": "running",
+                "dynamic_steps": steps,
+                "limitations": limitations,
+                "profile": profile.value,
+                "requested_profile": resolution.requested_profile,
+                "effective_profile": profile.value,
+                "autonomous_exploration_requested": (
+                    resolution.autonomous_exploration_requested
+                ),
+                "autonomous_exploration_executed": exploration_executed,
+                "phase_timings": phase_timings,
+                "runtime_termination": runtime_termination,
+            },
+            root=self.paths.root,
+        )
         rules_started = time.perf_counter()
         findings = RuleEngine(self.paths, self.repository).evaluate(record.session_id)
         steps["rules"] = "completed"

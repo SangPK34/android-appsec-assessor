@@ -278,8 +278,14 @@ def test_scan_stops_started_resources_when_wait_is_interrupted(
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
-        def start(self, session_id: str, *, launch_app: bool) -> None:
-            del session_id, launch_app
+        def start(
+            self,
+            session_id: str,
+            *,
+            launch_app: bool,
+            canary: str | None = None,
+        ) -> None:
+            del session_id, launch_app, canary
             calls.append("traffic_start")
 
         def stop(self, session_id: str) -> SimpleNamespace:
@@ -291,8 +297,14 @@ def test_scan_stops_started_resources_when_wait_is_interrupted(
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
-        def start(self, session_id: str, *, spawn: bool) -> None:
-            del session_id, spawn
+        def start(
+            self,
+            session_id: str,
+            *,
+            spawn: bool,
+            canary: str | None = None,
+        ) -> None:
+            del session_id, spawn, canary
             calls.append("frida_start")
 
         def stop(self, session_id: str) -> SimpleNamespace:

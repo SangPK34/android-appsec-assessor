@@ -112,6 +112,7 @@ def test_validation_canary_attribution_can_confirm_cleartext(tmp_path: Path) -> 
                 "cleartext": True,
                 "sensitive_query_keys": [],
                 "attribution": "validation_canary",
+                "canary_sink_types": ["http_header", "http_body"],
             }
         ],
     )
@@ -121,6 +122,10 @@ def test_validation_canary_attribution_can_confirm_cleartext(tmp_path: Path) -> 
     assert findings["ASL-MVP-002"].status is FindingStatus.CONFIRMED
     assert findings["ASL-MVP-003"].status is FindingStatus.CONFIRMED
     assert findings["ASL-MVP-003"].details["exact_canary_flow_count"] == 1
+    assert findings["ASL-MVP-003"].details["traffic_canary_sink_types"] == [
+        "http_body",
+        "http_header",
+    ]
 
 
 def test_sensitive_name_without_exact_canary_is_only_potential(tmp_path: Path) -> None:

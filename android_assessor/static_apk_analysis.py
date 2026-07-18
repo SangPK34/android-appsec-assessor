@@ -232,6 +232,7 @@ class StaticApkPolicy:
     max_dynamic_api_matches: int = 500
     max_policy_api_matches: int = 500
     max_embedded_code_entries: int = 500
+    max_security_api_matches: int = 500
 
     def __post_init__(self) -> None:
         numeric_values = asdict(self)
@@ -415,16 +416,20 @@ class StaticApkAnalysisResult:
     embedded_code: tuple[EmbeddedCodeEntry, ...]
     limitations: tuple[str, ...]
     metrics: dict[str, int]
+    security_api_candidates: tuple[ApiInventoryMatch, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": self.status,
             "sources": list(self.sources),
             "secret_candidates": [item.to_dict() for item in self.secret_candidates],
             "endpoints": [item.to_dict() for item in self.endpoints],
             "dynamic_loading_apis": [
                 item.to_dict() for item in self.dynamic_loading_apis
+            ],
+            "security_api_candidates": [
+                item.to_dict() for item in self.security_api_candidates
             ],
             "api_policy_matches": [item.to_dict() for item in self.api_policy_matches],
             "embedded_code": [item.to_dict() for item in self.embedded_code],
@@ -440,6 +445,7 @@ class _Collector:
     secrets: list[SecretCandidate] = field(default_factory=list)
     endpoints: list[EndpointCandidate] = field(default_factory=list)
     dynamic: list[ApiInventoryMatch] = field(default_factory=list)
+    security: list[ApiInventoryMatch] = field(default_factory=list)
     policy_matches: list[ApiPolicyMatch] = field(default_factory=list)
     embedded: list[EmbeddedCodeEntry] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
@@ -461,6 +467,7 @@ class _Collector:
     secret_keys: set[tuple[str, str, str]] = field(default_factory=set)
     endpoint_keys: set[tuple[str, str]] = field(default_factory=set)
     dynamic_keys: set[tuple[str, str, str, str, str]] = field(default_factory=set)
+    security_keys: set[tuple[str, str, str, str, str]] = field(default_factory=set)
     policy_keys: set[tuple[str, str, str, str]] = field(default_factory=set)
     embedded_keys: set[tuple[str, str]] = field(default_factory=set)
     source_sensitive_values: dict[str, list[str]] = field(default_factory=dict)
@@ -533,6 +540,360 @@ _DYNAMIC_API_PATTERNS: tuple[tuple[str, str, str, frozenset[str]], ...] = (
         frozenset({"load", "loadLibrary"}),
     ),
 )
+
+# These exact DEX method references are bounded inventory candidates only. A
+# method_id does not prove that a call is reachable, what arguments it receives,
+# or how an implementation behaves. Runtime correlation must establish those
+# properties before a candidate can support a security finding.
+_SECURITY_API_PATTERNS: tuple[
+    tuple[str, str, str, str, frozenset[str]], ...
+] = (
+    (
+        "WEBVIEW_JAVASCRIPT_ENABLED",
+        "webview",
+        "Landroid/webkit/WebSettings;",
+        "setJavaScriptEnabled",
+        frozenset({"(Z)V"}),
+    ),
+    (
+        "WEBVIEW_FILE_ACCESS",
+        "webview",
+        "Landroid/webkit/WebSettings;",
+        "setAllowFileAccess",
+        frozenset({"(Z)V"}),
+    ),
+    (
+        "WEBVIEW_CONTENT_ACCESS",
+        "webview",
+        "Landroid/webkit/WebSettings;",
+        "setAllowContentAccess",
+        frozenset({"(Z)V"}),
+    ),
+    (
+        "WEBVIEW_FILE_URL_ACCESS",
+        "webview",
+        "Landroid/webkit/WebSettings;",
+        "setAllowFileAccessFromFileURLs",
+        frozenset({"(Z)V"}),
+    ),
+    (
+        "WEBVIEW_UNIVERSAL_FILE_URL_ACCESS",
+        "webview",
+        "Landroid/webkit/WebSettings;",
+        "setAllowUniversalAccessFromFileURLs",
+        frozenset({"(Z)V"}),
+    ),
+    (
+        "WEBVIEW_MIXED_CONTENT_MODE",
+        "webview",
+        "Landroid/webkit/WebSettings;",
+        "setMixedContentMode",
+        frozenset({"(I)V"}),
+    ),
+    (
+        "WEBVIEW_JAVASCRIPT_INTERFACE",
+        "webview",
+        "Landroid/webkit/WebView;",
+        "addJavascriptInterface",
+        frozenset({"(Ljava/lang/Object;Ljava/lang/String;)V"}),
+    ),
+    (
+        "WEBVIEW_DEBUGGING",
+        "webview",
+        "Landroid/webkit/WebView;",
+        "setWebContentsDebuggingEnabled",
+        frozenset({"(Z)V"}),
+    ),
+    (
+        "WEBVIEW_LOAD_URL",
+        "webview",
+        "Landroid/webkit/WebView;",
+        "loadUrl",
+        frozenset(
+            {
+                "(Ljava/lang/String;)V",
+                "(Ljava/lang/String;Ljava/util/Map;)V",
+            }
+        ),
+    ),
+    (
+        "WEBVIEW_LOAD_DATA",
+        "webview",
+        "Landroid/webkit/WebView;",
+        "loadData",
+        frozenset(
+            {
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            }
+        ),
+    ),
+    (
+        "WEBVIEW_LOAD_DATA_BASE_URL",
+        "webview",
+        "Landroid/webkit/WebView;",
+        "loadDataWithBaseURL",
+        frozenset(
+            {
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+                "Ljava/lang/String;Ljava/lang/String;)V",
+            }
+        ),
+    ),
+    (
+        "WEBVIEW_EVALUATE_JAVASCRIPT",
+        "webview",
+        "Landroid/webkit/WebView;",
+        "evaluateJavascript",
+        frozenset(
+            {
+                "(Ljava/lang/String;Landroid/webkit/ValueCallback;)V",
+            }
+        ),
+    ),
+    (
+        "WEBVIEW_SSL_ERROR_PROCEED",
+        "webview_tls",
+        "Landroid/webkit/SslErrorHandler;",
+        "proceed",
+        frozenset({"()V"}),
+    ),
+    (
+        "TLS_SSL_CONTEXT_INIT",
+        "tls",
+        "Ljavax/net/ssl/SSLContext;",
+        "init",
+        frozenset(
+            {
+                "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;"
+                "Ljava/security/SecureRandom;)V",
+            }
+        ),
+    ),
+    (
+        "TLS_CHECK_SERVER_TRUSTED",
+        "tls",
+        "Ljavax/net/ssl/X509TrustManager;",
+        "checkServerTrusted",
+        frozenset(
+            {
+                "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
+            }
+        ),
+    ),
+    (
+        "TLS_HOSTNAME_VERIFY",
+        "tls",
+        "Ljavax/net/ssl/HostnameVerifier;",
+        "verify",
+        frozenset({"(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z"}),
+    ),
+    (
+        "TLS_SET_HOSTNAME_VERIFIER",
+        "tls",
+        "Ljavax/net/ssl/HttpsURLConnection;",
+        "setHostnameVerifier",
+        frozenset({"(Ljavax/net/ssl/HostnameVerifier;)V"}),
+    ),
+    (
+        "TLS_SET_DEFAULT_HOSTNAME_VERIFIER",
+        "tls",
+        "Ljavax/net/ssl/HttpsURLConnection;",
+        "setDefaultHostnameVerifier",
+        frozenset({"(Ljavax/net/ssl/HostnameVerifier;)V"}),
+    ),
+    (
+        "TLS_TRUST_MANAGER_FACTORY",
+        "tls",
+        "Ljavax/net/ssl/TrustManagerFactory;",
+        "getTrustManagers",
+        frozenset({"()[Ljavax/net/ssl/TrustManager;"}),
+    ),
+    (
+        "TLS_OKHTTP_CERTIFICATE_PINNER",
+        "tls_control",
+        "Lokhttp3/CertificatePinner;",
+        "check",
+        frozenset(
+            {
+                "(Ljava/lang/String;Ljava/util/List;)V",
+                "(Ljava/lang/String;[Ljava/security/cert/Certificate;)V",
+            }
+        ),
+    ),
+    (
+        "CRYPTO_CIPHER_INSTANCE",
+        "crypto",
+        "Ljavax/crypto/Cipher;",
+        "getInstance",
+        frozenset(
+            {
+                "(Ljava/lang/String;)Ljavax/crypto/Cipher;",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;",
+                "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Cipher;",
+            }
+        ),
+    ),
+    (
+        "CRYPTO_MESSAGE_DIGEST_INSTANCE",
+        "crypto",
+        "Ljava/security/MessageDigest;",
+        "getInstance",
+        frozenset(
+            {
+                "(Ljava/lang/String;)Ljava/security/MessageDigest;",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/MessageDigest;",
+                "(Ljava/lang/String;Ljava/security/Provider;)Ljava/security/MessageDigest;",
+            }
+        ),
+    ),
+    (
+        "CRYPTO_MAC_INSTANCE",
+        "crypto",
+        "Ljavax/crypto/Mac;",
+        "getInstance",
+        frozenset(
+            {
+                "(Ljava/lang/String;)Ljavax/crypto/Mac;",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
+                "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;",
+            }
+        ),
+    ),
+    (
+        "CRYPTO_SECRET_KEY_SPEC",
+        "crypto_material",
+        "Ljavax/crypto/spec/SecretKeySpec;",
+        "<init>",
+        frozenset(
+            {
+                "([BLjava/lang/String;)V",
+                "([BIILjava/lang/String;)V",
+            }
+        ),
+    ),
+    (
+        "CRYPTO_IV_PARAMETER_SPEC",
+        "crypto_material",
+        "Ljavax/crypto/spec/IvParameterSpec;",
+        "<init>",
+        frozenset({"([B)V", "([BII)V"}),
+    ),
+    (
+        "CRYPTO_PBE_PARAMETER_SPEC",
+        "crypto_material",
+        "Ljavax/crypto/spec/PBEParameterSpec;",
+        "<init>",
+        frozenset(
+            {
+                "([BI)V",
+                "([BILjava/security/spec/AlgorithmParameterSpec;)V",
+            }
+        ),
+    ),
+    (
+        "CRYPTO_PBE_KEY_SPEC",
+        "crypto_material",
+        "Ljavax/crypto/spec/PBEKeySpec;",
+        "<init>",
+        frozenset({"([C)V", "([C[BI)V", "([C[BII)V"}),
+    ),
+    (
+        "CRYPTO_SECURE_RANDOM_SEED",
+        "crypto_randomness",
+        "Ljava/security/SecureRandom;",
+        "setSeed",
+        frozenset({"(J)V", "([B)V"}),
+    ),
+    (
+        "CRYPTO_JAVA_RANDOM",
+        "crypto_randomness",
+        "Ljava/util/Random;",
+        "<init>",
+        frozenset({"()V", "(J)V"}),
+    ),
+    (
+        "CRYPTO_JAVA_RANDOM",
+        "crypto_randomness",
+        "Ljava/util/Random;",
+        "nextBytes",
+        frozenset({"([B)V"}),
+    ),
+    (
+        "PENDING_INTENT_ACTIVITY",
+        "pending_intent",
+        "Landroid/app/PendingIntent;",
+        "getActivity",
+        frozenset(
+            {
+                "(Landroid/content/Context;ILandroid/content/Intent;I)"
+                "Landroid/app/PendingIntent;",
+                "(Landroid/content/Context;ILandroid/content/Intent;I"
+                "Landroid/os/Bundle;)Landroid/app/PendingIntent;",
+            }
+        ),
+    ),
+    (
+        "PENDING_INTENT_ACTIVITIES",
+        "pending_intent",
+        "Landroid/app/PendingIntent;",
+        "getActivities",
+        frozenset(
+            {
+                "(Landroid/content/Context;I[Landroid/content/Intent;I)"
+                "Landroid/app/PendingIntent;",
+                "(Landroid/content/Context;I[Landroid/content/Intent;I"
+                "Landroid/os/Bundle;)Landroid/app/PendingIntent;",
+            }
+        ),
+    ),
+    (
+        "PENDING_INTENT_BROADCAST",
+        "pending_intent",
+        "Landroid/app/PendingIntent;",
+        "getBroadcast",
+        frozenset(
+            {
+                "(Landroid/content/Context;ILandroid/content/Intent;I)"
+                "Landroid/app/PendingIntent;",
+            }
+        ),
+    ),
+    (
+        "PENDING_INTENT_SERVICE",
+        "pending_intent",
+        "Landroid/app/PendingIntent;",
+        "getService",
+        frozenset(
+            {
+                "(Landroid/content/Context;ILandroid/content/Intent;I)"
+                "Landroid/app/PendingIntent;",
+            }
+        ),
+    ),
+    (
+        "PENDING_INTENT_FOREGROUND_SERVICE",
+        "pending_intent",
+        "Landroid/app/PendingIntent;",
+        "getForegroundService",
+        frozenset(
+            {
+                "(Landroid/content/Context;ILandroid/content/Intent;I)"
+                "Landroid/app/PendingIntent;",
+            }
+        ),
+    ),
+)
+
+_SECURITY_API_INDEX = {
+    key: tuple(
+        pattern
+        for pattern in _SECURITY_API_PATTERNS
+        if (pattern[2], pattern[3]) == key
+    )
+    for key in {
+        (pattern[2], pattern[3]) for pattern in _SECURITY_API_PATTERNS
+    }
+}
 
 
 def _uint32(data: bytes, offset: int) -> int:
@@ -1247,6 +1608,47 @@ def _record_method_reference(
                 )
             )
             break
+    for (
+        inventory_id,
+        category,
+        class_descriptor,
+        method_name,
+        prototypes,
+    ) in _SECURITY_API_INDEX.get(
+        (reference.class_descriptor, reference.method_name),
+        (),
+    ):
+        if (
+            reference.class_descriptor != class_descriptor
+            or reference.method_name != method_name
+            or reference.prototype not in prototypes
+        ):
+            continue
+        identity = (
+            inventory_id,
+            source_id,
+            dex_entry,
+            reference.method_name,
+            reference.prototype,
+        )
+        if identity in collector.security_keys:
+            break
+        if len(collector.security) >= collector.policy.max_security_api_matches:
+            collector.limit("security_api_matches")
+            break
+        collector.security_keys.add(identity)
+        collector.security.append(
+            ApiInventoryMatch(
+                inventory_id=inventory_id,
+                category=category,
+                source_id=source_id,
+                dex_entry=dex_entry,
+                class_descriptor=reference.class_descriptor,
+                method_name=reference.method_name,
+                prototype=reference.prototype,
+            )
+        )
+        break
     for entry in collector.api_policy:
         if (
             reference.class_descriptor != entry.class_descriptor
@@ -1571,6 +1973,42 @@ def analyze_apks(
                 ),
             )
             for item in collector.dynamic
+        ),
+        security_api_candidates=tuple(
+            replace(
+                item,
+                source_id=_safe_source_id(
+                    item.source_id,
+                    sensitive_values=sensitive_values,
+                ),
+                dex_entry=_safe_metadata_text(
+                    item.dex_entry,
+                    sensitive_values=sensitive_values,
+                ),
+                class_descriptor=_safe_metadata_text(
+                    item.class_descriptor,
+                    sensitive_values=sensitive_values,
+                ),
+                method_name=_safe_metadata_text(
+                    item.method_name,
+                    sensitive_values=sensitive_values,
+                ),
+                prototype=_safe_metadata_text(
+                    item.prototype,
+                    sensitive_values=sensitive_values,
+                ),
+            )
+            for item in sorted(
+                collector.security,
+                key=lambda value: (
+                    value.source_id,
+                    value.dex_entry,
+                    value.inventory_id,
+                    value.class_descriptor,
+                    value.method_name,
+                    value.prototype,
+                ),
+            )
         ),
         api_policy_matches=tuple(
             replace(

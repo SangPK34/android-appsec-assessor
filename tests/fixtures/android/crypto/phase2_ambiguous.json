@@ -1,0 +1,7 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "operations": [
+    {"operation_id": "md5-context-unknown", "operation_kind": "digest", "transformation": "MD5", "purpose": "digest", "executed": true, "key_length_bits": null, "key_sha256": null, "iv_sha256": null, "iv_source": "none", "key_origin": "unknown", "canary_match": false, "call_sequence": ["digest.digest"]}
+  ]
+}

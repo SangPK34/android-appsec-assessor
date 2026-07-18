@@ -1,0 +1,7 @@
+{
+  "source": "fixture",
+  "environment": "simulated",
+  "operations": [
+    {"operation_id": "raw-secret-rejected", "operation_kind": "cipher", "transformation": "AES/GCM/NoPadding", "purpose": "encrypt", "executed": true, "password": "must-not-survive-normalization", "canary_match": false}
+  ]
+}

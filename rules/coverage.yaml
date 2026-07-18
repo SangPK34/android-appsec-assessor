@@ -1,12 +1,39 @@
-schema_version: 1
+schema_version: 2
 statuses: [detected, partially_detected, observable_only, not_supported]
+detection_modes: [static, autonomous_runtime, controlled_validation, guided]
 id_kinds:
   production_rule: IDs present in rules/mvp.yaml and evaluated by RuleEngine.
   analyzer_result: IDs emitted by an analyzer but not independently evaluated by RuleEngine.
   inventory_only: IDs identify evidence inventory and never imply a finding.
   planned: ASL-PLANNED-* IDs describe explicit unsupported or deferred coverage.
+coverage_defaults: &coverage_defaults
+  detection_mode: static
+  activation_required: apk_inspection
+  manual_interaction_required: false
+  auto_confirm_possible: false
+  runtime_sources: []
+runtime_correlation_defaults: &runtime_correlation_defaults
+  <<: *coverage_defaults
+  detection_mode: autonomous_runtime
+  activation_required: autonomous_exploration
+  auto_confirm_possible: true
+  runtime_sources: [frida, autonomous_explorer]
+runtime_observation_defaults: &runtime_observation_defaults
+  <<: *coverage_defaults
+  detection_mode: autonomous_runtime
+  activation_required: autonomous_exploration
+  runtime_sources: [frida, autonomous_explorer]
+network_runtime_defaults: &network_runtime_defaults
+  <<: *runtime_correlation_defaults
+  activation_required: traffic_capture_and_autonomous_exploration
+  runtime_sources: [traffic, frida, autonomous_explorer]
+storage_runtime_defaults: &storage_runtime_defaults
+  <<: *runtime_correlation_defaults
+  activation_required: root_storage_and_autonomous_exploration
+  runtime_sources: [private_storage, frida, autonomous_explorer]
 rules:
   - rule_id: ASL-MVP-001
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: debug_test_configuration
     masvs_mapping: mapping_pending
@@ -20,6 +47,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-MANIFEST-ALLOW-BACKUP
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: backup_policy
     masvs_mapping: mapping_pending
@@ -33,6 +61,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-MVP-002
+    <<: *network_runtime_defaults
     id_kind: production_rule
     vulnerability_class: cleartext_network_policy
     masvs_mapping: mapping_pending
@@ -46,8 +75,10 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-MVP-003
+    <<: *network_runtime_defaults
+    runtime_sources: [traffic, logcat, frida, autonomous_explorer]
     id_kind: production_rule
-    vulnerability_class: sensitive_url_or_log_sink
+    vulnerability_class: sensitive_data_sink_exposure
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
     static_support: false
@@ -59,6 +90,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-MVP-004
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: exported_component_aggregate
     masvs_mapping: mapping_pending
@@ -72,6 +104,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-MANIFEST-EXPORTED-ACTIVITY
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: exported_activity_boundary
     masvs_mapping: mapping_pending
@@ -85,6 +118,7 @@ rules:
     implementation_status: detected
 
   - rule_id: ASL-MANIFEST-EXPORTED-SERVICE
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: exported_service_boundary
     masvs_mapping: mapping_pending
@@ -98,6 +132,7 @@ rules:
     implementation_status: detected
 
   - rule_id: ASL-MANIFEST-EXPORTED-RECEIVER
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: exported_receiver_boundary
     masvs_mapping: mapping_pending
@@ -111,6 +146,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-MANIFEST-EXPORTED-PROVIDER
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: exported_provider_read_write_boundary
     masvs_mapping: mapping_pending
@@ -124,6 +160,7 @@ rules:
     implementation_status: detected
 
   - rule_id: ASL-MANIFEST-CUSTOM-PERMISSION
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: custom_permission_protection
     masvs_mapping: mapping_pending
@@ -137,6 +174,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-MANIFEST-FILEPROVIDER-PATHS
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: fileprovider_path_exposure
     masvs_mapping: mapping_pending
@@ -150,6 +188,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-MANIFEST-DEEP-LINK-EXPOSURE
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: deep_link_restrictions
     masvs_mapping: mapping_pending
@@ -163,6 +202,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-STATIC-HARDCODED-SECRET
+    <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: hardcoded_secret
     masvs_mapping: mapping_pending
@@ -176,6 +216,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-INVENTORY-ENDPOINTS
+    <<: *coverage_defaults
     id_kind: inventory_only
     vulnerability_class: endpoint_inventory
     masvs_mapping: mapping_pending
@@ -189,6 +230,7 @@ rules:
     implementation_status: observable_only
 
   - rule_id: ASL-INVENTORY-DYNAMIC-CODE
+    <<: *coverage_defaults
     id_kind: inventory_only
     vulnerability_class: dynamic_code_loading
     masvs_mapping: mapping_pending
@@ -202,6 +244,7 @@ rules:
     implementation_status: observable_only
 
   - rule_id: ASL-INVENTORY-DEPRECATED-API
+    <<: *coverage_defaults
     id_kind: inventory_only
     vulnerability_class: banned_deprecated_api
     masvs_mapping: mapping_pending
@@ -214,7 +257,22 @@ rules:
     default_profile: quick
     implementation_status: observable_only
 
+  - rule_id: ASL-INVENTORY-SECURITY-API
+    <<: *coverage_defaults
+    id_kind: inventory_only
+    vulnerability_class: security_api_candidate_inventory
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: true
+    runtime_support: false
+    root_required: false
+    frida_required: false
+    controlled_validation_available: false
+    default_profile: quick
+    implementation_status: observable_only
+
   - rule_id: ASL-RUNTIME-WEBVIEW
+    <<: *runtime_observation_defaults
     id_kind: production_rule
     vulnerability_class: webview_security
     masvs_mapping: mapping_pending
@@ -227,7 +285,52 @@ rules:
     default_profile: full
     implementation_status: observable_only
 
+  - rule_id: WEBVIEW-JS-BRIDGE-REMOTE
+    <<: *runtime_correlation_defaults
+    id_kind: production_rule
+    vulnerability_class: webview_javascript_bridge_remote_content
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: false
+    runtime_support: true
+    root_required: false
+    frida_required: true
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: partially_detected
+    auto_confirm_possible: false
+
+  - rule_id: WEBVIEW-UNSAFE-SETTINGS
+    <<: *runtime_correlation_defaults
+    id_kind: production_rule
+    vulnerability_class: webview_unsafe_runtime_settings
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: false
+    runtime_support: true
+    root_required: false
+    frida_required: true
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: partially_detected
+    auto_confirm_possible: false
+
+  - rule_id: WEBVIEW-SSL-ERROR-PROCEED
+    <<: *runtime_correlation_defaults
+    id_kind: production_rule
+    vulnerability_class: webview_ssl_error_bypass
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: true
+    runtime_support: true
+    root_required: false
+    frida_required: false
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: detected
+
   - rule_id: ASL-MVP-005
+    <<: *network_runtime_defaults
     id_kind: production_rule
     vulnerability_class: tls_certificate_validation
     masvs_mapping: mapping_pending
@@ -241,6 +344,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: CRYPTO-ECB
+    <<: *runtime_correlation_defaults
     id_kind: production_rule
     vulnerability_class: insecure_cipher_mode
     masvs_mapping: mapping_pending
@@ -254,6 +358,7 @@ rules:
     implementation_status: detected
 
   - rule_id: CRYPTO-WEAK-ALGORITHM
+    <<: *runtime_correlation_defaults
     id_kind: production_rule
     vulnerability_class: weak_cryptographic_algorithm
     masvs_mapping: mapping_pending
@@ -267,6 +372,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: CRYPTO-COVERAGE
+    <<: *runtime_observation_defaults
     id_kind: analyzer_result
     vulnerability_class: crypto_runtime_coverage
     masvs_mapping: mapping_pending
@@ -280,7 +386,8 @@ rules:
     implementation_status: observable_only
 
   - rule_id: CRYPTO-SHORT-KEY
-    id_kind: analyzer_result
+    <<: *runtime_correlation_defaults
+    id_kind: production_rule
     vulnerability_class: weak_symmetric_key_length
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
@@ -292,7 +399,22 @@ rules:
     default_profile: full
     implementation_status: partially_detected
 
+  - rule_id: CRYPTO-ZERO-IV
+    <<: *runtime_correlation_defaults
+    id_kind: production_rule
+    vulnerability_class: zero_initialization_vector
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: false
+    runtime_support: true
+    root_required: false
+    frida_required: true
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: detected
+
   - rule_id: CRYPTO-STATIC-IV
+    <<: *runtime_observation_defaults
     id_kind: analyzer_result
     vulnerability_class: static_initialization_vector
     masvs_mapping: mapping_pending
@@ -306,7 +428,8 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: CRYPTO-REUSED-IV
-    id_kind: analyzer_result
+    <<: *runtime_correlation_defaults
+    id_kind: production_rule
     vulnerability_class: reused_initialization_vector
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
@@ -318,7 +441,52 @@ rules:
     default_profile: full
     implementation_status: partially_detected
 
+  - rule_id: CRYPTO-WEAK-DIGEST
+    <<: *runtime_correlation_defaults
+    id_kind: production_rule
+    vulnerability_class: weak_digest_or_mac
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: false
+    runtime_support: true
+    root_required: false
+    frida_required: true
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: partially_detected
+    auto_confirm_possible: false
+
+  - rule_id: CRYPTO-LOW-PBE-ITERATIONS
+    <<: *runtime_correlation_defaults
+    id_kind: production_rule
+    vulnerability_class: low_password_derivation_iterations
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: false
+    runtime_support: true
+    root_required: false
+    frida_required: true
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: partially_detected
+    auto_confirm_possible: false
+
+  - rule_id: CRYPTO-PREDICTABLE-RANDOM
+    <<: *runtime_correlation_defaults
+    id_kind: production_rule
+    vulnerability_class: predictable_random_cryptographic_material
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: false
+    runtime_support: true
+    root_required: false
+    frida_required: true
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: detected
+
   - rule_id: CRYPTO-STATIC-KEY
+    <<: *runtime_observation_defaults
     id_kind: analyzer_result
     vulnerability_class: static_runtime_key_material
     masvs_mapping: mapping_pending
@@ -332,6 +500,7 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: CRYPTO-CANARY-BOUNDARY
+    <<: *runtime_observation_defaults
     id_kind: analyzer_result
     vulnerability_class: crypto_canary_boundary
     masvs_mapping: mapping_pending
@@ -345,6 +514,7 @@ rules:
     implementation_status: observable_only
 
   - rule_id: CRYPTO-TRANSFORMATION-INCOMPLETE
+    <<: *runtime_observation_defaults
     id_kind: analyzer_result
     vulnerability_class: incomplete_crypto_transformation
     masvs_mapping: mapping_pending
@@ -358,6 +528,7 @@ rules:
     implementation_status: observable_only
 
   - rule_id: CRYPTO-POLICY
+    <<: *runtime_observation_defaults
     id_kind: analyzer_result
     vulnerability_class: crypto_policy_aggregate
     masvs_mapping: mapping_pending
@@ -371,6 +542,7 @@ rules:
     implementation_status: observable_only
 
   - rule_id: ASL-RUNTIME-LOGGING
+    <<: *runtime_observation_defaults
     id_kind: production_rule
     vulnerability_class: sensitive_logging
     masvs_mapping: mapping_pending
@@ -384,6 +556,9 @@ rules:
     implementation_status: partially_detected
 
   - rule_id: ASL-RUNTIME-STORAGE
+    <<: *runtime_observation_defaults
+    activation_required: root_storage_analysis
+    runtime_sources: [private_storage]
     id_kind: production_rule
     vulnerability_class: sensitive_private_storage
     masvs_mapping: mapping_pending
@@ -396,7 +571,51 @@ rules:
     default_profile: full
     implementation_status: observable_only
 
+  - rule_id: STORAGE-WORLD-READABLE
+    <<: *storage_runtime_defaults
+    id_kind: production_rule
+    vulnerability_class: world_readable_private_storage
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: false
+    runtime_support: true
+    root_required: true
+    frida_required: false
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: detected
+
+  - rule_id: STORAGE-WORLD-WRITABLE
+    <<: *storage_runtime_defaults
+    id_kind: production_rule
+    vulnerability_class: world_writable_private_storage
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: false
+    runtime_support: true
+    root_required: true
+    frida_required: false
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: detected
+
+  - rule_id: STORAGE-SENSITIVE-CANARY
+    <<: *storage_runtime_defaults
+    activation_required: autonomous_exploration_with_frida_or_root_storage
+    id_kind: production_rule
+    vulnerability_class: exact_canary_plaintext_storage
+    masvs_mapping: mapping_pending
+    mastg_mapping: mapping_pending
+    static_support: false
+    runtime_support: true
+    root_required: false
+    frida_required: false
+    controlled_validation_available: false
+    default_profile: full
+    implementation_status: detected
+
   - rule_id: ASL-RUNTIME-ROOT
+    <<: *runtime_observation_defaults
     id_kind: production_rule
     vulnerability_class: root_detection_behavior
     masvs_mapping: mapping_pending
@@ -409,20 +628,22 @@ rules:
     default_profile: full
     implementation_status: observable_only
 
-  - rule_id: ASL-PLANNED-PENDING-INTENT
-    id_kind: planned
-    vulnerability_class: pending_intent_misuse
+  - rule_id: ASL-INVENTORY-PENDING-INTENT
+    <<: *coverage_defaults
+    id_kind: inventory_only
+    vulnerability_class: pending_intent_api_inventory
     masvs_mapping: mapping_pending
     mastg_mapping: mapping_pending
-    static_support: false
+    static_support: true
     runtime_support: false
     root_required: false
     frida_required: false
     controlled_validation_available: false
-    default_profile: full
-    implementation_status: not_supported
+    default_profile: quick
+    implementation_status: observable_only
 
   - rule_id: ASL-PLANNED-TASK-HIJACKING
+    <<: *coverage_defaults
     id_kind: planned
     vulnerability_class: task_hijacking_ui_protection
     masvs_mapping: mapping_pending
@@ -436,6 +657,7 @@ rules:
     implementation_status: not_supported
 
   - rule_id: ASL-PLANNED-LOCAL-SQLI
+    <<: *coverage_defaults
     id_kind: planned
     vulnerability_class: local_sql_injection
     masvs_mapping: mapping_pending
@@ -449,6 +671,7 @@ rules:
     implementation_status: observable_only
 
   - rule_id: ASL-PLANNED-PATH-TRAVERSAL
+    <<: *coverage_defaults
     id_kind: planned
     vulnerability_class: path_traversal
     masvs_mapping: mapping_pending
@@ -462,6 +685,7 @@ rules:
     implementation_status: not_supported
 
   - rule_id: ASL-PLANNED-DESERIALIZATION
+    <<: *coverage_defaults
     id_kind: planned
     vulnerability_class: unsafe_deserialization
     masvs_mapping: mapping_pending

@@ -415,6 +415,7 @@ def _run(
     manifest: dict[str, object] | None = None,
     config: ExplorerConfig | None = None,
     network_guard_active: bool = True,
+    session_canary: str | None = None,
 ) -> tuple[object, FakeClock, AndroidExplorer]:
     clock = FakeClock()
     if isinstance(backend, SlowTerminalBackend):
@@ -441,6 +442,7 @@ def _run(
             len(backend.methods),
         ),
         network_guard_active=network_guard_active,
+        session_canary=session_canary,
         clock=clock,
         sleeper=clock.sleep,
     )
@@ -886,6 +888,27 @@ def test_form_aware_retry_fills_minimum_input_and_retries_once() -> None:
     assert "crypto" in result.runtime_categories
 
 
+def test_form_aware_retry_uses_exact_session_canary_without_tracing_value() -> None:
+    backend = FormRetryBackend()
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    _result, _, explorer = _run(
+        backend,
+        package="org.lab.form",
+        session_canary=canary,
+        config=ExplorerConfig(
+            max_runtime_seconds=10,
+            plateau_seconds=1,
+            max_states=5,
+            max_actions=10,
+            per_action_timeout_seconds=1,
+            monkey_events=0,
+        ),
+    )
+
+    assert backend.inputs == [canary]
+    assert canary not in json.dumps(explorer.trace)
+
+
 def test_seeded_traversal_is_deterministic_and_deduplicates_actions() -> None:
     first_backend = FakeBackend()
     first, _, first_explorer = _run(first_backend)
@@ -1141,6 +1164,35 @@ def test_activity_and_deep_link_discovery_enforce_allowlisted_hosts() -> None:
         and item.get("reason") == "activity_not_resumed"
         for item in result.activity_attempts
     )
+
+
+def test_allowlisted_deep_link_uses_exact_session_canary() -> None:
+    backend = FakeBackend()
+    canary = "THESIS_CANARY_20260718T010203Z_deadbeefcafe"
+    _run(
+        backend,
+        session_canary=canary,
+        manifest={
+            "deep_links": [
+                {
+                    "component": "com.example.app.MainActivity",
+                    "scheme": "https",
+                    "host": "10.0.2.2",
+                    "path": "/lab",
+                }
+            ]
+        },
+        config=ExplorerConfig(
+            max_runtime_seconds=3,
+            plateau_seconds=1,
+            max_states=2,
+            max_actions=1,
+            per_action_timeout_seconds=1,
+            monkey_events=0,
+        ),
+    )
+
+    assert backend.deep_links == [f"https://10.0.2.2/lab?asl={canary}"]
 
 
 def test_deep_link_manifest_path_is_percent_encoded_before_dispatch() -> None:
