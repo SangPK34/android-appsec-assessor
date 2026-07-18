@@ -880,8 +880,65 @@ class RuleEngine:
                     ]
                 if ipc_routes:
                     outcomes = {str(item.get("outcome")) for item in ipc_routes}
+                    outcome_counts: dict[str, int] = {}
+                    for route in ipc_routes:
+                        outcome = str(route.get("outcome"))
+                        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+                    attempted_routes = [
+                        route for route in ipc_routes if route.get("attempted") is True
+                    ]
+                    observable_routes = [
+                        route
+                        for route in ipc_routes
+                        if route.get("observable_impact") is True
+                    ]
+                    blockers = tuple(
+                        dict.fromkeys(
+                            str(route.get("reason"))
+                            for route in ipc_routes
+                            if route.get("outcome")
+                            in {
+                                "inconclusive",
+                                "not_exercised",
+                                "out_of_scope",
+                            }
+                            and isinstance(route.get("reason"), str)
+                            and route["reason"]
+                        )
+                    )
+                    if outcomes == {"confirmed"}:
+                        validation_state = "confirmed"
+                    elif outcomes == {"rejected_for_tested_route"}:
+                        validation_state = "rejected_for_tested_route"
+                    elif outcomes == {"not_exercised"}:
+                        validation_state = "not_exercised"
+                    elif outcomes == {"out_of_scope"}:
+                        validation_state = "out_of_scope"
+                    elif outcomes == {"inconclusive"}:
+                        validation_state = "inconclusive"
+                    else:
+                        validation_state = "partial"
+                    activation_state = (
+                        "reached"
+                        if observable_routes
+                        else "not_exercised"
+                        if not attempted_routes
+                        else "attempted_inconclusive"
+                    )
                     details["ipc_validation"] = {
                         "route_count": len(ipc_routes),
+                        "outcome_counts": outcome_counts,
+                        "attempted_count": len(attempted_routes),
+                        "runtime_reached": (
+                            True
+                            if observable_routes
+                            else False
+                            if attempted_routes
+                            else None
+                        ),
+                        "activation_state": activation_state,
+                        "validation_state": validation_state,
+                        "auto_validation_blocker": list(blockers),
                         "routes": ipc_routes,
                         "artifact": "redacted/ipc/exported-components.json",
                         "evidence_id": context.get("ipc_evidence_id"),
@@ -901,22 +958,27 @@ class RuleEngine:
                         )
                         details["missing_evidence"] = []
                     else:
-                        selected_status = (
-                            FindingStatus.INCONCLUSIVE
-                            if outcomes & {
-                                "inconclusive",
-                                "not_exercised",
-                                "out_of_scope",
-                            }
-                            else selected.finding_status
-                        )
-                        details["reason"] = (
-                            "The bounded manifest-derived route was attempted, but no "
-                            "attributed observable impact was established."
-                        )
-                        details["missing_evidence"] = [
-                            "observable impact for every manifest-derived IPC route"
-                        ]
+                        # Manifest detection and route validation answer different
+                        # questions.  A bounded route that was not exercised or was
+                        # inconclusive must not erase a credible static candidate.
+                        selected_status = selected.finding_status
+                        if selected_status is FindingStatus.POTENTIAL:
+                            details["reason"] = (
+                                "A manifest-derived component boundary remains a "
+                                "potential finding; bounded automatic IPC validation "
+                                f"was {validation_state}."
+                            )
+                            details["missing_evidence"] = [
+                                "candidate-scoped route activation under the bounded "
+                                "validator safety contract",
+                                "package-attributed observable impact or a tested "
+                                "permission-boundary rejection",
+                            ]
+                        elif selected_status is FindingStatus.INCONCLUSIVE:
+                            details["reason"] = (
+                                "Manifest protection analysis remains inconclusive; "
+                                f"bounded automatic IPC validation was {validation_state}."
+                            )
                     selected_finding_status = selected_status
                     analysis_type = "adb_ipc_validation"
                 else:

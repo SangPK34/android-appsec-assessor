@@ -8,6 +8,15 @@ redaction:
   package_identifiers_included: false
 
 sessions:
+  - session_id: 20260719-064709-99f0ba
+    report_sha256: a8988c0b0a99732a77de5b37d091fd01d288029c1ec89c73b664fc4d2713afb9
+    security_rules_evaluated: 30
+    confirmed: 4
+    potential: 10
+    pass: 6
+    inconclusive: 10
+    skipped: 0
+    error: 0
   - session_id: 20260719-061843-f776de
     report_sha256: 540a52c1c123be4a3bb73379c1d5858293d554ab4720ff2f82f8a9d021f26127
     security_rules_evaluated: 31
@@ -64,6 +73,12 @@ sessions:
     inconclusive: 13
 
 cases:
+  - case_id: exported_ipc_candidate_state_preservation
+    session_id: 20260719-064709-99f0ba
+    outcome: potential
+    tested_scope: normalized_exported_receiver_and_provider_bounded_auto_routes
+    evidence: Manifest-derived missing permission boundaries remained potential when the receiver action was refused by the bounded safety contract or the provider authority root URI was inconclusive. Each route records activation state, validation state, runtime reachability, and a route-scoped blocker; no route was confirmed without attributable impact.
+
   - case_id: candidate_micro_scenario_activation
     session_id: 20260719-061843-f776de
     outcome: inconclusive

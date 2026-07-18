@@ -228,3 +228,37 @@ def test_root_coverage_and_experiment_csv_are_bounded_and_hashed(tmp_path: Path)
         "report_json",
         "experiment_results_csv",
     }
+
+
+def test_report_renders_detection_activation_and_missing_evidence(tmp_path: Path) -> None:
+    paths, repository, session_id = _project(tmp_path)
+    FindingRepository(paths, repository).save(
+        session_id,
+        [
+            _finding(
+                "IPC-ROUTE-001",
+                root_required=False,
+                root_used=False,
+                frida_used=False,
+                details={
+                    "reason": "Manifest candidate remains potential.",
+                    "missing_evidence": ["candidate-scoped route activation"],
+                    "ipc_validation": {
+                        "activation_state": "not_exercised",
+                        "validation_state": "not_exercised",
+                        "runtime_reached": None,
+                        "auto_validation_blocker": ["bounded action refused"],
+                    },
+                },
+            )
+        ],
+    )
+
+    ReportService(paths, repository).generate(session_id)
+    html = repository.paths_for(session_id).report_html.read_text(encoding="utf-8")
+
+    assert "Detection / activation" in html
+    assert "Manifest candidate remains potential." in html
+    assert "activation=not_exercised" in html
+    assert "candidate-scoped route activation" in html
+    assert "bounded action refused" in html

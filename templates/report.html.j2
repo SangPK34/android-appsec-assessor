@@ -60,7 +60,7 @@
 
   <h2>Findings and coverage</h2>
   <table>
-    <thead><tr><th>Rule</th><th>Status</th><th>Title</th><th>Method</th><th>Validation</th><th>Evidence</th><th>Remediation</th></tr></thead>
+    <thead><tr><th>Rule</th><th>Status</th><th>Title</th><th>Method</th><th>Detection / activation</th><th>Validation</th><th>Evidence</th><th>Remediation</th></tr></thead>
     <tbody>
     {% for finding in report.findings %}
       <tr>
@@ -68,6 +68,7 @@
         <td class="{{ finding.status }}">{{ finding.status }}</td>
         <td>{{ finding.title }}<br><small>{{ finding.description }}</small></td>
         <td>{{ finding.analysis_type }}<br><small>root={{ finding.root_used }}, frida={{ finding.frida_used }}, validation={{ finding.validation_type }}</small></td>
+        <td><small>{{ finding.details.reason or '-' }}</small>{% if finding.details.ipc_validation %}<br><small>activation={{ finding.details.ipc_validation.activation_state }}, validation={{ finding.details.ipc_validation.validation_state }}, reached={{ finding.details.ipc_validation.runtime_reached }}</small>{% if finding.details.ipc_validation.auto_validation_blocker %}<br><small>blocker={{ finding.details.ipc_validation.auto_validation_blocker | join('; ') }}</small>{% endif %}{% endif %}{% if finding.details.missing_evidence %}<br><small>missing={{ finding.details.missing_evidence | join('; ') }}</small>{% endif %}</td>
         <td>{% if finding.validation %}{{ finding.validation.status }} · {{ finding.validation.validation_type }}<br>{{ finding.validation.summary }}{% else %}-{% endif %}</td>
         <td>{% for evidence_id in finding.evidence_ids %}<code>{{ evidence_id }}</code><br>{% endfor %}</td>
         <td>{{ finding.remediation }}</td>

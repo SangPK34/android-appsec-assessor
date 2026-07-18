@@ -371,6 +371,100 @@ def test_quota_marks_remaining_routes_not_exercised(tmp_path: Path) -> None:
     assert any(route.outcome is IpcRouteOutcome.NOT_EXERCISED for route in result.routes)
 
 
+def test_unexercised_receiver_preserves_manifest_potential(tmp_path: Path) -> None:
+    manifest = _manifest()
+    manifest["components"] = [
+        {
+            "component_type": "receiver",
+            "name": f"{PACKAGE}.UnboundedReceiver",
+            "effective_exported": True,
+            "enabled": True,
+            "permission": None,
+            "intent_filters": [{"actions": [f"{PACKAGE}.SYNC"]}],
+        }
+    ]
+    paths, repository, session_id = _session(tmp_path, manifest)
+    result = ExportedComponentValidationService(paths_context(paths), repository).run(
+        session_id,
+        adb=ScriptedIpcAdb(),
+        scope=load_scope_for_test(paths),
+    )
+
+    receiver = result.routes[0]
+    assert receiver.outcome is IpcRouteOutcome.NOT_EXERCISED
+    findings = {
+        item.rule_id: item for item in RuleEngine(paths, repository).evaluate(session_id)
+    }
+    finding = findings["ASL-MANIFEST-EXPORTED-RECEIVER"]
+
+    assert finding.status is FindingStatus.POTENTIAL
+    assert finding.analysis_type == "adb_ipc_validation"
+    validation = finding.details["ipc_validation"]
+    assert validation["activation_state"] == "not_exercised"
+    assert validation["validation_state"] == "not_exercised"
+    assert validation["runtime_reached"] is None
+    assert "potential finding" in finding.details["reason"]
+
+
+def test_inconclusive_provider_preserves_manifest_potential(tmp_path: Path) -> None:
+    manifest = _manifest()
+    manifest["components"] = [
+        {
+            "component_type": "provider",
+            "name": f"{PACKAGE}.UnknownProvider",
+            "effective_exported": True,
+            "enabled": True,
+            "permission": None,
+            "read_permission": None,
+            "authorities": f"{PACKAGE}.unknown",
+            "intent_filters": [],
+        }
+    ]
+    paths, repository, session_id = _session(tmp_path, manifest)
+    result = ExportedComponentValidationService(paths_context(paths), repository).run(
+        session_id,
+        adb=ScriptedIpcAdb(mode="provider_unknown"),
+        scope=load_scope_for_test(paths),
+    )
+
+    provider = result.routes[0]
+    assert provider.outcome is IpcRouteOutcome.INCONCLUSIVE
+    findings = {
+        item.rule_id: item for item in RuleEngine(paths, repository).evaluate(session_id)
+    }
+    finding = findings["ASL-MANIFEST-EXPORTED-PROVIDER"]
+
+    assert finding.status is FindingStatus.POTENTIAL
+    validation = finding.details["ipc_validation"]
+    assert validation["activation_state"] == "attempted_inconclusive"
+    assert validation["validation_state"] == "inconclusive"
+    assert validation["runtime_reached"] is False
+    assert validation["outcome_counts"] == {"inconclusive": 1}
+
+
+def test_permission_rejection_remains_route_scoped_pass(tmp_path: Path) -> None:
+    manifest = _manifest(protected=True)
+    manifest["components"] = [manifest["components"][0]]
+    paths, repository, session_id = _session(tmp_path, manifest)
+    result = ExportedComponentValidationService(paths_context(paths), repository).run(
+        session_id,
+        adb=ScriptedIpcAdb(mode="activity_denied"),
+        scope=load_scope_for_test(paths),
+    )
+
+    assert result.routes[0].outcome is IpcRouteOutcome.REJECTED
+    findings = {
+        item.rule_id: item for item in RuleEngine(paths, repository).evaluate(session_id)
+    }
+    finding = findings["ASL-MANIFEST-EXPORTED-ACTIVITY"]
+
+    assert finding.status is FindingStatus.PASS
+    validation = finding.details["ipc_validation"]
+    assert validation["validation_state"] == "rejected_for_tested_route"
+    assert validation["runtime_reached"] is False
+    assert "tested route" in finding.details["reason"]
+
+
 def paths_context(paths: ProjectPaths) -> SimpleNamespace:
     return SimpleNamespace(paths=paths)
 
