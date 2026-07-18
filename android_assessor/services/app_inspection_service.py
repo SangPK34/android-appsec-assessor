@@ -46,6 +46,23 @@ _MANIFEST_COLLECTION_FIELDS = (
     "deep_links",
     "file_provider_paths",
 )
+_MANIFEST_BOOLEAN_FIELDS = (
+    "debuggable",
+    "test_only",
+    "uses_cleartext_traffic",
+    "allow_backup",
+    "application_enabled",
+)
+_COMPONENT_BOOLEAN_FIELDS = (
+    "exported",
+    "effective_exported",
+    "enabled",
+    "grant_uri_permissions",
+    "direct_boot_aware",
+    "stop_with_task",
+    "isolated_process",
+    "multiprocess",
+)
 
 
 def _merge_manifest_payloads(
@@ -61,10 +78,34 @@ def _merge_manifest_payloads(
     merged["manifest_sources"] = [source for source, _payload in values]
     merged["manifest_limitations"] = list(dict.fromkeys(limitations))
     merged["manifest_complete"] = not limitations
+    for field_name in _MANIFEST_BOOLEAN_FIELDS:
+        observed = [
+            (source, payload.get(field_name))
+            for source, payload in values
+            if isinstance(payload.get(field_name), bool)
+        ]
+        if not observed:
+            merged[field_name] = None
+            continue
+        merged[field_name] = observed[0][1]
+        if any(value != observed[0][1] for _source, value in observed[1:]):
+            merged[field_name] = None
+            conflicting_source = next(
+                source
+                for source, value in observed[1:]
+                if value != observed[0][1]
+            )
+            limitations.append(
+                f"{conflicting_source}:conflicting_manifest_boolean:{field_name}"
+            )
     for field_name in _MANIFEST_COLLECTION_FIELDS:
         rows: list[dict[str, Any]] = []
         exact: set[str] = set()
         component_identities: dict[tuple[str, str], str] = {}
+        component_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        component_boolean_values: dict[
+            tuple[str, str], dict[str, set[bool]]
+        ] = {}
         custom_permission_identities: dict[str, str] = {}
         for source, payload in values:
             raw_rows = payload.get(field_name, [])
@@ -86,11 +127,36 @@ def _merge_manifest_payloads(
                         str(raw_row.get("name", "")),
                     )
                     previous = component_identities.get(component_key)
+                    boolean_values = component_boolean_values.setdefault(
+                        component_key,
+                        {},
+                    )
+                    conflicting_boolean_fields: list[str] = []
+                    for boolean_field in _COMPONENT_BOOLEAN_FIELDS:
+                        current_value = raw_row.get(boolean_field)
+                        if not isinstance(current_value, bool):
+                            continue
+                        observed_values = boolean_values.setdefault(boolean_field, set())
+                        observed_values.add(current_value)
+                        if len(observed_values) > 1:
+                            conflicting_boolean_fields.append(boolean_field)
                     if previous is not None and previous != identity:
                         limitations.append(
                             f"{source}:conflicting_component:{component_key[0]}"
                         )
+                        previous_rows = component_rows.get(component_key, [])
+                        for boolean_field in conflicting_boolean_fields:
+                            row[boolean_field] = None
+                            for previous_row in previous_rows:
+                                previous_row[boolean_field] = None
+                            if boolean_field in {"exported", "effective_exported"}:
+                                row["exported_source"] = "conflicting_split_values"
+                                for previous_row in previous_rows:
+                                    previous_row["exported_source"] = (
+                                        "conflicting_split_values"
+                                    )
                     component_identities[component_key] = identity
+                    component_rows.setdefault(component_key, []).append(row)
                 elif field_name == "custom_permissions":
                     permission_name = str(raw_row.get("name", ""))
                     previous = custom_permission_identities.get(permission_name)

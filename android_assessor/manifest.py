@@ -127,6 +127,8 @@ class ComponentInfo:
     intent_filters: tuple[IntentFilter, ...]
     grant_uri_permissions: bool | None = None
     direct_boot_aware: bool | None = None
+    stop_with_task: bool | None = None
+    isolated_process: bool | None = None
     multiprocess: bool | None = None
     foreground_service_type: str | None = None
     meta_data: tuple[ManifestMetaData, ...] = ()
@@ -149,6 +151,8 @@ class ComponentInfo:
             "intent_filters": [item.to_dict() for item in self.intent_filters],
             "grant_uri_permissions": self.grant_uri_permissions,
             "direct_boot_aware": self.direct_boot_aware,
+            "stop_with_task": self.stop_with_task,
+            "isolated_process": self.isolated_process,
             "multiprocess": self.multiprocess,
             "foreground_service_type": self.foreground_service_type,
             "meta_data": [item.to_dict() for item in self.meta_data],
@@ -256,7 +260,10 @@ class AaptInspection:
 
 _ELEMENT_PATTERN = re.compile(r"^(?P<indent>\s*)E:\s+(?P<tag>[A-Za-z0-9_.-]+)")
 _ATTRIBUTE_PATTERN = re.compile(r"^(?P<indent>\s*)A:\s+(?P<label>.+?)=(?P<value>.*)$")
-_RAW_VALUE_PATTERN = re.compile(r'\(Raw:\s*"((?:\\.|[^"\\])*)"\)')
+_RAW_VALUE_PATTERN = re.compile(
+    r'\(Raw:\s*"((?:\\.|[^"\\])*)"\)',
+    re.IGNORECASE,
+)
 _SYMBOLIC_XML_REFERENCE = re.compile(
     r"^@(?:(?:[A-Za-z0-9_.]+):)?xml/(?P<name>[A-Za-z0-9_.-]+)$"
 )
@@ -275,6 +282,14 @@ _MAX_RESOURCE_STRINGS = 50_000
 _MAX_RESOURCE_STRING_LENGTH = 4096
 
 
+def _canonical_boolean_numeric(value: int) -> bool | None:
+    if value == 0:
+        return False
+    if value in {-1, 1, 0xFFFFFFFF}:
+        return True
+    return None
+
+
 def _parse_attribute_value(raw: str) -> str | bool | int:
     value = raw.strip()
     raw_match = _RAW_VALUE_PATTERN.search(value)
@@ -287,7 +302,8 @@ def _parse_attribute_value(raw: str) -> str | bool | int:
         type_id = int(typed.group(1), 16)
         numeric = int(typed.group(2), 0)
         if type_id == 0x12:
-            return numeric != 0
+            normalized = _canonical_boolean_numeric(numeric)
+            return normalized if normalized is not None else value
         return numeric
     return value
 
@@ -379,7 +395,29 @@ def _attribute_value(
 
 def _bool_attribute(node: ManifestNode, name: str) -> bool | None:
     value = node.attributes.get(name)
-    return value if isinstance(value, bool) else None
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().casefold()
+    typed = re.fullmatch(
+        r"(?:\(type\s+0x12\)|type\s*=\s*0x12\s+data\s*=\s*)"
+        r"(?P<value>0x[0-9a-f]+|-?\d+)",
+        candidate,
+    )
+    if typed is not None:
+        candidate = typed.group("value")
+    if candidate == "true":
+        return True
+    if candidate == "false":
+        return False
+    if re.fullmatch(r"0x[0-9a-f]+|-?\d+", candidate):
+        try:
+            numeric = int(candidate, 0)
+        except ValueError:
+            return None
+        return _canonical_boolean_numeric(numeric)
+    return None
 
 
 def _int_attribute(node: ManifestNode, name: str) -> int | None:
@@ -765,19 +803,24 @@ def inspect_manifest_tree(
             for filter_node in _children(component_node, "intent-filter")
         )
         explicit_exported = _bool_attribute(component_node, "exported")
+        component_enabled = _bool_attribute(component_node, "enabled")
         effective, source = _effective_exported(
             component_node.tag,
             explicit_exported,
             bool(filters),
             target_sdk,
         )
+        if application_enabled is False:
+            effective, source = False, "application_disabled"
+        elif component_enabled is False:
+            effective, source = False, "component_disabled"
         component = ComponentInfo(
             component_type=component_node.tag,
             name=name,
             exported=explicit_exported,
             effective_exported=effective,
             exported_source=source,
-            enabled=_bool_attribute(component_node, "enabled"),
+            enabled=component_enabled,
             permission=_text_attribute(component_node, "permission"),
             read_permission=_text_attribute(component_node, "readPermission"),
             write_permission=_text_attribute(component_node, "writePermission"),
@@ -789,6 +832,8 @@ def inspect_manifest_tree(
                 "grantUriPermissions",
             ),
             direct_boot_aware=_bool_attribute(component_node, "directBootAware"),
+            stop_with_task=_bool_attribute(component_node, "stopWithTask"),
+            isolated_process=_bool_attribute(component_node, "isolatedProcess"),
             multiprocess=_bool_attribute(component_node, "multiprocess"),
             foreground_service_type=_text_attribute(
                 component_node,

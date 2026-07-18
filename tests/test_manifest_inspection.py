@@ -176,6 +176,170 @@ def test_manifest_parser_extracts_flags_components_permissions_and_deep_links() 
     assert inspection.deep_links[0].auto_verify is True
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("true", True),
+        ("false", False),
+        ("0xffffffff", True),
+        ("0x0", False),
+        ('(Raw: "true")', True),
+        ('(raw: "false")', False),
+        ("(type 0x12)0xffffffff", True),
+        ("(type 0x12)0x0", False),
+        ("type=0x12 data=0xffffffff", True),
+        ("type=0x12 data=0x0", False),
+    ),
+)
+def test_manifest_boolean_formats_are_normalized(
+    value: str,
+    expected: bool,
+) -> None:
+    output = f'''E: manifest
+  A: package="com.example.boolean" (Raw: "com.example.boolean")
+  E: application
+    A: android:debuggable={value}
+'''
+
+    inspection = inspect_manifest_tree(parse_aapt_xmltree(output), target_sdk=34)
+
+    assert inspection.debuggable is expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        None,
+        "maybe",
+        "0x2",
+        "(type 0x12)0x2",
+        "type=0x12 data=0x2",
+        "type=0x10 data=0xffffffff",
+    ),
+)
+def test_absent_or_malformed_manifest_boolean_is_unknown(value: str | None) -> None:
+    attribute = "" if value is None else f"    A: android:debuggable={value}\n"
+    output = f'''E: manifest
+  A: package="com.example.boolean" (Raw: "com.example.boolean")
+  E: application
+{attribute}'''
+
+    inspection = inspect_manifest_tree(parse_aapt_xmltree(output), target_sdk=34)
+
+    assert inspection.debuggable is None
+
+
+def test_all_normalized_application_and_component_boolean_fields() -> None:
+    output = '''E: manifest
+  A: package="com.example.boolean" (Raw: "com.example.boolean")
+  E: application
+    A: android:enabled=true
+    A: android:debuggable=(raw: "true")
+    A: android:testOnly=0x0
+    A: android:allowBackup=type=0x12 data=0xffffffff
+    A: android:usesCleartextTraffic=false
+    E: service
+      A: android:name=".Worker" (Raw: ".Worker")
+      A: android:exported=true
+      A: android:enabled=0xffffffff
+      A: android:directBootAware=(type 0x12)0xffffffff
+      A: android:stopWithTask=(raw: "false")
+      A: android:isolatedProcess=type=0x12 data=0xffffffff
+    E: provider
+      A: android:name=".Files" (Raw: ".Files")
+      A: android:authorities="com.example.boolean.files" (Raw: "com.example.boolean.files")
+      A: android:exported=false
+      A: android:grantUriPermissions=0xffffffff
+'''
+
+    inspection = inspect_manifest_tree(parse_aapt_xmltree(output), target_sdk=34)
+
+    assert inspection.application_enabled is True
+    assert inspection.debuggable is True
+    assert inspection.test_only is False
+    assert inspection.allow_backup is True
+    assert inspection.uses_cleartext_traffic is False
+    service, provider = inspection.components
+    assert service.exported is True
+    assert service.enabled is True
+    assert service.direct_boot_aware is True
+    assert service.stop_with_task is False
+    assert service.isolated_process is True
+    assert provider.exported is False
+    assert provider.grant_uri_permissions is True
+
+
+@pytest.mark.parametrize(
+    "component_type",
+    ("activity", "activity-alias", "service", "receiver", "provider"),
+)
+def test_explicit_true_wins_for_every_component_type(component_type: str) -> None:
+    alias_target = (
+        '      A: android:targetActivity=".Target" (Raw: ".Target")\n'
+        if component_type == "activity-alias"
+        else ""
+    )
+    authorities = (
+        '      A: android:authorities="com.example.boolean.provider" '
+        '(Raw: "com.example.boolean.provider")\n'
+        if component_type == "provider"
+        else ""
+    )
+    output = f'''E: manifest
+  A: package="com.example.boolean" (Raw: "com.example.boolean")
+  E: application
+    E: {component_type}
+      A: android:name=".Entry" (Raw: ".Entry")
+{alias_target}{authorities}      A: android:exported=true
+'''
+
+    component = inspect_manifest_tree(
+        parse_aapt_xmltree(output),
+        target_sdk=34,
+    ).components[0]
+
+    assert component.exported is True
+    assert component.effective_exported is True
+    assert component.exported_source == "explicit"
+
+
+@pytest.mark.parametrize(
+    ("component_type", "target_sdk", "expected", "source"),
+    (
+        ("activity", 30, True, "legacy_intent_filter_default"),
+        ("activity-alias", 31, None, "missing_explicit_exported"),
+        ("service", 30, True, "legacy_intent_filter_default"),
+        ("receiver", 31, None, "missing_explicit_exported"),
+        ("provider", 16, True, "legacy_provider_default"),
+        ("provider", 17, False, "provider_default"),
+    ),
+)
+def test_effective_exported_defaults_by_component_and_target_sdk(
+    component_type: str,
+    target_sdk: int,
+    expected: bool | None,
+    source: str,
+) -> None:
+    filter_xml = "" if component_type == "provider" else '''      E: intent-filter
+        E: action
+          A: android:name="com.example.boolean.OPEN" (Raw: "com.example.boolean.OPEN")
+'''
+    output = f'''E: manifest
+  A: package="com.example.boolean" (Raw: "com.example.boolean")
+  E: application
+    E: {component_type}
+      A: android:name=".Entry" (Raw: ".Entry")
+{filter_xml}'''
+
+    component = inspect_manifest_tree(
+        parse_aapt_xmltree(output),
+        target_sdk=target_sdk,
+    ).components[0]
+
+    assert component.effective_exported is expected
+    assert component.exported_source == source
+
+
 def test_manifest_parser_extracts_provider_policy_metadata() -> None:
     inspection = inspect_manifest_tree(
         parse_aapt_xmltree(FILE_PROVIDER_XMLTREE),
@@ -321,7 +485,31 @@ def test_disabled_application_and_alias_permission_are_normalized() -> None:
     assert inspection.application_enabled is False
     alias = next(item for item in inspection.components if item.component_type == "activity-alias")
     assert alias.permission is None
+    assert alias.exported is True
+    assert alias.effective_exported is False
+    assert alias.exported_source == "application_disabled"
     assert inspection.deep_links[0].component_permission is None
+
+
+def test_disabled_component_is_not_effectively_exported() -> None:
+    output = '''E: manifest
+  A: package="com.example.lab" (Raw: "com.example.lab")
+  E: application
+    E: receiver
+      A: android:name=".DisabledReceiver" (Raw: ".DisabledReceiver")
+      A: android:enabled=(raw: "false")
+      A: android:exported=0xffffffff
+'''
+
+    component = inspect_manifest_tree(
+        parse_aapt_xmltree(output),
+        target_sdk=34,
+    ).components[0]
+
+    assert component.enabled is False
+    assert component.exported is True
+    assert component.effective_exported is False
+    assert component.exported_source == "component_disabled"
 
 
 def test_view_browsable_filter_without_default_is_not_normalized_as_deep_link() -> None:

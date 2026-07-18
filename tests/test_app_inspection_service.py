@@ -151,6 +151,85 @@ def test_split_manifest_merge_records_custom_permission_conflicts() -> None:
     assert len(merged["custom_permissions"]) == 2
 
 
+def test_split_manifest_boolean_conflict_is_conservatively_unknown() -> None:
+    base = {
+        "debuggable": True,
+        "test_only": False,
+        "uses_cleartext_traffic": None,
+        "allow_backup": True,
+        "application_enabled": True,
+        "custom_permissions": [],
+        "permissions": [],
+        "components": [],
+        "deep_links": [],
+        "file_provider_paths": [],
+    }
+    split = {
+        **base,
+        "debuggable": False,
+        "allow_backup": False,
+    }
+
+    merged = _merge_manifest_payloads(
+        [("base:0", base), ("split:1", split)],
+        [],
+    )
+
+    assert merged["debuggable"] is None
+    assert merged["allow_backup"] is None
+    assert merged["test_only"] is False
+    assert merged["manifest_complete"] is False
+    assert merged["manifest_limitations"] == [
+        "split:1:conflicting_manifest_boolean:debuggable",
+        "split:1:conflicting_manifest_boolean:allow_backup",
+    ]
+
+
+def test_split_component_boolean_conflict_is_conservatively_unknown() -> None:
+    component = {
+        "component_type": "activity",
+        "name": "com.example.Entry",
+        "exported": True,
+        "effective_exported": True,
+        "exported_source": "explicit",
+        "enabled": True,
+    }
+    base = {
+        "custom_permissions": [],
+        "permissions": [],
+        "components": [component],
+        "deep_links": [],
+        "file_provider_paths": [],
+    }
+    split = {
+        **base,
+        "components": [
+            {
+                **component,
+                "exported": False,
+                "effective_exported": False,
+            }
+        ],
+    }
+
+    merged = _merge_manifest_payloads(
+        [("base:0", base), ("split:1", split)],
+        [],
+    )
+
+    assert len(merged["components"]) == 2
+    assert all(row["exported"] is None for row in merged["components"])
+    assert all(row["effective_exported"] is None for row in merged["components"])
+    assert all(
+        row["exported_source"] == "conflicting_split_values"
+        for row in merged["components"]
+    )
+    assert merged["manifest_complete"] is False
+    assert merged["manifest_limitations"] == [
+        "split:1:conflicting_component:activity"
+    ]
+
+
 class FakeAdb:
     @staticmethod
     def apk_bytes(remote_path: str) -> bytes:
