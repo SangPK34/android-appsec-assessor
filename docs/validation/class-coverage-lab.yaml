@@ -8,6 +8,15 @@ redaction:
   package_identifiers_included: false
 
 sessions:
+  - session_id: 20260719-040824-94ecd8
+    report_sha256: 180a6feb8eece7698938e22ccf35b73c5a728c1bb731dbecc8f0b57a24d82514
+    security_rules_evaluated: 31
+    confirmed: 4
+    potential: 9
+    pass: 9
+    inconclusive: 9
+    skipped: 0
+    error: 0
   - session_id: 20260718-213857-8de6f9
     report_sha256: 99338e72f68fbfa85a78be50ad966aa4efdeeb10fffbf540e7f10295a5aa12a4
     security_rules_evaluated: 30
@@ -46,6 +55,12 @@ sessions:
     inconclusive: 13
 
 cases:
+  - case_id: exported_activity_ipc_boundary
+    session_id: 20260719-040824-94ecd8
+    outcome: confirmed
+    tested_scope: manifest_derived_activity_foreground_transition_with_target_pid
+    evidence: Three bounded external Activity routes produced exact resumed-component and target-PID evidence; one route remained inconclusive and was not generalized.
+
   - case_id: build_manifest_configuration
     session_id: 20260718-213857-8de6f9
     outcome: confirmed

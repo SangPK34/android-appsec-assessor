@@ -408,6 +408,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
             autonomous=autonomous,
             explorer_config=explorer_config,
             controlled_canary=controlled_canary,
+            ipc_validation=auto_mode,
             scenario_request=scenario_request,
         )
     else:
@@ -419,6 +420,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
             autonomous=autonomous,
             explorer_config=explorer_config,
             controlled_canary=controlled_canary,
+            ipc_validation=auto_mode,
             scenario_request=scenario_request,
         )
     payload = result.to_dict()

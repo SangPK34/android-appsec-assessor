@@ -21,6 +21,7 @@ from ..explorer import (
     ExplorerService,
     RuntimeFeedbackCollector,
 )
+from ..exported_component_validation import ExportedComponentValidationService
 from ..findings import FindingRecord
 from ..frida_controller import FridaController
 from ..logcat import LogcatCollector
@@ -157,6 +158,8 @@ class ScanResult:
     autonomous_exploration_executed: bool = False
     controlled_canary_requested: bool = False
     controlled_canary_executed: bool = False
+    ipc_validation_requested: bool = False
+    ipc_validation_executed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +175,8 @@ class ScanResult:
             "autonomous_exploration_executed": self.autonomous_exploration_executed,
             "controlled_canary_requested": self.controlled_canary_requested,
             "controlled_canary_executed": self.controlled_canary_executed,
+            "ipc_validation_requested": self.ipc_validation_requested,
+            "ipc_validation_executed": self.ipc_validation_executed,
             "phase_timings": dict(self.phase_timings or {}),
             "report_path": self.report_path,
         }
@@ -264,6 +269,7 @@ class ScanService:
         autonomous: bool | None = None,
         explorer_config: ExplorerConfig | None = None,
         controlled_canary: bool = False,
+        ipc_validation: bool = False,
         scenario_request: ScenarioRequest | None = None,
     ) -> ScanResult:
         _require_explicit_controlled_canary_request(
@@ -281,6 +287,7 @@ class ScanService:
             autonomous=autonomous,
             explorer_config=explorer_config,
             controlled_canary=controlled_canary,
+            ipc_validation=ipc_validation,
             scenario_request=scenario_request,
         )
 
@@ -293,6 +300,7 @@ class ScanService:
         autonomous: bool | None = None,
         explorer_config: ExplorerConfig | None = None,
         controlled_canary: bool = False,
+        ipc_validation: bool = False,
         scenario_request: ScenarioRequest | None = None,
     ) -> ScanResult:
         _require_explicit_controlled_canary_request(
@@ -350,6 +358,7 @@ class ScanService:
                     runtime_seconds=runtime_seconds,
                     explorer_config=explorer_config,
                     controlled_canary=controlled_canary,
+                    ipc_validation=ipc_validation,
                     scenario_request=scenario_request,
                 )
         except BaseException:
@@ -629,6 +638,7 @@ class ScanService:
         runtime_seconds: int | None = None,
         explorer_config: ExplorerConfig | None = None,
         controlled_canary: bool = False,
+        ipc_validation: bool = False,
         scenario_request: ScenarioRequest | None = None,
     ) -> ScanResult:
         profile = resolution.effective_profile
@@ -646,6 +656,7 @@ class ScanService:
                 "pending" if scenario_request is not None else "skipped"
             ),
             "controlled_canary": "pending" if controlled_canary else "skipped",
+            "exported_component_validation": "pending" if ipc_validation else "skipped",
             "target_logcat": "pending",
             "private_storage": "skipped" if profile is ScanProfile.QUICK else "pending",
             "rules": "pending",
@@ -659,6 +670,8 @@ class ScanService:
         exploration_result: ExplorerResult | None = None
         exploration_executed = False
         controlled_canary_executed = False
+        ipc_validation_executed = False
+        ipc_validation_result = None
         scenario_result = None
         scenario_plan: ScenarioPlan | None = None
         scenario_correlation: dict[str, Any] | None = None
@@ -697,6 +710,8 @@ class ScanService:
                 "autonomous_exploration_executed": False,
                 "controlled_canary_requested": controlled_canary,
                 "controlled_canary_executed": False,
+                "ipc_validation_requested": ipc_validation,
+                "ipc_validation_executed": False,
                 "phase_timings": {},
             },
             root=self.paths.root,
@@ -973,6 +988,43 @@ class ScanService:
                 runtime_termination = "not_started"
                 if controlled_canary:
                     steps["controlled_canary"] = "not_exercised"
+            if ipc_validation and profile is ScanProfile.FULL:
+                ipc_started = time.perf_counter()
+                if launched or traffic_started or frida_started:
+                    try:
+                        ipc_validation_result = ExportedComponentValidationService(
+                            self.context,
+                            self.repository,
+                        ).run(
+                            record.session_id,
+                            adb=adb,
+                            scope=load_scope(self.paths),
+                        )
+                        ipc_validation_executed = True
+                        outcomes = {
+                            route.outcome.value for route in ipc_validation_result.routes
+                        }
+                        if "confirmed" in outcomes:
+                            steps["exported_component_validation"] = "completed"
+                        elif any(route.attempted for route in ipc_validation_result.routes):
+                            steps["exported_component_validation"] = "partial"
+                        elif outcomes and outcomes <= {"out_of_scope"}:
+                            steps["exported_component_validation"] = "out_of_scope"
+                        else:
+                            steps["exported_component_validation"] = "not_exercised"
+                    except (AndroidAssessorError, OSError, ValueError) as exc:
+                        steps["exported_component_validation"] = "error"
+                        limitations.append(
+                            "Exported-component validation failed: "
+                            f"{redact_text(str(exc))[:300]}"
+                        )
+                else:
+                    steps["exported_component_validation"] = "not_exercised"
+                    limitations.append(
+                        "Exported-component validation was not exercised because the "
+                        "target runtime did not start."
+                    )
+                timed("exported_component_validation", ipc_started)
         finally:
             analysis_started = time.perf_counter()
             if frida_started:
@@ -1119,6 +1171,13 @@ class ScanService:
                 "autonomous_exploration_executed": exploration_executed,
                 "controlled_canary_requested": controlled_canary,
                 "controlled_canary_executed": controlled_canary_executed,
+                "ipc_validation_requested": ipc_validation,
+                "ipc_validation_executed": ipc_validation_executed,
+                "ipc_validation": (
+                    ipc_validation_result.to_dict()
+                    if ipc_validation_result is not None
+                    else None
+                ),
                 "phase_timings": phase_timings,
                 "runtime_termination": runtime_termination,
                 **scenario_metadata,
@@ -1147,6 +1206,13 @@ class ScanService:
                 "autonomous_exploration_executed": exploration_executed,
                 "controlled_canary_requested": controlled_canary,
                 "controlled_canary_executed": controlled_canary_executed,
+                "ipc_validation_requested": ipc_validation,
+                "ipc_validation_executed": ipc_validation_executed,
+                "ipc_validation": (
+                    ipc_validation_result.to_dict()
+                    if ipc_validation_result is not None
+                    else None
+                ),
                 "phase_timings": phase_timings,
                 "runtime_termination": runtime_termination,
                 "runtime_started_at": runtime_started_at,
@@ -1184,6 +1250,13 @@ class ScanService:
                     "autonomous_exploration_executed": exploration_executed,
                     "controlled_canary_requested": controlled_canary,
                     "controlled_canary_executed": controlled_canary_executed,
+                    "ipc_validation_requested": ipc_validation,
+                    "ipc_validation_executed": ipc_validation_executed,
+                    "ipc_validation": (
+                        ipc_validation_result.to_dict()
+                        if ipc_validation_result is not None
+                        else None
+                    ),
                     "phase_timings": phase_timings,
                     "runtime_termination": runtime_termination,
                     "runtime_started_at": runtime_started_at,
@@ -1221,6 +1294,8 @@ class ScanService:
                     ),
                     "autonomous_exploration_executed": exploration_executed,
                     "runtime_termination": runtime_termination,
+                    "ipc_validation_requested": ipc_validation,
+                    "ipc_validation_executed": ipc_validation_executed,
                 },
                 root=self.paths.root,
             )
@@ -1245,5 +1320,7 @@ class ScanService:
             autonomous_exploration_executed=exploration_executed,
             controlled_canary_requested=controlled_canary,
             controlled_canary_executed=controlled_canary_executed,
+            ipc_validation_requested=ipc_validation,
+            ipc_validation_executed=ipc_validation_executed,
             report_path="report.html",
         )

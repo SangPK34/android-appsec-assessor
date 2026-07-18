@@ -55,6 +55,49 @@ def _optional_json(path: Path, root: Path) -> dict[str, Any] | None:
         return None
 
 
+def _registered_ipc_validation(
+    paths: Any,
+    *,
+    session_id: str,
+    package: str,
+    evidence_values: list[dict[str, Any]],
+    root: Path,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """Load only the hash-registered, session-owned IPC result artifact."""
+
+    artifact = paths.redacted_dir / "ipc" / "exported-components.json"
+    relative = artifact.relative_to(paths.root).as_posix()
+    registered = next(
+        (
+            item
+            for item in evidence_values
+            if item.get("evidence_type") == "ipc_component_validation"
+            and item.get("relative_path") == relative
+        ),
+        None,
+    )
+    if registered is None:
+        return None, None, ["IPC validation artifact is not registered."]
+    errors: list[str] = []
+    try:
+        expected_hash = str(registered.get("sha256", ""))
+        if not artifact.is_file() or sha256_file(artifact) != expected_hash:
+            errors.append("IPC validation artifact integrity mismatch.")
+        payload = _optional_json(artifact, root)
+        if not isinstance(payload, dict):
+            errors.append("IPC validation artifact is not a JSON object.")
+            return None, str(registered.get("evidence_id")), errors
+        if payload.get("session_id") != session_id or payload.get("package") != package:
+            errors.append("IPC validation artifact identity does not match the session.")
+            return None, str(registered.get("evidence_id")), errors
+        return (
+            payload if not errors else None,
+            str(registered.get("evidence_id")),
+            errors,
+        )
+    except (AndroidAssessorError, OSError, ValueError) as exc:
+        errors.append(f"IPC validation artifact could not be loaded: {redact_text(str(exc))[:200]}")
+        return None, str(registered.get("evidence_id")), errors
 def _frida_events(
     path: Path,
     *,
@@ -817,6 +860,71 @@ class RuleEngine:
                 "analysis_confidence": selected.confidence,
                 "observation_only": definition.observation_only,
             }
+            ipc_rule_types = {
+                "ASL-MANIFEST-EXPORTED-ACTIVITY": {"activity"},
+                "ASL-MANIFEST-EXPORTED-RECEIVER": {"receiver"},
+                "ASL-MANIFEST-EXPORTED-PROVIDER": {"provider"},
+            }
+            ipc_payload = context.get("ipc_validation")
+            ipc_routes: list[dict[str, Any]] = []
+            if definition.rule_id in ipc_rule_types and isinstance(ipc_payload, dict):
+                raw_routes = ipc_payload.get("routes", [])
+                if isinstance(raw_routes, list):
+                    ipc_routes = [
+                        dict(item)
+                        for item in raw_routes
+                        if isinstance(item, dict)
+                        and isinstance(item.get("candidate"), dict)
+                        and item["candidate"].get("component_type")
+                        in ipc_rule_types[definition.rule_id]
+                    ]
+                if ipc_routes:
+                    outcomes = {str(item.get("outcome")) for item in ipc_routes}
+                    details["ipc_validation"] = {
+                        "route_count": len(ipc_routes),
+                        "routes": ipc_routes,
+                        "artifact": "redacted/ipc/exported-components.json",
+                        "evidence_id": context.get("ipc_evidence_id"),
+                    }
+                    if "confirmed" in outcomes:
+                        selected_status = FindingStatus.CONFIRMED
+                        details["reason"] = (
+                            "A bounded manifest-derived IPC route produced an attributed "
+                            "observable impact."
+                        )
+                        details["missing_evidence"] = []
+                    elif outcomes <= {"rejected_for_tested_route"}:
+                        selected_status = FindingStatus.PASS
+                        details["reason"] = (
+                            "Every tested route for this component family was rejected by "
+                            "the observed permission boundary."
+                        )
+                        details["missing_evidence"] = []
+                    else:
+                        selected_status = (
+                            FindingStatus.INCONCLUSIVE
+                            if outcomes & {
+                                "inconclusive",
+                                "not_exercised",
+                                "out_of_scope",
+                            }
+                            else selected.finding_status
+                        )
+                        details["reason"] = (
+                            "The bounded manifest-derived route was attempted, but no "
+                            "attributed observable impact was established."
+                        )
+                        details["missing_evidence"] = [
+                            "observable impact for every manifest-derived IPC route"
+                        ]
+                    selected_finding_status = selected_status
+                    analysis_type = "adb_ipc_validation"
+                else:
+                    selected_finding_status = selected.finding_status
+                    analysis_type = "static"
+            else:
+                selected_finding_status = selected.finding_status
+                analysis_type = "static"
             evidence_ids = evidence("manifest_tree")
             if definition.rule_id == "ASL-MANIFEST-FILEPROVIDER-PATHS":
                 evidence_ids = tuple(
@@ -828,9 +936,13 @@ class RuleEngine:
                         )
                     )
                 )
+            if ipc_routes and context.get("ipc_evidence_id"):
+                evidence_ids = tuple(
+                    dict.fromkeys((*evidence_ids, str(context["ipc_evidence_id"])))
+                )
             return (
-                selected.finding_status,
-                "static",
+                selected_finding_status,
+                analysis_type,
                 details,
                 evidence_ids,
                 False,
@@ -2314,6 +2426,13 @@ class RuleEngine:
             )
         )
         evidence_values = self.evidence.list(session_id)
+        ipc_validation, ipc_evidence_id, ipc_validation_errors = _registered_ipc_validation(
+            paths,
+            session_id=session_id,
+            package=session_record.package,
+            evidence_values=evidence_values,
+            root=self.paths.root,
+        )
         device_environment = (
             "emulator"
             if session_record.serial.startswith("emulator-")
@@ -2448,6 +2567,9 @@ class RuleEngine:
             "private_storage": private_storage,
             "scan_state": scan_state,
             "serial": session_record.serial,
+            "ipc_validation": ipc_validation,
+            "ipc_evidence_id": ipc_evidence_id,
+            "ipc_validation_errors": ipc_validation_errors,
         }
         now = datetime.now(UTC).isoformat()
         previous_findings = {

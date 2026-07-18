@@ -69,6 +69,7 @@ def test_full_scan_cli_forwards_autonomous_configuration(
     assert calls[0]["autonomous"] is True
     assert calls[0]["runtime_seconds"] == 37
     assert calls[0]["controlled_canary"] is True
+    assert calls[0]["ipc_validation"] is False
     config = calls[0]["explorer_config"]
     assert isinstance(config, ExplorerConfig)
     assert config.max_runtime_seconds == 37
@@ -147,6 +148,7 @@ def test_auto_cli_enables_bounded_controlled_exploration(tmp_path, monkeypatch) 
     assert calls[0]["autonomous"] is True
     assert calls[0]["runtime_seconds"] == 41
     assert calls[0]["controlled_canary"] is True
+    assert calls[0]["ipc_validation"] is True
     config = calls[0]["explorer_config"]
     assert isinstance(config, ExplorerConfig)
     assert config.per_action_timeout_seconds == 8

@@ -49,23 +49,24 @@ class_matrix:
     detection_mode: [static, autonomous_runtime, controlled_validation]
     runtime_observer: [autonomous_explorer_targeted_navigation]
     controlled_validator:
-      [exported_activity_canary, world_readable_storage_receiver_probe]
+      [exported_component_ipc_batch, world_readable_storage_receiver_probe]
     current_implementation_status: partially_implemented
     positive_fixture:
       - tests/test_exported_activity_validation.py::test_exported_activity_requires_observable_canary_impact
+      - tests/test_exported_component_validation.py::test_ipc_artifact_is_consumed_by_manifest_rules
     negative_fixture:
-      - tests/test_phase2_correlation.py::test_candidate_scoped_storage_validation_can_reject_one_candidate
+      - tests/test_exported_component_validation.py::test_negative_ipc_routes_are_not_false_positive
     lab_result:
-      outcome: potential
-      session_id: 20260718-191354-57d6af
-      tested_scope: receiver_route_reached_without_ipc_boundary_impact
+      outcome: confirmed
+      session_id: 20260719-040824-94ecd8
+      tested_scope: manifest_derived_activity_foreground_transition_with_target_pid
       evidence_reference: docs/validation/class-coverage-lab.yaml
-      evidence_case: exported_receiver_boundary
+      evidence_case: exported_activity_ipc_boundary
     confirmation_threshold: A bounded external invocation reproduces a security-relevant effect with target-process or resulting-state evidence.
     rejection_requirement: The exact candidate route is reached and the defined effect is absent in complete bounded evidence.
-    known_gap: Provider, Service, and generic Receiver boundaries lack production validators; launch success alone remains potential.
+    known_gap: Provider routes without a manifest-derived queryable URI and Receiver routes without target-attributed impact remain inconclusive; Service validation is deferred.
     false_positive_controls: [effective_exported_state, permission_strength, exact_candidate_key, route_scoped_rejection]
-    next_action: Add a read-only quota-bounded exported Provider validator.
+    next_action: Add bounded service validation only after a generic reversible observable contract exists.
 
   - class: sensitive_logging_and_exposed_data_sinks
     rule_ids: [ASL-MVP-003, ASL-RUNTIME-LOGGING]
@@ -366,8 +367,9 @@ rules:
     root_required: false
     frida_required: false
     controlled_validation_available: false
+    auto_ipc_validation_available: true
     default_profile: quick
-    implementation_status: detected
+    implementation_status: partially_detected
 
   - rule_id: ASL-MANIFEST-EXPORTED-SERVICE
     <<: *coverage_defaults
@@ -408,8 +410,9 @@ rules:
     root_required: false
     frida_required: false
     controlled_validation_available: false
+    auto_ipc_validation_available: true
     default_profile: quick
-    implementation_status: detected
+    implementation_status: partially_detected
 
   - rule_id: ASL-MANIFEST-CUSTOM-PERMISSION
     <<: *coverage_defaults
@@ -478,6 +481,7 @@ rules:
     root_required: false
     frida_required: false
     controlled_validation_available: false
+    auto_ipc_validation_available: true
     default_profile: quick
     implementation_status: partially_detected
 
@@ -492,6 +496,7 @@ rules:
     root_required: false
     frida_required: false
     controlled_validation_available: false
+    auto_ipc_validation_available: true
     default_profile: quick
     implementation_status: partially_detected
 

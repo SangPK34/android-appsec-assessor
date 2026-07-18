@@ -10,7 +10,7 @@ from typing import Any
 
 from .errors import AdbError, AdbTimeoutError, ExternalCommandError
 from .redaction import redact_text_with_values
-from .subprocess_utils import CommandResult, run_command
+from .subprocess_utils import CommandResult, run_command, run_command_bounded_output
 from .validation import (
     validate_android_apk_path,
     validate_managed_remote_path,
@@ -250,6 +250,64 @@ class AdbClient:
             else result
         )
 
+    def _run_bounded(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+        check: bool = False,
+        operation: str = "running a bounded device command",
+        sensitive_values: Sequence[str] = (),
+    ) -> CommandResult:
+        normalized = _validate_arguments(arguments)
+        protected_values = tuple(dict.fromkeys((
+            validate_serial(normalized[1]) if len(normalized) > 1 and normalized[0] == "-s" else "",
+            *sensitive_values,
+        )))
+        if self.command_log is not None:
+            command_log: Path | None = self.command_log
+        else:
+            command_log = None
+        try:
+            result = run_command_bounded_output(
+                [self.executable, *normalized],
+                timeout=timeout,
+                max_stdout_bytes=max_stdout_bytes,
+                max_stderr_bytes=max_stderr_bytes,
+                check=check,
+                sensitive_values=protected_values,
+                command_log=command_log,
+            )
+        except ExternalCommandError as exc:
+            raise AdbError(f"Could not execute ADB: {exc}") from exc
+        del operation
+        return result
+
+    def shell_bounded(
+        self,
+        serial: str,
+        arguments: Sequence[str],
+        *,
+        timeout: float = 30,
+        max_stdout_bytes: int = 64 * 1024,
+        max_stderr_bytes: int = 16 * 1024,
+        check: bool = False,
+        operation: str = "running a bounded Android shell command",
+        sensitive_values: Sequence[str] = (),
+    ) -> CommandResult:
+        selected = validate_serial(serial)
+        return self._run_bounded(
+            ("-s", selected, "shell", *_validate_arguments(arguments)),
+            timeout=timeout,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+            check=check,
+            operation=operation,
+            sensitive_values=(selected, *sensitive_values),
+        )
+
     def shell(
         self,
         serial: str,
@@ -450,4 +508,5 @@ class AdbClient:
             timeout=30,
             check=False,
             operation="starting an allowlisted activity for controlled validation",
+            sensitive_values=(canary,),
         )
