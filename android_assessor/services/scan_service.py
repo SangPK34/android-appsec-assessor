@@ -25,6 +25,11 @@ from ..exported_component_validation import ExportedComponentValidationService
 from ..findings import FindingRecord
 from ..frida_controller import FridaController
 from ..logcat import LogcatCollector
+from ..micro_scenario import (
+    CandidateMicroScenarioService,
+    MicroScenarioExecution,
+    MicroScenarioSeed,
+)
 from ..private_storage import AdbPrivateStorageBackend, PrivateStorageService
 from ..redaction import redact_text
 from ..report import ReportService
@@ -90,6 +95,22 @@ def _read_redacted_jsonl(path: Any, *, maximum: int = 20_000) -> list[dict[str, 
 
 def _non_negative_count(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _apply_sink_verification_quota(
+    payload: dict[str, Any],
+    quota: int,
+) -> dict[str, Any]:
+    """Bound accepted observer evidence without changing eligibility rules."""
+
+    bounded_quota = max(0, int(quota))
+    accepted = payload.get("events", [])
+    if isinstance(accepted, list) and len(accepted) > bounded_quota:
+        payload["events"] = accepted[:bounded_quota]
+        payload["accepted_count"] = bounded_quota
+        payload["quota_exhausted"] = True
+    payload["sink_verification_quota"] = bounded_quota
+    return payload
 
 
 def _exploration_coverage_limitation(result: ExplorerResult) -> str | None:
@@ -160,6 +181,8 @@ class ScanResult:
     controlled_canary_executed: bool = False
     ipc_validation_requested: bool = False
     ipc_validation_executed: bool = False
+    micro_scenario_requested: bool = False
+    micro_scenario_executed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -177,6 +200,8 @@ class ScanResult:
             "controlled_canary_executed": self.controlled_canary_executed,
             "ipc_validation_requested": self.ipc_validation_requested,
             "ipc_validation_executed": self.ipc_validation_executed,
+            "micro_scenario_requested": self.micro_scenario_requested,
+            "micro_scenario_executed": self.micro_scenario_executed,
             "phase_timings": dict(self.phase_timings or {}),
             "report_path": self.report_path,
         }
@@ -270,6 +295,7 @@ class ScanService:
         explorer_config: ExplorerConfig | None = None,
         controlled_canary: bool = False,
         ipc_validation: bool = False,
+        micro_scenario: bool = False,
         scenario_request: ScenarioRequest | None = None,
     ) -> ScanResult:
         _require_explicit_controlled_canary_request(
@@ -288,6 +314,7 @@ class ScanService:
             explorer_config=explorer_config,
             controlled_canary=controlled_canary,
             ipc_validation=ipc_validation,
+            micro_scenario=micro_scenario,
             scenario_request=scenario_request,
         )
 
@@ -301,6 +328,7 @@ class ScanService:
         explorer_config: ExplorerConfig | None = None,
         controlled_canary: bool = False,
         ipc_validation: bool = False,
+        micro_scenario: bool = False,
         scenario_request: ScenarioRequest | None = None,
     ) -> ScanResult:
         _require_explicit_controlled_canary_request(
@@ -359,6 +387,7 @@ class ScanService:
                     explorer_config=explorer_config,
                     controlled_canary=controlled_canary,
                     ipc_validation=ipc_validation,
+                    micro_scenario=micro_scenario,
                     scenario_request=scenario_request,
                 )
         except BaseException:
@@ -512,8 +541,9 @@ class ScanService:
         record: SessionRecord,
         *,
         scenario_result: Any,
-        scenario_plan: ScenarioPlan,
+        scenario_plan: Any,
         scenario_service: ScenarioService,
+        sink_verification_quota: int | None = None,
     ) -> dict[str, Any] | None:
         """Join completed scenario windows to redacted observer evidence."""
 
@@ -543,6 +573,11 @@ class ScanService:
             {
                 "process": process,
                 "owned_value_fingerprints": sorted(scenario_plan.owned_values),
+                "owned_value_metadata": [
+                    dict(item)
+                    for item in getattr(scenario_plan, "owned_value_metadata", ())
+                    if isinstance(item, Mapping)
+                ],
                 "scoped_backend_ids": sorted(scenario_plan.upstream_mapping),
                 "evidence_ids": {
                     key: value
@@ -554,6 +589,31 @@ class ScanService:
                 },
             }
         )
+        if getattr(scenario_plan, "canary_fingerprint", None):
+            summary["canary_fingerprint"] = scenario_plan.canary_fingerprint
+        verification_started = summary.get("ended_at")
+        verification_ended = datetime.now(UTC).isoformat()
+        if isinstance(verification_started, str):
+            raw_steps = summary.get("steps")
+            if isinstance(raw_steps, list):
+                raw_steps.append(
+                    {
+                        "step_id": "sink_verification",
+                        "action": "collect_observations",
+                        "attempted": True,
+                        "completed": True,
+                        "retry_count": 0,
+                        "timeout_seconds": 1,
+                        "resolved_selector": None,
+                        "observed_transition": None,
+                        "failure_reason": None,
+                        "evidence_reference": "scenario:sink_verification",
+                        "started_at": verification_started,
+                        "ended_at": verification_ended,
+                        "pid": pid,
+                        "process": process,
+                    }
+                )
         scenario_service.persist_summary(
             record.session_id,
             str(summary["scenario_id"]),
@@ -574,39 +634,61 @@ class ScanService:
 
         traffic_events = state_events(paths.traffic_dir / "state.json")
         frida_events = state_events(paths.frida_dir / "state.json")
+        logcat_events: list[dict[str, Any]] = []
+        logcat_state_path = paths.logcat_dir / "state.json"
+        try:
+            logcat_state = read_json_object(logcat_state_path, root=self.paths.root)
+            if (
+                logcat_state.get("canary_observed") is True
+                and logcat_state.get("collected_at")
+                and summary.get("canary_fingerprint")
+            ):
+                logcat_events.append(
+                    {
+                        "observer": "logcat",
+                        "session_id": record.session_id,
+                        "scenario_id": summary["scenario_id"],
+                        "step_id": "sink_verification",
+                        "package": record.package,
+                        "pid": logcat_state.get("target_pid", pid),
+                        "process": process,
+                        "timestamp": logcat_state["collected_at"],
+                        "canary_fingerprint": summary["canary_fingerprint"],
+                        "exact_owned_value_match": True,
+                        "canary_match": True,
+                        "evidence_id": logcat_state.get("evidence_id"),
+                    }
+                )
+        except (AndroidAssessorError, OSError, ValueError):
+            logcat_events = []
         normalized_traffic = []
         for event in traffic_events:
             value = dict(event)
-            value.update(
-                {
-                    "observer": "traffic",
-                    "session_id": record.session_id,
-                    "scenario_id": summary["scenario_id"],
-                    "package": record.package,
-                    "pid": pid,
-                    "process": process,
-                }
-            )
+            value.setdefault("observer", "traffic")
+            value.setdefault("session_id", record.session_id)
+            value.setdefault("scenario_id", summary["scenario_id"])
+            value.setdefault("package", record.package)
+            value.setdefault("pid", pid)
+            value.setdefault("process", process)
+            if value.get("attribution") == "validation_canary":
+                value["canary_match"] = True
             normalized_traffic.append(value)
         normalized_frida = []
         for event in frida_events:
             value = dict(event)
-            value.update(
-                {
-                    "observer": "frida",
-                    "session_id": record.session_id,
-                    "scenario_id": summary["scenario_id"],
-                    "package": record.package,
-                    "pid": value.get("pid", pid),
-                    "process": value.get("process") or process,
-                }
-            )
+            value.setdefault("observer", "frida")
+            value.setdefault("session_id", record.session_id)
+            value.setdefault("scenario_id", summary["scenario_id"])
+            value.setdefault("package", record.package)
+            value.setdefault("pid", pid)
+            value.setdefault("process", process)
             normalized_frida.append(value)
         try:
             correlation = correlate_scenario_events(
                 summary,
                 traffic_events=normalized_traffic,
                 frida_events=normalized_frida,
+                logcat_events=logcat_events,
             )
             payload = correlation.to_dict()
         except (TypeError, ValueError) as exc:
@@ -617,6 +699,8 @@ class ScanService:
                 "rejected_count": 0,
                 "correlation_error": redact_text(str(exc))[:300],
             }
+        if sink_verification_quota is not None:
+            _apply_sink_verification_quota(payload, sink_verification_quota)
         payload = {
             "schema_version": 1,
             "session_id": record.session_id,
@@ -639,6 +723,7 @@ class ScanService:
         explorer_config: ExplorerConfig | None = None,
         controlled_canary: bool = False,
         ipc_validation: bool = False,
+        micro_scenario: bool = False,
         scenario_request: ScenarioRequest | None = None,
     ) -> ScanResult:
         profile = resolution.effective_profile
@@ -657,6 +742,7 @@ class ScanService:
             ),
             "controlled_canary": "pending" if controlled_canary else "skipped",
             "exported_component_validation": "pending" if ipc_validation else "skipped",
+            "micro_scenario": "pending" if micro_scenario else "skipped",
             "target_logcat": "pending",
             "private_storage": "skipped" if profile is ScanProfile.QUICK else "pending",
             "rules": "pending",
@@ -672,12 +758,22 @@ class ScanService:
         controlled_canary_executed = False
         ipc_validation_executed = False
         ipc_validation_result = None
+        micro_scenario_executed = False
+        micro_scenario_execution: MicroScenarioExecution | None = None
+        micro_scenario_seed: MicroScenarioSeed | None = None
+        runtime_feedback_collector = RuntimeFeedbackCollector(paths)
+        micro_scope = load_scope(self.paths) if micro_scenario else None
         scenario_result = None
         scenario_plan: ScenarioPlan | None = None
         scenario_correlation: dict[str, Any] | None = None
         scenario_service = (
             ScenarioService(self.context, self.repository)
             if scenario_request is not None
+            else None
+        )
+        micro_scenario_service = (
+            CandidateMicroScenarioService(ScenarioService(self.context, self.repository))
+            if micro_scenario
             else None
         )
         assessment_canary = (
@@ -692,6 +788,28 @@ class ScanService:
             except (AndroidAssessorError, OSError, ValueError) as exc:
                 limitations.append(
                     f"Deterministic scenario preparation failed: {redact_text(str(exc))[:300]}"
+                )
+        if micro_scenario_service is not None and profile is ScanProfile.FULL:
+            try:
+                app_payload = read_json_object(paths.app_json, root=self.paths.root)
+                manifest_payload = app_payload.get("manifest")
+                static_payload = app_payload.get("static_analysis")
+                micro_scenario_seed = micro_scenario_service.prepare(
+                    record,
+                    manifest=(
+                        manifest_payload if isinstance(manifest_payload, Mapping) else {}
+                    ),
+                    static_analysis=(
+                        static_payload if isinstance(static_payload, Mapping) else {}
+                    ),
+                    session_canary=assessment_canary or "",
+                    allowed_hosts=(micro_scope.api_hosts if micro_scope is not None else ()),
+                )
+            except (AndroidAssessorError, OSError, ValueError) as exc:
+                steps["micro_scenario"] = "failed_precondition"
+                limitations.append(
+                    "Micro-scenario preparation failed: "
+                    f"{redact_text(str(exc))[:300]}"
                 )
         paths.runtime_control_json.unlink(missing_ok=True)
         write_json_atomic(
@@ -712,6 +830,9 @@ class ScanService:
                 "controlled_canary_executed": False,
                 "ipc_validation_requested": ipc_validation,
                 "ipc_validation_executed": False,
+                "micro_scenario_requested": micro_scenario,
+                "micro_scenario_executed": False,
+                "micro_scenario": None,
                 "phase_timings": {},
             },
             root=self.paths.root,
@@ -741,6 +862,13 @@ class ScanService:
                         "launch_app": False,
                         "canary": assessment_canary,
                     }
+                    if micro_scenario_seed is not None:
+                        traffic_kwargs["owned_value_fingerprints"] = dict(
+                            micro_scenario_seed.owned_values
+                        )
+                        traffic_kwargs["upstream_mapping"] = dict(
+                            micro_scenario_seed.upstream_mapping
+                        )
                     if scenario_request is not None:
                         traffic_kwargs.update(
                             {
@@ -816,8 +944,65 @@ class ScanService:
                     raise ValueError(
                         "runtime_seconds must be between "
                         f"{self.MIN_RUNTIME_SECONDS} and {self.MAX_RUNTIME_SECONDS}."
-                    )
+                )
                 runtime_started_at = datetime.now(UTC).isoformat()
+                if micro_scenario_seed is not None and micro_scenario_service is not None:
+                    runtime_feedback = runtime_feedback_collector.poll()
+                    if runtime_feedback.categories:
+                        micro_scenario_seed = micro_scenario_service.enrich_runtime_candidates(
+                            micro_scenario_seed,
+                            tuple(runtime_feedback.categories),
+                        )
+                if micro_scenario_seed is not None and micro_scenario_service is not None:
+                    micro_started = time.perf_counter()
+                    try:
+                        micro_backend = AdbExplorerBackend(
+                            adb,
+                            serial=record.serial,
+                            package=record.package,
+                            session_id=record.session_id,
+                            per_action_timeout=min(8, max(1, wait_seconds)),
+                        )
+                        micro_backend.set_runtime_budget(
+                            min(micro_scenario_seed.timeout_seconds, max(1, wait_seconds))
+                        )
+                        micro_scenario_execution = micro_scenario_service.run(
+                            micro_scenario_seed,
+                            backend=micro_backend,
+                            scope=micro_scope or load_scope(self.paths),
+                            network_guard_active=traffic_started,
+                            available_observers=tuple(
+                                observer
+                                for observer, active in (
+                                    ("frida", frida_started),
+                                    ("traffic", traffic_started),
+                                    ("logcat", True),
+                                    ("private_storage", profile is ScanProfile.FULL),
+                                )
+                                if active
+                            ),
+                            serial=record.serial,
+                        )
+                        micro_scenario_executed = True
+                        if micro_scenario_execution.completed:
+                            steps["micro_scenario"] = "completed"
+                        elif micro_scenario_execution.outcome == "out_of_scope":
+                            steps["micro_scenario"] = "out_of_scope"
+                        elif micro_scenario_execution.result is not None:
+                            steps["micro_scenario"] = "partial"
+                        else:
+                            steps["micro_scenario"] = "not_exercised"
+                        micro_scenario_service.persist(
+                            record.session_id,
+                            micro_scenario_execution,
+                        )
+                    except (AndroidAssessorError, OSError, ValueError) as exc:
+                        steps["micro_scenario"] = "error"
+                        limitations.append(
+                            "Micro-scenario execution failed: "
+                            f"{redact_text(str(exc))[:300]}"
+                        )
+                    timed("micro_scenario", micro_started)
                 if autonomous_enabled:
                     selected_config = explorer_config or ExplorerConfig(
                         max_runtime_seconds=wait_seconds,
@@ -827,7 +1012,7 @@ class ScanService:
                             selected_config,
                             controlled_canary_delivery=True,
                         )
-                    feedback_collector = RuntimeFeedbackCollector(paths)
+                    feedback_collector = runtime_feedback_collector
                     exploration_started = time.perf_counter()
                     try:
                         explorer_scope = load_scope(self.paths)
@@ -1117,18 +1302,32 @@ class ScanService:
             limitations.append(f"Target logcat skipped: {redact_text(str(exc))[:300]}")
         timed("logcat", logcat_started)
 
+        correlation_result = scenario_result
+        correlation_plan: Any = scenario_plan
+        correlation_service = scenario_service
+        correlation_quota: int | None = None
+        if micro_scenario_execution is not None and micro_scenario_execution.result is not None:
+            correlation_result = micro_scenario_execution.result
+            correlation_plan = micro_scenario_execution.plan
+            correlation_service = (
+                micro_scenario_service.scenario_service
+                if micro_scenario_service is not None
+                else None
+            )
+            correlation_quota = micro_scenario_execution.seed.sink_verification_quota
         if (
-            scenario_result is not None
-            and scenario_plan is not None
-            and scenario_service is not None
+            correlation_result is not None
+            and correlation_plan is not None
+            and correlation_service is not None
         ):
             correlation_started = time.perf_counter()
             try:
                 scenario_correlation = self._finalize_scenario_correlation(
                     record,
-                    scenario_result=scenario_result,
-                    scenario_plan=scenario_plan,
-                    scenario_service=scenario_service,
+                    scenario_result=correlation_result,
+                    scenario_plan=correlation_plan,
+                    scenario_service=correlation_service,
+                    sink_verification_quota=correlation_quota,
                 )
             except (AndroidAssessorError, OSError, ValueError) as exc:
                 limitations.append(
@@ -1137,18 +1336,31 @@ class ScanService:
                 )
             timed("scenario_correlation", correlation_started)
 
+        metadata_result = scenario_result
+        if micro_scenario_execution is not None and micro_scenario_execution.result is not None:
+            metadata_result = micro_scenario_execution.result
         scenario_metadata = {
             "scenario_id": (
-                scenario_result.scenario_id if scenario_result is not None else None
+                metadata_result.scenario_id if metadata_result is not None else None
             ),
             "scenario_correlation_path": (
                 "redacted/scenario/"
-                + scenario_result.scenario_id
+                + metadata_result.scenario_id
                 + "/correlation.json"
-                if scenario_correlation is not None and scenario_result is not None
+                if scenario_correlation is not None and metadata_result is not None
+                else None
+            ),
+            "micro_scenario_path": (
+                "redacted/micro-scenario/result.json"
+                if micro_scenario_execution is not None
                 else None
             ),
         }
+        micro_scenario_payload = (
+            micro_scenario_execution.to_dict()
+            if micro_scenario_execution is not None
+            else None
+        )
 
         # Persist the execution outcome before rule evaluation so capability-
         # dependent rules can distinguish an unavailable module from a failed
@@ -1173,6 +1385,9 @@ class ScanService:
                 "controlled_canary_executed": controlled_canary_executed,
                 "ipc_validation_requested": ipc_validation,
                 "ipc_validation_executed": ipc_validation_executed,
+                "micro_scenario_requested": micro_scenario,
+                "micro_scenario_executed": micro_scenario_executed,
+                "micro_scenario": micro_scenario_payload,
                 "ipc_validation": (
                     ipc_validation_result.to_dict()
                     if ipc_validation_result is not None
@@ -1208,6 +1423,9 @@ class ScanService:
                 "controlled_canary_executed": controlled_canary_executed,
                 "ipc_validation_requested": ipc_validation,
                 "ipc_validation_executed": ipc_validation_executed,
+                "micro_scenario_requested": micro_scenario,
+                "micro_scenario_executed": micro_scenario_executed,
+                "micro_scenario": micro_scenario_payload,
                 "ipc_validation": (
                     ipc_validation_result.to_dict()
                     if ipc_validation_result is not None
@@ -1252,6 +1470,9 @@ class ScanService:
                     "controlled_canary_executed": controlled_canary_executed,
                     "ipc_validation_requested": ipc_validation,
                     "ipc_validation_executed": ipc_validation_executed,
+                    "micro_scenario_requested": micro_scenario,
+                    "micro_scenario_executed": micro_scenario_executed,
+                    "micro_scenario": micro_scenario_payload,
                     "ipc_validation": (
                         ipc_validation_result.to_dict()
                         if ipc_validation_result is not None
@@ -1296,6 +1517,9 @@ class ScanService:
                     "runtime_termination": runtime_termination,
                     "ipc_validation_requested": ipc_validation,
                     "ipc_validation_executed": ipc_validation_executed,
+                    "micro_scenario_requested": micro_scenario,
+                    "micro_scenario_executed": micro_scenario_executed,
+                    "micro_scenario": micro_scenario_payload,
                 },
                 root=self.paths.root,
             )
@@ -1322,5 +1546,7 @@ class ScanService:
             controlled_canary_executed=controlled_canary_executed,
             ipc_validation_requested=ipc_validation,
             ipc_validation_executed=ipc_validation_executed,
+            micro_scenario_requested=micro_scenario,
+            micro_scenario_executed=micro_scenario_executed,
             report_path="report.html",
         )

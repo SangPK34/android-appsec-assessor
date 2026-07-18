@@ -43,6 +43,8 @@ class ScenarioPlan:
     resolver: ScenarioSecretResolver
     owned_values: Mapping[str, str]
     upstream_mapping: Mapping[str, str]
+    owned_value_metadata: tuple[Mapping[str, Any], ...] = ()
+    canary_fingerprint: str | None = None
 
 
 class AdbScenarioBackend(ScenarioBackend):
@@ -165,10 +167,18 @@ class ScenarioService:
             else ScenarioSecretResolver(session_canary=session_canary)
         )
         owned_values: dict[str, str] = {}
+        owned_value_metadata: list[Mapping[str, Any]] = []
         for spec in bundle.profile.values.values():
             resolved = resolver.resolve(spec)
             if resolved.sensitive and resolved.fingerprint is not None:
                 owned_values[resolved.fingerprint] = resolved.reveal_for_input()
+                owned_value_metadata.append(
+                    {
+                        "type": spec.kind,
+                        "length": len(resolved.reveal_for_input()),
+                        "fingerprint": resolved.fingerprint,
+                    }
+                )
         upstream_mapping: dict[str, str] = {}
         if bundle.profile.local_backend_url and bundle.profile.upstream_backend_url:
             source = _backend_endpoint(bundle.profile.local_backend_url, "local_backend_url")
@@ -179,7 +189,14 @@ class ScenarioService:
             if target.split(":", 1)[0] not in {"127.0.0.1", "localhost"}:
                 raise ConfigurationError("Scenario upstream must remain on the local host.")
             upstream_mapping[source] = target
-        return ScenarioPlan(request, bundle, resolver, owned_values, upstream_mapping)
+        return ScenarioPlan(
+            request,
+            bundle,
+            resolver,
+            owned_values,
+            upstream_mapping,
+            tuple(owned_value_metadata),
+        )
 
     def run(
         self,
