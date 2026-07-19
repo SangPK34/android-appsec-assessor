@@ -47,8 +47,8 @@ def active_session(tmp_path: Path) -> tuple[ProjectPaths, SessionRepository, str
 def cleartext_finding() -> FindingRecord:
     now = datetime.now(UTC).isoformat()
     return FindingRecord(
-        finding_id="finding-asl-mvp-002",
-        rule_id="ASL-MVP-002",
+        finding_id="finding-asl-network-cleartext",
+        rule_id="ASL-NETWORK-CLEARTEXT",
         title="Cleartext",
         category="network",
         description="test",
@@ -78,7 +78,7 @@ def test_missing_scope_denies_validation_before_adb(tmp_path: Path) -> None:
         ValidationService(
             context,  # type: ignore[arg-type]
             repository,
-        ).validate(session_id, "finding-asl-mvp-002")
+        ).validate(session_id, "finding-asl-network-cleartext")
 
     assert context.adb_calls == 0
 
@@ -135,7 +135,7 @@ def test_manifest_host_is_not_implicitly_allowlisted(tmp_path: Path) -> None:
         ValidationService(
             context,  # type: ignore[arg-type]
             repository,
-        ).validate(session_id, "finding-asl-mvp-002")
+        ).validate(session_id, "finding-asl-network-cleartext")
 
     assert context.adb_calls == 0
 
@@ -213,7 +213,7 @@ def test_validation_request_limit_is_enforced_before_adb(tmp_path: Path) -> None
         ValidationService(
             context,  # type: ignore[arg-type]
             repository,
-        ).validate(session_id, "finding-asl-mvp-002")
+        ).validate(session_id, "finding-asl-network-cleartext")
 
     assert context.adb_calls == 0
 

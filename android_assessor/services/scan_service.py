@@ -1551,7 +1551,7 @@ class ScanService:
             raise
         self.repository.append_event(
             record.session_id,
-            "mvp_scan_completed",
+            "scan_completed",
             {"steps": steps, "profile": profile.value, "limitation_count": len(limitations)},
         )
         return ScanResult(

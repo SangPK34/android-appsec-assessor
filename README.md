@@ -1,6 +1,8 @@
 # Android AppSec Assessor
 
-Android AppSec Assessor là framework chạy trên Windows, hỗ trợ kiểm thử bảo mật ứng dụng Android thông qua phân tích APK, ADB, giám sát lưu lượng, quan sát runtime, xác minh có kiểm soát và tạo báo cáo bằng chứng.
+Android AppSec Assessor là framework chạy local trên Windows để đánh giá bảo mật ứng dụng Android trong phạm vi được cho phép. Framework kết hợp phân tích APK, ADB, quan sát runtime, giám sát lưu lượng và xác minh có kiểm soát; mỗi kết luận phải liên kết với evidence và giới hạn quan sát cụ thể.
+
+Framework không suy diễn khả năng khai thác chỉ từ manifest, API reference, chuỗi tĩnh, quyền root hay một lệnh ADB thành công. Khi một flow chưa được kích hoạt hoặc evidence không đủ attribution, kết quả phải giữ ở trạng thái không kết luận thay vì nâng thành lỗ hổng.
 
 ## Tính năng chính
 
@@ -31,7 +33,15 @@ Root và Frida là capability hỗ trợ cho các nhóm phân tích tăng cườ
 | Runtime | Crypto API, TLS API, WebView, logging, storage và root-detection behavior |
 | Evidence | Hash, provenance, redaction, liên kết evidence với finding và trạng thái cleanup |
 
-Framework không mặc định coi mọi observation là vulnerability. Kết quả được phân loại theo bằng chứng và capability, gồm `pass`, `potential`, `confirmed`, `inconclusive`, `skipped` và `error`. Phân tích storage có thể dùng thêm trạng thái `post_compromise_observation` để tách khả năng đọc dữ liệu sau khi đã có quyền cao khỏi một finding của ứng dụng.
+Framework không mặc định coi mọi observation là vulnerability. Trạng thái finding thể hiện mức bằng chứng, không phải mức nghiêm trọng:
+
+- `confirmed`: hành vi liên quan đã được tái hiện hoặc quan sát với attribution đúng scope.
+- `potential`: có candidate hoặc cấu hình đáng xem xét, nhưng chưa có bằng chứng runtime đủ mạnh.
+- `inconclusive`: đã đánh giá nhưng thiếu capability, activation hoặc evidence cần thiết.
+- `pass`: điều kiện hoặc route đã kiểm tra không thỏa tiêu chí finding; không có nghĩa toàn bộ ứng dụng an toàn.
+- `skipped` và `error`: thao tác không chạy được hoặc kết thúc lỗi, luôn kèm lý do trong report.
+
+Controlled validation còn ghi kết quả riêng theo route, như `rejected_for_tested_route`, `not_exercised` hoặc `out_of_scope`. Phân tích storage có thể dùng `post_compromise_observation` để tách khả năng đọc dữ liệu sau khi đã có quyền cao khỏi finding của ứng dụng.
 
 ## Kiến trúc và workflow
 
@@ -150,6 +160,7 @@ Một số command thường dùng:
 .\run.cmd inspect-device --serial SERIAL
 .\run.cmd inspect-app --serial SERIAL --package PACKAGE
 .\run.cmd scan --serial SERIAL --package PACKAGE
+.\run.cmd scan --serial SERIAL --package PACKAGE --auto --max-runtime 60
 .\run.cmd session create --serial SERIAL --package PACKAGE
 .\run.cmd session list
 .\run.cmd session show --session SESSION_ID
@@ -159,6 +170,8 @@ Một số command thường dùng:
 ```
 
 Các giá trị `SERIAL`, `PACKAGE`, `SESSION_ID` và `FINDING_ID` trong ví dụ là placeholder. Dùng `--json` cho các command hỗ trợ xuất dữ liệu máy đọc được; `--show-serial` chỉ nên dùng trong môi trường local được kiểm soát.
+
+`scan --auto` chạy Full Assessment không cần thao tác UI của người dùng: nó dùng exploration, IPC validation và micro-scenario có quota/timeout riêng. Chế độ này vẫn không đoán credential, không lặp lại submit khi trạng thái không rõ, và báo `not_exercised` hoặc `inconclusive` khi không thể đi tới một flow.
 
 ## Quy trình sử dụng cơ bản
 
@@ -209,6 +222,7 @@ config/            Cấu hình lab, scope mẫu và tool manifest.
 hooks/             Hook runtime cố định cho Frida và mitmproxy.
 rules/             Khai báo rule đánh giá.
 tests/             Test unit và fixture mô phỏng.
+benchmarks/        Profile và scenario dành riêng cho benchmark local, tách khỏi production engine.
 web/               Template và static asset của Web UI.
 docs/              Tài liệu kỹ thuật và hướng dẫn chuyên sâu.
 ```

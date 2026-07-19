@@ -16,7 +16,10 @@ def prepared_rule_session(tmp_path: Path) -> tuple[ProjectPaths, SessionReposito
     paths.ensure_layout()
     rules_dir = paths.root / "rules"
     rules_dir.mkdir()
-    copyfile(Path(__file__).resolve().parent.parent / "rules" / "mvp.yaml", rules_dir / "mvp.yaml")
+    copyfile(
+        Path(__file__).resolve().parent.parent / "rules" / "core.yaml",
+        rules_dir / "core.yaml",
+    )
     repository = SessionRepository(paths)
     record = repository.initialize(serial="ABC123", package="com.example.app")
     session_paths = repository.paths_for(record.session_id)
@@ -92,10 +95,10 @@ def test_unattributed_background_traffic_cannot_confirm_target_findings(
 
     findings = {item.rule_id: item for item in RuleEngine(paths, repository).evaluate(session_id)}
 
-    assert findings["ASL-MVP-002"].status is FindingStatus.PASS
-    assert findings["ASL-MVP-003"].status is FindingStatus.INCONCLUSIVE
-    assert findings["ASL-MVP-005"].status is FindingStatus.INCONCLUSIVE
-    assert findings["ASL-MVP-002"].details["unattributed_request_count"] == 2
+    assert findings["ASL-NETWORK-CLEARTEXT"].status is FindingStatus.PASS
+    assert findings["ASL-RUNTIME-SENSITIVE-SINK"].status is FindingStatus.INCONCLUSIVE
+    assert findings["ASL-NETWORK-TLS-TRUST"].status is FindingStatus.INCONCLUSIVE
+    assert findings["ASL-NETWORK-CLEARTEXT"].details["unattributed_request_count"] == 2
 
 
 def test_validation_canary_attribution_can_confirm_cleartext(tmp_path: Path) -> None:
@@ -119,10 +122,10 @@ def test_validation_canary_attribution_can_confirm_cleartext(tmp_path: Path) -> 
 
     findings = {item.rule_id: item for item in RuleEngine(paths, repository).evaluate(session_id)}
 
-    assert findings["ASL-MVP-002"].status is FindingStatus.CONFIRMED
-    assert findings["ASL-MVP-003"].status is FindingStatus.CONFIRMED
-    assert findings["ASL-MVP-003"].details["exact_canary_flow_count"] == 1
-    assert findings["ASL-MVP-003"].details["traffic_canary_sink_types"] == [
+    assert findings["ASL-NETWORK-CLEARTEXT"].status is FindingStatus.CONFIRMED
+    assert findings["ASL-RUNTIME-SENSITIVE-SINK"].status is FindingStatus.CONFIRMED
+    assert findings["ASL-RUNTIME-SENSITIVE-SINK"].details["exact_canary_flow_count"] == 1
+    assert findings["ASL-RUNTIME-SENSITIVE-SINK"].details["traffic_canary_sink_types"] == [
         "http_body",
         "http_header",
     ]
@@ -149,7 +152,7 @@ def test_sensitive_name_without_exact_canary_is_only_potential(tmp_path: Path) -
     finding = next(
         item
         for item in RuleEngine(paths, repository).evaluate(session_id)
-        if item.rule_id == "ASL-MVP-003"
+        if item.rule_id == "ASL-RUNTIME-SENSITIVE-SINK"
     )
 
     assert finding.status is FindingStatus.POTENTIAL

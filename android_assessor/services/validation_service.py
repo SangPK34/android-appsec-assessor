@@ -1,4 +1,4 @@
-"""Three bounded canary validations for findings produced by the MVP rules."""
+"""Three bounded canary validations for findings produced by the core rules."""
 
 from __future__ import annotations
 
@@ -280,7 +280,7 @@ class ValidationService:
     ) -> ValidationRecord:
         component = self._exported_activity(finding)
         if component is None:
-            exported = self.findings.get(session_id, "finding-asl-mvp-004")
+            exported = self.findings.get(session_id, "finding-asl-ipc-exported-component")
             component = self._exported_activity(exported)
         if component is None:
             return ValidationRecord(
@@ -636,11 +636,11 @@ class ValidationService:
             raise SessionError("This controlled validation is not enabled in production.")
         self._reserve_validation_attempt(session_id, max_requests)
         canary = self._canary()
-        if finding.rule_id == "ASL-MVP-002":
+        if finding.rule_id == "ASL-NETWORK-CLEARTEXT":
             validation = self._validate_cleartext(session_id, finding, canary)
-        elif finding.rule_id == "ASL-MVP-003":
+        elif finding.rule_id == "ASL-RUNTIME-SENSITIVE-SINK":
             validation = self._validate_sensitive_log(session_id, finding, canary)
-        elif finding.rule_id == "ASL-MVP-004":
+        elif finding.rule_id == "ASL-IPC-EXPORTED-COMPONENT":
             validation = self._validate_exported_activity(session_id, finding, canary)
         elif finding.rule_id == "STORAGE-WORLD-READABLE":
             validation = self._validate_world_readable_storage(

@@ -68,7 +68,7 @@ def test_validation_refuses_inactive_session_before_adb(tmp_path: Path) -> None:
     with pytest.raises(SessionError, match="active session"):
         ValidationService(context, repository).validate(  # type: ignore[arg-type]
             session_id,
-            "finding-asl-mvp-002",
+            "finding-asl-network-cleartext",
         )
 
     assert context.adb_calls == 0

@@ -147,7 +147,7 @@ def _is_aggregate_alias(
     finding: dict[str, Any],
     rule_statuses: dict[str, str],
 ) -> bool:
-    if str(finding.get("rule_id", "")) != "ASL-MVP-004":
+    if str(finding.get("rule_id", "")) != "ASL-IPC-EXPORTED-COMPONENT":
         return False
     family = {
         "ASL-MANIFEST-EXPORTED-ACTIVITY",

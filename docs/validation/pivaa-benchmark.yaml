@@ -44,7 +44,7 @@ benchmark_runs:
 cases:
   - category: debug_test_configuration
     ground_truth_evidence: manifest.debuggable_or_test_only
-    eligible_framework_rule: ASL-MVP-001
+    eligible_framework_rule: ASL-CONFIG-DEBUGGABLE
     expected_minimum_status: confirmed
     observed_status: confirmed
     reason_for_mismatch: null
@@ -56,7 +56,7 @@ cases:
     reason_for_mismatch: null
   - category: cleartext_network_configuration
     ground_truth_evidence: manifest.uses_cleartext_traffic_or_network_security_config
-    eligible_framework_rule: ASL-MVP-002
+    eligible_framework_rule: ASL-NETWORK-CLEARTEXT
     expected_minimum_status: inconclusive
     observed_status: inconclusive
     reason_for_mismatch: "No scoped HTTPS or cleartext request evidence was collected."
@@ -104,7 +104,7 @@ cases:
     reason_for_mismatch: null
   - category: tls_behavior
     ground_truth_evidence: https_request_and_certificate_trust_event
-    eligible_framework_rule: ASL-MVP-005
+    eligible_framework_rule: ASL-NETWORK-TLS-TRUST
     expected_minimum_status: inconclusive
     observed_status: inconclusive
     reason_for_mismatch: "No in-scope HTTPS action completed through the lab proxy."

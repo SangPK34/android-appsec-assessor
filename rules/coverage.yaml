@@ -6,7 +6,7 @@ class_statuses:
 class_outcomes:
   [confirmed, potential, rejected_for_tested_route, inconclusive, not_exercised, out_of_scope]
 id_kinds:
-  production_rule: IDs present in rules/mvp.yaml and evaluated by RuleEngine.
+  production_rule: IDs present in rules/core.yaml and evaluated by RuleEngine.
   analyzer_result: IDs emitted by an analyzer but not independently evaluated by RuleEngine.
   inventory_only: IDs identify evidence inventory and never imply a finding.
   planned: ASL-PLANNED-* IDs describe explicit unsupported or deferred coverage.
@@ -15,7 +15,7 @@ id_kinds:
 # A class is not "implemented" merely because one of its rules can emit a finding.
 class_matrix:
   - class: build_and_manifest_configuration
-    rule_ids: [ASL-MVP-001, ASL-MANIFEST-ALLOW-BACKUP]
+    rule_ids: [ASL-CONFIG-DEBUGGABLE, ASL-MANIFEST-ALLOW-BACKUP]
     detection_mode: [static]
     runtime_observer: []
     controlled_validator: []
@@ -38,7 +38,7 @@ class_matrix:
 
   - class: exported_components_and_ipc_boundaries
     rule_ids:
-      - ASL-MVP-004
+      - ASL-IPC-EXPORTED-COMPONENT
       - ASL-MANIFEST-EXPORTED-ACTIVITY
       - ASL-MANIFEST-EXPORTED-SERVICE
       - ASL-MANIFEST-EXPORTED-RECEIVER
@@ -69,7 +69,7 @@ class_matrix:
     next_action: Add bounded service validation only after a generic reversible observable contract exists.
 
   - class: sensitive_logging_and_exposed_data_sinks
-    rule_ids: [ASL-MVP-003, ASL-RUNTIME-LOGGING]
+    rule_ids: [ASL-RUNTIME-SENSITIVE-SINK, ASL-RUNTIME-LOGGING]
     detection_mode: [autonomous_runtime, controlled_validation]
     runtime_observer: [frida_sensitive_sink, pid_attributed_logcat, attributed_traffic]
     controlled_validator: [sensitive_logging_canary]
@@ -139,7 +139,7 @@ class_matrix:
     next_action: Add const-string use-site provenance and dependency-noise fixtures before any confirmation path.
 
   - class: cleartext_and_tls_trust_behavior
-    rule_ids: [ASL-MVP-002, ASL-MVP-005]
+    rule_ids: [ASL-NETWORK-CLEARTEXT, ASL-NETWORK-TLS-TRUST]
     detection_mode: [static, autonomous_runtime, controlled_validation]
     runtime_observer: [attributed_traffic, frida_tls_trust]
     controlled_validator: [cleartext_canary]
@@ -285,7 +285,7 @@ storage_runtime_defaults: &storage_runtime_defaults
   activation_required: root_storage_and_autonomous_exploration
   runtime_sources: [private_storage, frida, autonomous_explorer]
 rules:
-  - rule_id: ASL-MVP-001
+  - rule_id: ASL-CONFIG-DEBUGGABLE
     <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: debug_test_configuration
@@ -313,7 +313,7 @@ rules:
     default_profile: quick
     implementation_status: partially_detected
 
-  - rule_id: ASL-MVP-002
+  - rule_id: ASL-NETWORK-CLEARTEXT
     <<: *network_runtime_defaults
     id_kind: production_rule
     vulnerability_class: cleartext_network_policy
@@ -327,7 +327,7 @@ rules:
     default_profile: quick
     implementation_status: partially_detected
 
-  - rule_id: ASL-MVP-003
+  - rule_id: ASL-RUNTIME-SENSITIVE-SINK
     <<: *network_runtime_defaults
     runtime_sources: [traffic, logcat, frida, autonomous_explorer]
     id_kind: production_rule
@@ -342,7 +342,7 @@ rules:
     default_profile: full
     implementation_status: partially_detected
 
-  - rule_id: ASL-MVP-004
+  - rule_id: ASL-IPC-EXPORTED-COMPONENT
     <<: *coverage_defaults
     id_kind: production_rule
     vulnerability_class: exported_component_aggregate
@@ -628,7 +628,7 @@ rules:
     default_profile: full
     implementation_status: detected
 
-  - rule_id: ASL-MVP-005
+  - rule_id: ASL-NETWORK-TLS-TRUST
     <<: *network_runtime_defaults
     id_kind: production_rule
     vulnerability_class: tls_certificate_validation

@@ -179,8 +179,8 @@ def _session(
     )
     (paths.root / "rules").mkdir()
     copyfile(
-        Path(__file__).resolve().parent.parent / "rules" / "mvp.yaml",
-        paths.root / "rules" / "mvp.yaml",
+        Path(__file__).resolve().parent.parent / "rules" / "core.yaml",
+        paths.root / "rules" / "core.yaml",
     )
     repository = SessionRepository(paths)
     record = repository.initialize(serial=SERIAL, package=PACKAGE)

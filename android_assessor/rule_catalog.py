@@ -22,7 +22,7 @@ class RootFocusedTestDefinition:
 
 ROOT_FOCUSED_TESTS: tuple[RootFocusedTestDefinition, ...] = (
     RootFocusedTestDefinition(
-        "ASL-MVP-001",
+        "ASL-CONFIG-DEBUGGABLE",
         "Debuggable or test-only build",
         True,
         True,
@@ -38,7 +38,7 @@ ROOT_FOCUSED_TESTS: tuple[RootFocusedTestDefinition, ...] = (
         "IMPLEMENTED_UNVERIFIED",
     ),
     RootFocusedTestDefinition(
-        "ASL-MVP-002",
+        "ASL-NETWORK-CLEARTEXT",
         "Cleartext configuration and attributed runtime canary",
         True,
         True,
@@ -46,7 +46,7 @@ ROOT_FOCUSED_TESTS: tuple[RootFocusedTestDefinition, ...] = (
         "IMPLEMENTED",
     ),
     RootFocusedTestDefinition(
-        "ASL-MVP-003",
+        "ASL-RUNTIME-SENSITIVE-SINK",
         "Sensitive logging or URL token metadata",
         True,
         True,
@@ -54,7 +54,7 @@ ROOT_FOCUSED_TESTS: tuple[RootFocusedTestDefinition, ...] = (
         "IMPLEMENTED",
     ),
     RootFocusedTestDefinition(
-        "ASL-MVP-004",
+        "ASL-IPC-EXPORTED-COMPONENT",
         "Exported Activity protection and controlled impact",
         True,
         True,
@@ -94,7 +94,7 @@ ROOT_FOCUSED_TESTS: tuple[RootFocusedTestDefinition, ...] = (
         "IMPLEMENTED_UNVERIFIED",
     ),
     RootFocusedTestDefinition(
-        "ASL-MVP-005",
+        "ASL-NETWORK-TLS-TRUST",
         "TLS and certificate trust behavior",
         True,
         True,

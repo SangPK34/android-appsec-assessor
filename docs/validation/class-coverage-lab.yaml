@@ -110,7 +110,7 @@ cases:
     session_id: 20260718-213857-8de6f9
     outcome: confirmed
     tested_scope: debuggable_build_flag
-    evidence: ASL-MVP-001 was confirmed from the normalized manifest flag.
+    evidence: ASL-CONFIG-DEBUGGABLE was confirmed from the normalized manifest flag.
 
   - case_id: exported_receiver_boundary
     session_id: 20260718-191354-57d6af
@@ -122,7 +122,7 @@ cases:
     session_id: 20260718-213857-8de6f9
     outcome: confirmed
     tested_scope: exact_canary_http_body_sink
-    evidence: ASL-MVP-003 was confirmed only after the exact session canary reached a package-attributed external HTTP body sink.
+    evidence: ASL-RUNTIME-SENSITIVE-SINK was confirmed only after the exact session canary reached a package-attributed external HTTP body sink.
 
   - case_id: world_readable_storage_route
     session_id: 20260718-191354-57d6af
@@ -140,7 +140,7 @@ cases:
     session_id: 20260718-213857-8de6f9
     outcome: confirmed
     tested_scope: attributed_cleartext_canary_route
-    evidence: ASL-MVP-002 was confirmed by an exact-canary HTTP flow attributed to the authorized target.
+    evidence: ASL-NETWORK-CLEARTEXT was confirmed by an exact-canary HTTP flow attributed to the authorized target.
 
   - case_id: weak_crypto_operation
     session_id: 20260718-104753-447618

@@ -350,8 +350,8 @@ def prepared_rule_session(tmp_path: Path) -> tuple[ProjectPaths, SessionReposito
     paths.ensure_layout()
     (paths.root / "rules").mkdir()
     copyfile(
-        Path(__file__).resolve().parent.parent / "rules" / "mvp.yaml",
-        paths.root / "rules" / "mvp.yaml",
+        Path(__file__).resolve().parent.parent / "rules" / "core.yaml",
+        paths.root / "rules" / "core.yaml",
     )
     repository = SessionRepository(paths)
     record = repository.initialize(serial="FIXTURE_SERIAL", package="com.example.app")
@@ -380,7 +380,7 @@ def prepared_rule_session(tmp_path: Path) -> tuple[ProjectPaths, SessionReposito
         ("validation_canary", FindingStatus.CONFIRMED),
     ),
 )
-def test_mvp_tls_rule_requires_validation_canary_for_confirmation(
+def test_tls_rule_requires_validation_canary_for_confirmation(
     tmp_path: Path,
     attribution: str,
     expected: FindingStatus,
@@ -415,7 +415,7 @@ def test_mvp_tls_rule_requires_validation_canary_for_confirmation(
         item.rule_id: item for item in RuleEngine(paths, repository).evaluate(session_id)
     }
 
-    assert findings["ASL-MVP-005"].status is expected
-    assert findings["ASL-MVP-005"].details["tls_behavior_state"] == (
+    assert findings["ASL-NETWORK-TLS-TRUST"].status is expected
+    assert findings["ASL-NETWORK-TLS-TRUST"].details["tls_behavior_state"] == (
         "MITM_ACCEPTED" if expected is FindingStatus.CONFIRMED else "INCONCLUSIVE"
     )

@@ -245,7 +245,7 @@ class RuleEngine:
         self.sessions = sessions or SessionRepository(paths)
         self.findings = FindingRepository(paths, self.sessions)
         self.evidence = EvidenceRepository(paths, self.sessions)
-        self.definitions = self._load_definitions(paths.root / "rules" / "mvp.yaml")
+        self.definitions = self._load_definitions(paths.root / "rules" / "core.yaml")
 
     def _load_definitions(self, path: Path) -> tuple[RuleDefinition, ...]:
         self.paths.require_inside_root(path)

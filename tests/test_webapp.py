@@ -287,7 +287,6 @@ def test_app_scan_form_has_visible_progress_and_error_swap_contract() -> None:
     response = client.get(f"/sessions/{session_id}/app")
 
     assert response.status_code == 200
-    assert "Start MVP scan" not in response.text
     assert "Quick Scan" in response.text
     assert "Full Assessment" in response.text
     assert 'name="profile" value="quick"' in response.text

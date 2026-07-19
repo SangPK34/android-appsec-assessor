@@ -1,6 +1,6 @@
 schema_version: 1
 rules:
-  - id: ASL-MVP-001
+  - id: ASL-CONFIG-DEBUGGABLE
     evaluator: app_debuggable
     title: Debuggable or test-only application build
     category: code-quality
@@ -15,7 +15,7 @@ rules:
     cwe_mapping: mapping_pending
     remediation: Disable android:debuggable and android:testOnly in release builds.
 
-  - id: ASL-MVP-002
+  - id: ASL-NETWORK-CLEARTEXT
     evaluator: cleartext
     title: Cleartext network traffic or permissive cleartext configuration
     category: network
@@ -30,7 +30,7 @@ rules:
     cwe_mapping: mapping_pending
     remediation: Enforce HTTPS and deny cleartext traffic in Network Security Configuration.
 
-  - id: ASL-MVP-003
+  - id: ASL-RUNTIME-SENSITIVE-SINK
     evaluator: sensitive_token
     title: Sensitive canary reached an exposed runtime sink
     category: data-storage
@@ -45,7 +45,7 @@ rules:
     cwe_mapping: mapping_pending
     remediation: Keep sensitive values out of exposed sinks and enforce an explicit, protected trust boundary before sharing data.
 
-  - id: ASL-MVP-004
+  - id: ASL-IPC-EXPORTED-COMPONENT
     evaluator: exported_component
     title: Exported component without an explicit protection boundary
     category: platform
@@ -61,7 +61,7 @@ rules:
     cwe_mapping: mapping_pending
     remediation: Disable unnecessary exports or enforce a signature-level permission and input validation.
 
-  - id: ASL-MVP-005
+  - id: ASL-NETWORK-TLS-TRUST
     evaluator: tls_interception
     title: TLS interception and certificate trust behavior
     category: network

@@ -66,8 +66,8 @@ class Context:
 def exported_finding() -> FindingRecord:
     now = datetime.now(UTC).isoformat()
     return FindingRecord(
-        finding_id="finding-asl-mvp-004",
-        rule_id="ASL-MVP-004",
+        finding_id="finding-asl-ipc-exported-component",
+        rule_id="ASL-IPC-EXPORTED-COMPONENT",
         title="Exported component",
         category="platform",
         description="test",
@@ -231,7 +231,7 @@ def test_exported_activity_requires_observable_canary_impact(
     updated = ValidationService(
         Context(paths, adb),  # type: ignore[arg-type]
         repository,
-    ).validate(session.session_id, "finding-asl-mvp-004")
+    ).validate(session.session_id, "finding-asl-ipc-exported-component")
 
     assert adb.launches == 1
     assert updated.status is expected
@@ -261,8 +261,8 @@ def test_world_readable_storage_receiver_validation_re_evaluates_evidence(
     paths.ensure_layout()
     (paths.root / "rules").mkdir()
     copyfile(
-        Path(__file__).resolve().parent.parent / "rules" / "mvp.yaml",
-        paths.root / "rules" / "mvp.yaml",
+        Path(__file__).resolve().parent.parent / "rules" / "core.yaml",
+        paths.root / "rules" / "core.yaml",
     )
     paths.scope_file.write_text(
         "devices: [ABC123]\npackages: [com.example.app]\napi_hosts: []\n"

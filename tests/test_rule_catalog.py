@@ -24,7 +24,7 @@ def test_catalog_merge_preserves_observed_status_without_faking_unrun_results() 
     merged = merge_root_coverage(
         [
             {
-                "test_id": "ASL-MVP-001",
+                "test_id": "ASL-CONFIG-DEBUGGABLE",
                 "finding_status": "pass",
                 "physical_validation_status": "UNVERIFIED",
             }
@@ -32,7 +32,7 @@ def test_catalog_merge_preserves_observed_status_without_faking_unrun_results() 
     )
     by_id = {item["test_id"]: item for item in merged}
 
-    assert by_id["ASL-MVP-001"]["finding_status"] == "pass"
+    assert by_id["ASL-CONFIG-DEBUGGABLE"]["finding_status"] == "pass"
     assert by_id["ASL-ROOT-STORAGE"]["finding_status"] == "skipped"
     assert all(item["physical_validation_status"] != "PASSED" for item in merged)
 
@@ -284,7 +284,7 @@ def test_coverage_registry_includes_every_crypto_analyzer_result_id() -> None:
         (root / "rules" / "coverage.yaml").read_text(encoding="utf-8")
     )
     production = yaml.safe_load(
-        (root / "rules" / "mvp.yaml").read_text(encoding="utf-8")
+        (root / "rules" / "core.yaml").read_text(encoding="utf-8")
     )["rules"]
     production_ids = {row["id"] for row in production}
     tree = ast.parse(
@@ -322,9 +322,9 @@ def test_partial_coverage_claims_match_current_production_boundaries() -> None:
     by_id = {row["rule_id"]: row for row in rows}
 
     for rule_id in {
-        "ASL-MVP-001",
+        "ASL-CONFIG-DEBUGGABLE",
         "ASL-MANIFEST-ALLOW-BACKUP",
-        "ASL-MVP-002",
+        "ASL-NETWORK-CLEARTEXT",
         "ASL-MANIFEST-CUSTOM-PERMISSION",
         "ASL-MANIFEST-FILEPROVIDER-PATHS",
         "ASL-MANIFEST-DEEP-LINK-EXPOSURE",
@@ -342,7 +342,7 @@ def test_phase2_registry_does_not_overstate_static_or_auto_confirm_support() -> 
     by_id = {row["rule_id"]: row for row in rows}
 
     for rule_id in {
-        "ASL-MVP-005",
+        "ASL-NETWORK-TLS-TRUST",
         "CRYPTO-SHORT-KEY",
         "CRYPTO-ZERO-IV",
         "CRYPTO-REUSED-IV",
@@ -397,7 +397,7 @@ def test_coverage_registry_matches_production_rule_and_validation_catalog() -> N
         (root / "rules" / "coverage.yaml").read_text(encoding="utf-8")
     )["rules"]
     production = yaml.safe_load(
-        (root / "rules" / "mvp.yaml").read_text(encoding="utf-8")
+        (root / "rules" / "core.yaml").read_text(encoding="utf-8")
     )["rules"]
     coverage_by_id = {row["rule_id"]: row for row in coverage}
     production_by_id = {row["id"]: row for row in production}

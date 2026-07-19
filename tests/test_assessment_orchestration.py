@@ -39,8 +39,8 @@ def _rule_session(tmp_path: Path) -> tuple[ProjectPaths, SessionRepository, str]
     paths.ensure_layout()
     (paths.root / "rules").mkdir()
     copyfile(
-        Path(__file__).resolve().parent.parent / "rules" / "mvp.yaml",
-        paths.root / "rules" / "mvp.yaml",
+        Path(__file__).resolve().parent.parent / "rules" / "core.yaml",
+        paths.root / "rules" / "core.yaml",
     )
     repository = SessionRepository(paths)
     record = repository.initialize(serial="emulator-5554", package="com.example.app")
@@ -74,7 +74,7 @@ def _rule_session(tmp_path: Path) -> tuple[ProjectPaths, SessionRepository, str]
 def test_profiles_are_explicit_and_rule_catalog_is_extended() -> None:
     assert ScanProfile.parse("quick") is ScanProfile.QUICK
     assert ScanProfile.parse("FULL") is ScanProfile.FULL
-    assert len(__import__("yaml").safe_load(Path("rules/mvp.yaml").read_text())["rules"]) >= 10
+    assert len(__import__("yaml").safe_load(Path("rules/core.yaml").read_text())["rules"]) >= 10
 
 
 def test_profile_resolution_preserves_direct_api_compatibility() -> None:
@@ -1415,18 +1415,18 @@ def test_runtime_stop_request_is_idempotent_marker(tmp_path: Path) -> None:
 
 def test_exported_component_aggregate_is_suppressed_when_specific_rules_run() -> None:
     conclusive = {
-        "ASL-MVP-004": "potential",
+        "ASL-IPC-EXPORTED-COMPONENT": "potential",
         "ASL-MANIFEST-EXPORTED-ACTIVITY": "pass",
         "ASL-MANIFEST-EXPORTED-SERVICE": "pass",
         "ASL-MANIFEST-EXPORTED-RECEIVER": "potential",
         "ASL-MANIFEST-EXPORTED-PROVIDER": "pass",
     }
-    assert _is_aggregate_alias({"rule_id": "ASL-MVP-004"}, conclusive) is True
+    assert _is_aggregate_alias({"rule_id": "ASL-IPC-EXPORTED-COMPONENT"}, conclusive) is True
     assert _is_aggregate_alias(
-        {"rule_id": "ASL-MVP-004"},
+        {"rule_id": "ASL-IPC-EXPORTED-COMPONENT"},
         {**conclusive, "ASL-MANIFEST-EXPORTED-SERVICE": "inconclusive"},
     ) is False
     assert _is_aggregate_alias(
-        {"rule_id": "ASL-MVP-004"},
-        {"ASL-MVP-004": "potential"},
+        {"rule_id": "ASL-IPC-EXPORTED-COMPONENT"},
+        {"ASL-IPC-EXPORTED-COMPONENT": "potential"},
     ) is False

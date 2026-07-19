@@ -42,7 +42,7 @@ class ValidationDefinition:
 VALIDATION_DEFINITIONS: tuple[ValidationDefinition, ...] = (
     ValidationDefinition(
         validation_id="cleartext_canary",
-        rule_id="ASL-MVP-002",
+        rule_id="ASL-NETWORK-CLEARTEXT",
         validation_type="adb_assisted_validation",
         preconditions=("Active scoped session", "Allowlisted HTTP deep link"),
         required_capabilities=(
@@ -62,7 +62,7 @@ VALIDATION_DEFINITIONS: tuple[ValidationDefinition, ...] = (
     ),
     ValidationDefinition(
         validation_id="sensitive_logging_canary",
-        rule_id="ASL-MVP-003",
+        rule_id="ASL-RUNTIME-SENSITIVE-SINK",
         validation_type="adb_assisted_validation",
         preconditions=("Active scoped session", "Controlled canary delivery component"),
         required_capabilities=("ADB_AUTHORIZED", "LOGCAT_ACCESS"),
@@ -76,7 +76,7 @@ VALIDATION_DEFINITIONS: tuple[ValidationDefinition, ...] = (
     ),
     ValidationDefinition(
         validation_id="exported_activity_canary",
-        rule_id="ASL-MVP-004",
+        rule_id="ASL-IPC-EXPORTED-COMPONENT",
         validation_type="adb_assisted_validation",
         preconditions=("Active scoped session", "Unprotected exported activity"),
         required_capabilities=("ADB_AUTHORIZED",),

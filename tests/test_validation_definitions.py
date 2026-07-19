@@ -41,9 +41,9 @@ def test_validation_registry_has_unique_complete_bounded_definitions() -> None:
 
 def test_existing_validations_are_registered_and_production_enabled() -> None:
     expected = {
-        "ASL-MVP-002": "cleartext_canary",
-        "ASL-MVP-003": "sensitive_logging_canary",
-        "ASL-MVP-004": "exported_activity_canary",
+        "ASL-NETWORK-CLEARTEXT": "cleartext_canary",
+        "ASL-RUNTIME-SENSITIVE-SINK": "sensitive_logging_canary",
+        "ASL-IPC-EXPORTED-COMPONENT": "exported_activity_canary",
         "STORAGE-WORLD-READABLE": "world_readable_storage_receiver_probe",
     }
 

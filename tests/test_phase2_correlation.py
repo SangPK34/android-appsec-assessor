@@ -28,8 +28,8 @@ def _prepared_session(
     paths.ensure_layout()
     (paths.root / "rules").mkdir()
     copyfile(
-        Path(__file__).resolve().parent.parent / "rules" / "mvp.yaml",
-        paths.root / "rules" / "mvp.yaml",
+        Path(__file__).resolve().parent.parent / "rules" / "core.yaml",
+        paths.root / "rules" / "core.yaml",
     )
     repository = SessionRepository(paths)
     record = repository.initialize(serial="FIXTURE_SERIAL", package=PACKAGE)
@@ -633,7 +633,7 @@ def test_custom_trust_runtime_is_potential_and_generic_tls_call_is_inconclusive(
             ),
         ],
     )
-    custom = _findings(paths, repository, session_id)["ASL-MVP-005"]
+    custom = _findings(paths, repository, session_id)["ASL-NETWORK-TLS-TRUST"]
     assert custom.status is FindingStatus.POTENTIAL
     assert custom.details["custom_trust_manager_observed"] is True
     assert custom.details["trust_manager_accept_observed"] is True
@@ -659,7 +659,7 @@ def test_custom_trust_runtime_is_potential_and_generic_tls_call_is_inconclusive(
             )
         ],
     )
-    generic = _findings(safe_paths, safe_repository, safe_session)["ASL-MVP-005"]
+    generic = _findings(safe_paths, safe_repository, safe_session)["ASL-NETWORK-TLS-TRUST"]
     assert generic.status is FindingStatus.INCONCLUSIVE
 
 
@@ -687,7 +687,7 @@ def test_exact_canary_storage_sink_confirms_but_shape_or_wrong_package_does_not(
         ],
     )
     findings = _findings(paths, repository, session_id)
-    aggregate = findings["ASL-MVP-003"]
+    aggregate = findings["ASL-RUNTIME-SENSITIVE-SINK"]
     exact = findings["STORAGE-SENSITIVE-CANARY"]
     assert aggregate.status is FindingStatus.INCONCLUSIVE
     assert exact.status is FindingStatus.CONFIRMED
@@ -720,7 +720,7 @@ def test_exact_canary_storage_sink_confirms_but_shape_or_wrong_package_does_not(
         rejected_paths,
         rejected_repository,
         rejected_session,
-    )["ASL-MVP-003"]
+    )["ASL-RUNTIME-SENSITIVE-SINK"]
     assert rejected.status is FindingStatus.INCONCLUSIVE
 
 
@@ -755,7 +755,7 @@ def test_exact_canary_sensitive_sinks_require_a_clear_external_boundary(
         confirmed_paths,
         confirmed_repository,
         confirmed_session,
-    )["ASL-MVP-003"]
+    )["ASL-RUNTIME-SENSITIVE-SINK"]
     assert confirmed.status is FindingStatus.CONFIRMED
     assert confirmed.details["exact_frida_sinks"][0]["sink_type"] == "notification"
 
@@ -788,7 +788,7 @@ def test_exact_canary_sensitive_sinks_require_a_clear_external_boundary(
         candidate_paths,
         candidate_repository,
         candidate_session,
-    )["ASL-MVP-003"]
+    )["ASL-RUNTIME-SENSITIVE-SINK"]
     assert candidate.status is FindingStatus.POTENTIAL
     assert candidate.details["exact_frida_sinks"] == []
     assert candidate.details["exact_frida_sink_candidates"][0]["sink_type"] == (
@@ -823,7 +823,7 @@ def test_exact_canary_sensitive_sinks_require_a_clear_external_boundary(
         observed_paths,
         observed_repository,
         observed_session,
-    )["ASL-MVP-003"]
+    )["ASL-RUNTIME-SENSITIVE-SINK"]
     assert observed.status is FindingStatus.INCONCLUSIVE
     assert observed.details["exact_frida_sink_observations"][0]["sink_type"] == (
         "content_provider"
@@ -2095,6 +2095,6 @@ def test_exact_canary_webview_sink_requires_a_clear_remote_boundary(
             ],
         )
 
-        finding = _findings(paths, repository, session_id)["ASL-MVP-003"]
+        finding = _findings(paths, repository, session_id)["ASL-RUNTIME-SENSITIVE-SINK"]
 
         assert finding.status is expected
