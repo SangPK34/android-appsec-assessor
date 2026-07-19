@@ -170,7 +170,7 @@ class_matrix:
       - CRYPTO-WEAK-DIGEST
       - CRYPTO-LOW-PBE-ITERATIONS
       - CRYPTO-PREDICTABLE-RANDOM
-    detection_mode: [static, autonomous_runtime]
+    detection_mode: [static, autonomous_runtime, guided]
     runtime_observer: [frida_crypto_operations]
     controlled_validator: []
     current_implementation_status: partially_implemented
@@ -179,16 +179,16 @@ class_matrix:
     negative_fixture:
       - tests/test_crypto_analysis.py::test_crypto_safe_fixture_passes_without_false_positive
     lab_result:
-      outcome: potential
-      session_id: 20260718-104753-447618
-      tested_scope: attributed_weak_digest_operations_without_sensitive_context
+      outcome: confirmed
+      session_id: 20260720-015502-9b1dca
+      tested_scope: profile_driven_login_submit_with_target_pid_crypto_operation
       evidence_reference: docs/validation/class-coverage-lab.yaml
-      evidence_case: weak_crypto_operation
+      evidence_case: profiled_login_crypto_activation
     confirmation_threshold: An attributed completed operation has all rule-specific normalized metadata; digest and PBE also require security-sensitive context.
     rejection_requirement: The reached operation has complete safe parameters; an unexecuted static candidate is not rejected.
-    known_gap: Activation is weak and static call-sites lack application-versus-dependency origin and reliable runtime correlation.
+    known_gap: Profile-backed activation covers only declared local-lab routes; unprofiled flows and static call-sites without application ownership remain unresolved.
     false_positive_controls: [completed_operation_required, normalized_metadata, per_flow_evaluation, sensitive_context_for_digest]
-    next_action: Correlate app-owned call-sites with reached runtime operations after explorer resilience.
+    next_action: Add generic app-code ownership and route selection before expanding crypto confirmation beyond bounded profile-backed flows.
 
   - class: unsafe_webview_behavior
     rule_ids:

@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from android_assessor.errors import AdbTimeoutError, ConfigurationError, ScopeError
+from android_assessor.errors import (
+    AdbTimeoutError,
+    AndroidAssessorError,
+    ConfigurationError,
+    ScopeError,
+)
 from android_assessor.scenario import (
     ScenarioAction,
     ScenarioBackend,
@@ -276,6 +282,7 @@ def _runner(
     bundle: ScenarioBundle,
     *,
     scope: FakeScope | None = None,
+    sleeper: Callable[[float], None] | None = None,
 ) -> ScenarioRunner:
     return ScenarioRunner(
         backend,
@@ -290,6 +297,7 @@ def _runner(
         ),
         network_guard_active=True,
         available_observers=("frida", "traffic", "logcat", "private_storage"),
+        sleeper=sleeper or (lambda _delay: None),
     )
 
 
@@ -376,6 +384,37 @@ def test_transition_timeout_is_failed_activation_not_completion() -> None:
     assert transition.failure_reason == "transition_timeout"
     assert transition.retry_count == 1
     assert backend.click_count == 1
+
+
+def test_transient_transition_observation_retries_without_replaying_click() -> None:
+    backend = FakeBackend()
+    backend.observe_script.extend(
+        [
+            LOGIN_STATE,
+            LOGIN_STATE,
+            AndroidAssessorError("resumed activity temporarily unavailable"),
+            HOME_STATE,
+        ]
+    )
+    delays: list[float] = []
+    bundle = _bundle(
+        _step("launch", ScenarioAction.LAUNCH),
+        _step("submit", ScenarioAction.CLICK, selector_ref="submit"),
+        _step(
+            "transition",
+            ScenarioAction.WAIT_FOR_TRANSITION,
+            transition_ref="authenticated",
+            max_read_retries=1,
+        ),
+        _step("cleanup", ScenarioAction.CLEANUP),
+    )
+
+    result = _runner(backend, bundle, sleeper=delays.append).run()
+
+    assert result.outcome is ScenarioOutcome.COMPLETED
+    assert _by_id(result)["transition"].retry_count == 1
+    assert backend.click_count == 1
+    assert delays == [0.25]
 
 
 def test_package_escape_stops_scenario_without_following_actions() -> None:

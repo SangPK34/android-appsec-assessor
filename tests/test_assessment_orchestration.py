@@ -28,6 +28,7 @@ from android_assessor.services.scan_service import (
     ScanService,
     resolve_scan_profile,
 )
+from android_assessor.services.scenario_service import ScenarioRequest
 from android_assessor.session import SessionRepository
 from android_assessor.storage import read_json_object, write_json_atomic
 from android_assessor.validation import validate_session_canary
@@ -685,6 +686,263 @@ def test_scan_profile_starts_only_planned_controllers(
     else:
         assert set(canaries) == {"logcat"}
         assert canaries["logcat"] is None
+
+
+def test_auto_profiled_scenario_runs_before_explorer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    record = repository.load(session_id)
+    calls: list[str] = []
+
+    class Scope:
+        def require_device_package(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def require_url(self, _value: str) -> None:
+            pass
+
+    class Adb:
+        def force_stop_package(self, _serial: str, _package: str) -> None:
+            pass
+
+        def launch_package(self, _serial: str, _package: str) -> None:
+            pass
+
+    class Context:
+        def __init__(self) -> None:
+            self.paths = paths
+
+        def adb_client(self, **_kwargs: object) -> Adb:
+            return Adb()
+
+    class Traffic:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def start(self, *_args: object, **_kwargs: object) -> None:
+            calls.append("traffic")
+
+        def stop(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(status="stopped")
+
+    class Frida(Traffic):
+        def start(self, *_args: object, **_kwargs: object) -> None:
+            calls.append("frida")
+
+    class Scenario:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def prepare(self, request: object, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                request=request,
+                owned_values={},
+                upstream_mapping={},
+                owned_value_metadata=(),
+                canary_fingerprint=None,
+            )
+
+        def run(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            calls.append("scenario")
+            return SimpleNamespace(
+                scenario_id="login",
+                outcome=SimpleNamespace(value="completed"),
+                to_dict=lambda: {"scenario_id": "login", "steps": []},
+            )
+
+    class Explorer:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def run(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            calls.append("explorer")
+            return SimpleNamespace(
+                status="completed",
+                termination_reason="coverage_plateau",
+                runtime_categories=(),
+                controlled_canary_deliveries=0,
+                controlled_canary_attempts=0,
+                controlled_canary_failures=0,
+                controlled_canary_budget_skips=0,
+                to_dict=lambda: {"status": "completed"},
+            )
+
+    class Storage:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def collect(self, *_args: object, **_kwargs: object) -> None:
+            calls.append("storage")
+
+    class StorageBackend:
+        environment_type: str | None = None
+
+    class Logcat:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def collect(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(status="completed", error=None)
+
+    class Rules:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def evaluate(self, *_args: object) -> list[object]:
+            return []
+
+    class Report:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def generate(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr("android_assessor.services.scan_service.load_scope", lambda _paths: Scope())
+    monkeypatch.setattr("android_assessor.services.scan_service.TrafficCaptureService", Traffic)
+    monkeypatch.setattr("android_assessor.services.scan_service.FridaController", Frida)
+    monkeypatch.setattr("android_assessor.services.scan_service.ScenarioService", Scenario)
+    monkeypatch.setattr("android_assessor.services.scan_service.ExplorerService", Explorer)
+    monkeypatch.setattr("android_assessor.services.scan_service.PrivateStorageService", Storage)
+    monkeypatch.setattr(
+        "android_assessor.services.scan_service.AdbPrivateStorageBackend",
+        lambda _adb: StorageBackend(),
+    )
+    monkeypatch.setattr("android_assessor.services.scan_service.LogcatCollector", Logcat)
+    monkeypatch.setattr("android_assessor.services.scan_service.RuleEngine", Rules)
+    monkeypatch.setattr("android_assessor.services.scan_service.ReportService", Report)
+
+    service = ScanService(Context(), repository)  # type: ignore[arg-type]
+    correlation_kwargs: dict[str, object] = {}
+
+    def finalize_correlation(*_args: object, **kwargs: object) -> None:
+        correlation_kwargs.update(kwargs)
+
+    monkeypatch.setattr(service, "_finalize_scenario_correlation", finalize_correlation)
+    result = service._scan_session_locked(
+        record,
+        resolution=resolve_scan_profile(
+            ScanProfile.FULL,
+            autonomous=True,
+            explorer_config=ExplorerConfig(max_runtime_seconds=1),
+        ),
+        runtime_seconds=1,
+        explorer_config=ExplorerConfig(max_runtime_seconds=1),
+        controlled_canary=True,
+        scenario_request=ScenarioRequest(
+            profile_path=paths.root / "profile.yaml",
+            scenario_path=paths.root / "login.yaml",
+        ),
+    )
+
+    assert calls.index("scenario") < calls.index("explorer")
+    assert result.dynamic_steps["deterministic_scenario"] == "completed"
+    assert result.dynamic_steps["autonomous_exploration"] == "completed"
+    assert result.dynamic_steps["micro_scenario"] == "skipped"
+    assert correlation_kwargs["allow_post_scenario_observation_window"] is False
+
+
+def test_scenario_correlation_excludes_events_after_later_runtime_actions(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    record = repository.load(session_id)
+    session_paths = repository.paths_for(session_id)
+    event_path = session_paths.redacted_dir / "frida" / "events.jsonl"
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    event_path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-07-18T10:00:02+00:00",
+                "session_id": session_id,
+                "scenario_id": "login",
+                "package": record.package,
+                "pid": 4321,
+                "process": record.package,
+                "category": "crypto",
+                "method": "cipher.do_final",
+                "evidence_id": "frida-fixture",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    write_json_atomic(
+        session_paths.frida_dir / "state.json",
+        {"events_path": event_path.relative_to(session_paths.root).as_posix()},
+        root=paths.root,
+    )
+    persisted: dict[str, object] = {}
+
+    class ScenarioServiceFixture:
+        evidence = SimpleNamespace(list=lambda _session_id: ())
+
+        def persist_summary(
+            self,
+            _session_id: str,
+            _scenario_id: str,
+            summary: dict[str, object],
+        ) -> None:
+            persisted["summary"] = summary
+
+        def persist_correlation(
+            self,
+            _session_id: str,
+            _scenario_id: str,
+            correlation: dict[str, object],
+        ) -> None:
+            persisted["correlation"] = correlation
+
+    result = SimpleNamespace(
+        outcome=SimpleNamespace(value="completed"),
+        to_dict=lambda: {
+            "session_id": session_id,
+            "scenario_id": "login",
+            "package": record.package,
+            "outcome": "completed",
+            "ended_at": "2026-07-18T10:00:01+00:00",
+            "verified_pids": [4321],
+            "verified_processes": [record.package],
+            "steps": [
+                {
+                    "step_id": "submit",
+                    "completed": True,
+                    "started_at": "2026-07-18T10:00:00+00:00",
+                    "ended_at": "2026-07-18T10:00:01+00:00",
+                    "pid": 4321,
+                    "process": record.package,
+                }
+            ],
+        },
+    )
+    plan = SimpleNamespace(
+        owned_values={},
+        upstream_mapping={},
+        owned_value_metadata=(),
+        canary_fingerprint=None,
+    )
+
+    service = ScanService(SimpleNamespace(paths=paths), repository)  # type: ignore[arg-type]
+    correlation = service._finalize_scenario_correlation(
+        record,
+        scenario_result=result,
+        scenario_plan=plan,
+        scenario_service=ScenarioServiceFixture(),  # type: ignore[arg-type]
+        allow_post_scenario_observation_window=False,
+    )
+
+    assert correlation is not None
+    assert correlation["accepted_count"] == 0
+    assert correlation["rejected_count"] == 1
+    assert correlation["rejected"][0]["rejection_reason"] == "outside_completed_step_window"
+    assert correlation["post_scenario_observation_window"] == (
+        "disabled_after_subsequent_runtime_actions"
+    )
+    summary = persisted["summary"]
+    assert isinstance(summary, dict)
+    assert all(step["step_id"] != "sink_verification" for step in summary["steps"])
 
 
 def test_crypto_analyzer_output_is_consumed_by_rule_engine(tmp_path: Path) -> None:

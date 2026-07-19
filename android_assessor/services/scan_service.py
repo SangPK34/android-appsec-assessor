@@ -544,6 +544,7 @@ class ScanService:
         scenario_plan: Any,
         scenario_service: ScenarioService,
         sink_verification_quota: int | None = None,
+        allow_post_scenario_observation_window: bool = True,
     ) -> dict[str, Any] | None:
         """Join completed scenario windows to redacted observer evidence."""
 
@@ -592,8 +593,15 @@ class ScanService:
         if getattr(scenario_plan, "canary_fingerprint", None):
             summary["canary_fingerprint"] = scenario_plan.canary_fingerprint
         verification_started = summary.get("ended_at")
-        verification_ended = datetime.now(UTC).isoformat()
-        if isinstance(verification_started, str):
+        if not allow_post_scenario_observation_window:
+            post_scenario_window = "disabled_after_subsequent_runtime_actions"
+        elif not isinstance(verification_started, str):
+            post_scenario_window = "unavailable_without_scenario_end_time"
+        else:
+            post_scenario_window = "enabled"
+        summary["post_scenario_observation_window"] = post_scenario_window
+        if post_scenario_window == "enabled":
+            verification_ended = datetime.now(UTC).isoformat()
             raw_steps = summary.get("steps")
             if isinstance(raw_steps, list):
                 raw_steps.append(
@@ -705,6 +713,7 @@ class ScanService:
             "schema_version": 1,
             "session_id": record.session_id,
             "scenario_id": summary["scenario_id"],
+            "post_scenario_observation_window": post_scenario_window,
             **payload,
         }
         scenario_service.persist_correlation(
@@ -953,7 +962,58 @@ class ScanService:
                             micro_scenario_seed,
                             tuple(runtime_feedback.categories),
                         )
-                if micro_scenario_seed is not None and micro_scenario_service is not None:
+                if scenario_service is not None and scenario_plan is None:
+                    steps["deterministic_scenario"] = "failed_precondition"
+                    if not autonomous_enabled:
+                        runtime_termination = "scenario_failed_precondition"
+                elif scenario_service is not None and scenario_plan is not None:
+                    scenario_started = time.perf_counter()
+                    try:
+                        scenario_scope = load_scope(self.paths)
+                        scenario_result = scenario_service.run(
+                            record.session_id,
+                            plan=scenario_plan,
+                            adb=AdbExplorerBackend(
+                                adb,
+                                serial=record.serial,
+                                package=record.package,
+                                session_id=record.session_id,
+                                per_action_timeout=min(10, self.DEFAULT_RUNTIME_SECONDS),
+                            ),
+                            scope=scenario_scope,
+                            network_guard_active=traffic_started,
+                            available_observers=tuple(
+                                observer
+                                for observer, active in (
+                                    ("frida", frida_started),
+                                    ("traffic", traffic_started),
+                                    ("logcat", True),
+                                    ("private_storage", profile is ScanProfile.FULL),
+                                )
+                                if active
+                            ),
+                        )
+                        steps["deterministic_scenario"] = scenario_result.outcome.value
+                        if not autonomous_enabled:
+                            runtime_termination = "scenario_" + scenario_result.outcome.value
+                        if scenario_result.outcome.value != "completed":
+                            limitations.append(
+                                "Deterministic scenario did not complete: "
+                                + scenario_result.outcome.value
+                            )
+                    except (AndroidAssessorError, OSError, ValueError) as exc:
+                        steps["deterministic_scenario"] = "error"
+                        if not autonomous_enabled:
+                            runtime_termination = "scenario_error"
+                        limitations.append(
+                            f"Deterministic scenario failed: {redact_text(str(exc))[:300]}"
+                        )
+                    timed("scenario", scenario_started)
+                if (
+                    micro_scenario_seed is not None
+                    and micro_scenario_service is not None
+                    and scenario_request is None
+                ):
                     micro_started = time.perf_counter()
                     try:
                         micro_backend = AdbExplorerBackend(
@@ -1003,6 +1063,12 @@ class ScanService:
                             f"{redact_text(str(exc))[:300]}"
                         )
                     timed("micro_scenario", micro_started)
+                elif micro_scenario and scenario_request is not None:
+                    steps["micro_scenario"] = "not_exercised"
+                    limitations.append(
+                        "Candidate micro-scenario was not exercised because the supplied "
+                        "deterministic scenario owns the bounded mutation route."
+                    )
                 if autonomous_enabled:
                     selected_config = explorer_config or ExplorerConfig(
                         max_runtime_seconds=wait_seconds,
@@ -1114,51 +1180,7 @@ class ScanService:
                             f"Autonomous exploration failed: {redact_text(str(exc))[:300]}"
                         )
                     timed("exploration", exploration_started)
-                elif scenario_service is not None and scenario_plan is not None:
-                    scenario_started = time.perf_counter()
-                    try:
-                        scenario_scope = load_scope(self.paths)
-                        scenario_result = scenario_service.run(
-                            record.session_id,
-                            plan=scenario_plan,
-                            adb=AdbExplorerBackend(
-                                adb,
-                                serial=record.serial,
-                                package=record.package,
-                                session_id=record.session_id,
-                                per_action_timeout=min(10, self.DEFAULT_RUNTIME_SECONDS),
-                            ),
-                            scope=scenario_scope,
-                            network_guard_active=traffic_started,
-                            available_observers=tuple(
-                                observer
-                                for observer, active in (
-                                    ("frida", frida_started),
-                                    ("traffic", traffic_started),
-                                    ("logcat", True),
-                                    ("private_storage", profile is ScanProfile.FULL),
-                                )
-                                if active
-                            ),
-                        )
-                        steps["deterministic_scenario"] = scenario_result.outcome.value
-                        runtime_termination = "scenario_" + scenario_result.outcome.value
-                        if scenario_result.outcome.value != "completed":
-                            limitations.append(
-                                "Deterministic scenario did not complete: "
-                                + scenario_result.outcome.value
-                            )
-                    except (AndroidAssessorError, OSError, ValueError) as exc:
-                        steps["deterministic_scenario"] = "error"
-                        runtime_termination = "scenario_error"
-                        limitations.append(
-                            f"Deterministic scenario failed: {redact_text(str(exc))[:300]}"
-                        )
-                    timed("scenario", scenario_started)
-                elif scenario_service is not None:
-                    steps["deterministic_scenario"] = "failed_precondition"
-                    runtime_termination = "scenario_failed_precondition"
-                else:
+                elif scenario_service is None:
                     deadline = time.monotonic() + wait_seconds
                     while time.monotonic() < deadline:
                         if self._runtime_stop_requested(record.session_id):
@@ -1328,6 +1350,9 @@ class ScanService:
                     scenario_plan=correlation_plan,
                     scenario_service=correlation_service,
                     sink_verification_quota=correlation_quota,
+                    allow_post_scenario_observation_window=not (
+                        exploration_executed or ipc_validation_executed
+                    ),
                 )
             except (AndroidAssessorError, OSError, ValueError) as exc:
                 limitations.append(

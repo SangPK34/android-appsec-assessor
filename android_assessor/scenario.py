@@ -598,6 +598,7 @@ class ScenarioRunner:
         available_observers: Sequence[str] = (),
         monotonic: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.backend = backend
         self.scope = scope
@@ -610,6 +611,7 @@ class ScenarioRunner:
         self.available_observers = frozenset(str(item) for item in available_observers)
         self.monotonic = monotonic
         self.now = now or (lambda: datetime.now(UTC))
+        self.sleeper = sleeper
         self._deadline = 0.0
         self._last_observation: ScenarioObservation | None = None
         self._transition_origin: ScenarioObservation | None = None
@@ -990,6 +992,13 @@ class ScenarioRunner:
             return self.bundle.profile.transitions[step.transition_ref]
         return ScenarioTransition(activity=step.expected_activity)
 
+    def _wait_before_read_retry(self, step: ScenarioStep, attempt: int) -> None:
+        """Allow a bounded asynchronous activity transition to settle."""
+
+        if attempt >= step.max_read_retries:
+            return
+        self.sleeper(min(0.25, self._remaining_timeout(step.timeout_seconds)))
+
     def _run_wait_transition(
         self,
         step: ScenarioStep,
@@ -997,6 +1006,7 @@ class ScenarioRunner:
         expected = self._expected_transition(step)
         last_transition: Mapping[str, Any] | None = None
         selector_metadata: Mapping[str, Any] | None = None
+        failure_reason = "transition_timeout"
         for attempt in range(step.max_read_retries + 1):
             try:
                 observation = self._checked_observation(
@@ -1005,6 +1015,18 @@ class ScenarioRunner:
             except _ScenarioPackageEscape:
                 raise
             except (AdbTimeoutError, TimeoutError):
+                failure_reason = "transition_observation_timeout"
+                self._wait_before_read_retry(step, attempt)
+                continue
+            except ScopeError as exc:
+                raise _StepFailure(
+                    "scope_denied",
+                    ScenarioOutcome.OUT_OF_SCOPE,
+                    retry_count=attempt,
+                ) from exc
+            except (AndroidAssessorError, OSError, ValueError):
+                failure_reason = "transition_observation_unavailable"
+                self._wait_before_read_retry(step, attempt)
                 continue
             last_transition = self._transition_metadata(self._transition_origin, observation)
             activity_matches = (
@@ -1026,8 +1048,9 @@ class ScenarioRunner:
                     attempt,
                     self._evidence_reference(step),
                 )
+            self._wait_before_read_retry(step, attempt)
         raise _StepFailure(
-            "transition_timeout",
+            failure_reason,
             ScenarioOutcome.FAILED_ACTIVATION,
             retry_count=step.max_read_retries,
             transition=last_transition,

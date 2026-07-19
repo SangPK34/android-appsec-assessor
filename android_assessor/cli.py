@@ -338,8 +338,6 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
         raise AndroidAssessorError(
             "Use --scenario-profile and --scenario together for deterministic activation."
         )
-    if auto_mode and (args.scenario_profile is not None or args.scenario is not None):
-        raise AndroidAssessorError("--auto cannot be combined with a deterministic scenario.")
     if auto_mode and args.autonomous is False:
         raise AndroidAssessorError("--auto cannot be combined with --no-autonomous.")
     scan_profile = ScanProfile.FULL.value if auto_mode else args.profile
@@ -347,7 +345,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
     if args.scenario_profile is not None:
         if scan_profile != ScanProfile.FULL.value:
             raise AndroidAssessorError("Deterministic scenarios require a Full Assessment.")
-        if args.autonomous is True:
+        if args.autonomous is True and not auto_mode:
             raise AndroidAssessorError(
                 "Deterministic scenarios and autonomous exploration are mutually exclusive."
             )
@@ -369,7 +367,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
     autonomous = True if auto_mode else (
         False if max_runtime == 0 and args.autonomous is None else args.autonomous
     )
-    if scenario_request is not None:
+    if scenario_request is not None and not auto_mode:
         autonomous = False
     controlled_canary = args.controlled_canary or auto_mode
     if controlled_canary and (
@@ -409,7 +407,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
             explorer_config=explorer_config,
             controlled_canary=controlled_canary,
             ipc_validation=auto_mode,
-            micro_scenario=auto_mode,
+            micro_scenario=auto_mode and scenario_request is None,
             scenario_request=scenario_request,
         )
     else:
@@ -422,7 +420,7 @@ def _run_scan(args: argparse.Namespace, context: AppContext) -> int:
             explorer_config=explorer_config,
             controlled_canary=controlled_canary,
             ipc_validation=auto_mode,
-            micro_scenario=auto_mode,
+            micro_scenario=auto_mode and scenario_request is None,
             scenario_request=scenario_request,
         )
     payload = result.to_dict()

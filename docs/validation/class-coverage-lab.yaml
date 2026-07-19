@@ -1,5 +1,5 @@
 schema_version: 1
-generated_at: 2026-07-18
+generated_at: 2026-07-20
 purpose: Sanitized, reviewable evidence index for the vulnerability-class coverage matrix.
 artifact_policy: Source session artifacts remain local and ignored; report SHA-256 values bind these summaries to the authorized-lab artifacts without publishing target data or canaries.
 non_production_reference: true
@@ -8,6 +8,15 @@ redaction:
   package_identifiers_included: false
 
 sessions:
+  - session_id: 20260720-015502-9b1dca
+    report_sha256: 1ba064e7c56341b4b4227035e7498e3c23795fed3eb06b764285b20940d2d0d8
+    security_rules_evaluated: 30
+    confirmed: 5
+    potential: 10
+    pass: 9
+    inconclusive: 6
+    skipped: 0
+    error: 0
   - session_id: 20260719-064709-99f0ba
     report_sha256: a8988c0b0a99732a77de5b37d091fd01d288029c1ec89c73b664fc4d2713afb9
     security_rules_evaluated: 30
@@ -73,6 +82,12 @@ sessions:
     inconclusive: 13
 
 cases:
+  - case_id: profiled_login_crypto_activation
+    session_id: 20260720-015502-9b1dca
+    outcome: confirmed
+    tested_scope: profile_driven_login_submit_with_target_pid_crypto_operation
+    evidence: A profile-supplied local-lab login completed without user interaction and reached the authenticated transition. A completed zero-IV cipher operation was recorded for the same target PID inside the bounded submit-step window. Post-scenario correlation was disabled after later explorer and IPC actions, so outside-window events were rejected rather than attributed to login.
+
   - case_id: exported_ipc_candidate_state_preservation
     session_id: 20260719-064709-99f0ba
     outcome: potential
