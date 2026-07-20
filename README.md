@@ -11,11 +11,13 @@ Framework cung cấp các nhóm chức năng sau:
 - Phát hiện thiết bị Android qua ADB, lưu lựa chọn thiết bị và thu thập thông tin thiết bị cùng capability.
 - Phân tích base APK và split APK được lấy từ package đã chọn.
 - Phân tích manifest, permission, component được export, cờ debug/test-only, chính sách backup và cấu hình cleartext.
+- Phân tích DEX có giới hạn cho method reference, call-site, literal-to-sink và static behavior candidate; hardcoded-secret candidate chỉ được giữ khi có ngữ cảnh sink, ownership app/dependency đã xác định hoặc được đánh dấu chưa xác định một cách bảo thủ.
+- Autonomous exploration và micro-scenario có quota/timeout để kích hoạt các route an toàn khi chạy `--auto`, đồng thời giữ lại coverage và lý do dừng của từng bước.
 - Thu thập metadata lưu lượng qua mitmproxy và đánh giá hành vi cleartext, TLS và certificate trust trong môi trường được cấu hình.
 - Thu thập logcat theo tiến trình mục tiêu để hỗ trợ phân tích dữ liệu nhạy cảm và canary.
 - Quan sát runtime bằng Frida với hook cố định, observation-only cho crypto, storage, logging, TLS, WebView và root-detection behavior khi capability phù hợp.
 - Phân tích có giới hạn private application storage khi có quyền truy cập dữ liệu ứng dụng phù hợp.
-- Xác minh có kiểm soát bằng canary cho các finding được hỗ trợ, dựa trên bằng chứng quan sát được.
+- Xác minh có kiểm soát bằng canary và IPC route bounded cho các finding được hỗ trợ, dựa trên evidence có attribution package, process và time window.
 - Quản lý session, scope allowlist, hash SHA-256, provenance, redaction và cleanup ledger.
 - Tạo báo cáo JSON, HTML và dữ liệu thực nghiệm dạng CSV.
 
@@ -27,6 +29,7 @@ Root và Frida là capability hỗ trợ cho các nhóm phân tích tăng cườ
 | --- | --- |
 | Cấu hình ứng dụng | Debuggable, test-only, chính sách backup và cleartext configuration |
 | Android components | Permission, Activity, Receiver, Provider và protection boundary của component được export |
+| Static behavior | DEX call-site candidate, ownership application/dependency và ngữ cảnh sử dụng khi analyzer hỗ trợ |
 | Network | Cleartext traffic, metadata nhạy cảm trong URL và hành vi TLS/certificate trust |
 | Logging | Canary hoặc thông tin nhạy cảm trong logcat của tiến trình mục tiêu |
 | Storage | SharedPreferences, SQLite, internal files và metadata private application storage trong phạm vi được phép |
@@ -220,7 +223,7 @@ Kết quả bao gồm metadata session, device và application; danh sách findi
 android_assessor/  Logic framework, services, rule và report.
 config/            Cấu hình lab, scope mẫu và tool manifest.
 hooks/             Hook runtime cố định cho Frida và mitmproxy.
-rules/             Khai báo rule đánh giá.
+rules/             Catalog rule production (`core.yaml`) và coverage matrix (`coverage.yaml`).
 tests/             Test unit và fixture mô phỏng.
 benchmarks/        Profile và scenario dành riêng cho benchmark local, tách khỏi production engine.
 web/               Template và static asset của Web UI.

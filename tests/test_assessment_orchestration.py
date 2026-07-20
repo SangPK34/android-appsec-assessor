@@ -1045,13 +1045,28 @@ def test_rule_results_include_reasoning_contract(tmp_path: Path) -> None:
             "completed",
             [
                 {
-                    "kind": "contextual_secret",
+                    "kind": "callsite_contextual_secret",
                     "confidence": "medium",
                     "source_id": "base:0",
                     "location": "assets/config.properties:line:4",
                     "key_name": "client_secret",
                     "value_sha256": "a" * 64,
                     "value_length": 32,
+                    "secret_type": "credential",
+                    "usage_context": "network_form_parameter",
+                    "code_ownership": "app_code",
+                    "caller_class_descriptor": "Lcom/example/app/LoginFlow;",
+                    "caller_method_name": "send",
+                    "caller_prototype": "()V",
+                    "dex_entry": "classes.dex",
+                    "sink_class_descriptor": (
+                        "Lorg/apache/http/message/BasicNameValuePair;"
+                    ),
+                    "sink_method_name": "<init>",
+                    "sink_prototype": "(Ljava/lang/String;Ljava/lang/String;)V",
+                    "sink_location": "classes.dex:code_item:64:code_unit:12",
+                    "construction": "direct_literal",
+                    "retention_reason": "bounded_same_method_sink_correlation",
                 }
             ],
             FindingStatus.POTENTIAL,
@@ -1102,6 +1117,134 @@ def test_static_secret_inventory_is_consumed_without_confirming_presence_only(
     serialized = json.dumps(finding.to_dict()).casefold()
     assert "raw_value" not in serialized
     assert "client-secret-material" not in serialized
+    if candidates:
+        reported = finding.details["candidates"][0]
+        assert reported["caller_method_name"] == "send"
+        assert reported["sink_method_name"] == "<init>"
+        assert reported["code_ownership"] == "app_code"
+        assert finding.details["contextual_app_owned_candidate_count"] == 1
+
+
+def test_static_secret_rejection_is_reported_without_promoting_the_rule(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    session_paths = repository.paths_for(session_id)
+    app = read_json_object(session_paths.app_json, root=paths.root)
+    app["static_analysis"] = {
+        "schema_version": 2,
+        "status": "completed",
+        "secret_candidates": [],
+        "secret_candidate_rejections": [
+            {
+                "source_id": "base:0",
+                "location": "classes.dex:code_unit:12",
+                "key_name": "api_key",
+                "value_sha256": "b" * 64,
+                "value_length": 24,
+                "secret_type": "api_credential",
+                "usage_context": "network_form_parameter",
+                "code_ownership": "packaged_dependency",
+                "reason": "caller_outside_application_namespace",
+                "caller_class_descriptor": "Lcom/vendor/sdk/Client;",
+                "caller_method_name": "send",
+                "caller_prototype": "()V",
+                "dex_entry": "classes.dex",
+                "sink_class_descriptor": "Lorg/apache/http/message/BasicNameValuePair;",
+                "sink_method_name": "<init>",
+                "sink_prototype": "(Ljava/lang/String;Ljava/lang/String;)V",
+                "sink_location": "classes.dex:code_unit:16",
+                "construction": "direct_literal",
+            }
+        ],
+        "limitations": [],
+    }
+    write_json_atomic(session_paths.app_json, app, root=paths.root)
+    inventory_path = session_paths.redacted_dir / "static" / "inventory.json"
+    write_json_atomic(
+        inventory_path,
+        app["static_analysis"],
+        root=paths.root,
+    )
+    EvidenceRepository(paths, repository).register_file(
+        session_id,
+        inventory_path,
+        evidence_type="static_apk_inventory",
+        source="bounded_apk_static_analysis",
+        description="Redacted static inventory fixture.",
+        sensitive=False,
+        redacted=True,
+    )
+
+    finding = next(
+        item
+        for item in RuleEngine(paths, repository).evaluate(session_id)
+        if item.rule_id == "ASL-STATIC-HARDCODED-SECRET"
+    )
+
+    assert finding.status is FindingStatus.PASS
+    assert finding.details["candidate_count"] == 0
+    assert finding.details["dependency_candidate_count"] == 1
+    assert finding.details["rejected_candidate_count"] == 1
+    assert finding.details["rejected_candidates"][0]["reason"] == (
+        "caller_outside_application_namespace"
+    )
+    assert finding.details["rejected_candidates"][0]["sink_method_name"] == "<init>"
+
+
+def test_unattributed_static_secret_inventory_does_not_promote_the_rule(
+    tmp_path: Path,
+) -> None:
+    paths, repository, session_id = _rule_session(tmp_path)
+    session_paths = repository.paths_for(session_id)
+    app = read_json_object(session_paths.app_json, root=paths.root)
+    app["static_analysis"] = {
+        "schema_version": 2,
+        "status": "completed",
+        "secret_candidates": [
+            {
+                "kind": "named_assignment",
+                "confidence": "medium",
+                "source_id": "base:0",
+                "location": "assets/config:line:1",
+                "key_name": "client_secret",
+                "value_sha256": "c" * 64,
+                "value_length": 24,
+                "secret_type": "credential",
+                "usage_context": "packaged_content",
+                "code_ownership": "unattributed_packaged_content",
+                "retention_reason": "sensitive_assignment_in_packaged_content",
+            }
+        ],
+        "limitations": [],
+    }
+    write_json_atomic(session_paths.app_json, app, root=paths.root)
+    inventory_path = session_paths.redacted_dir / "static" / "inventory.json"
+    write_json_atomic(
+        inventory_path,
+        app["static_analysis"],
+        root=paths.root,
+    )
+    EvidenceRepository(paths, repository).register_file(
+        session_id,
+        inventory_path,
+        evidence_type="static_apk_inventory",
+        source="bounded_apk_static_analysis",
+        description="Redacted static inventory fixture.",
+        sensitive=False,
+        redacted=True,
+    )
+
+    finding = next(
+        item
+        for item in RuleEngine(paths, repository).evaluate(session_id)
+        if item.rule_id == "ASL-STATIC-HARDCODED-SECRET"
+    )
+
+    assert finding.status is FindingStatus.INCONCLUSIVE
+    assert finding.details["candidate_count"] == 1
+    assert finding.details["contextual_app_owned_candidate_count"] == 0
+    assert finding.details["unattributed_packaged_content_candidate_count"] == 1
 
 
 def test_phase_one_manifest_rules_are_wired_with_specific_evidence(

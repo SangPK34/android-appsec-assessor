@@ -4,7 +4,7 @@ detection_modes: [static, autonomous_runtime, controlled_validation, guided]
 class_statuses:
   [partially_implemented, static_inventory_only, runtime_observation_only]
 class_outcomes:
-  [confirmed, potential, rejected_for_tested_route, inconclusive, not_exercised, out_of_scope]
+  [confirmed, potential, pass, rejected_for_tested_route, inconclusive, not_exercised, out_of_scope]
 id_kinds:
   production_rule: IDs present in rules/core.yaml and evaluated by RuleEngine.
   analyzer_result: IDs emitted by an analyzer but not independently evaluated by RuleEngine.
@@ -121,22 +121,31 @@ class_matrix:
     detection_mode: [static]
     runtime_observer: []
     controlled_validator: []
-    current_implementation_status: static_inventory_only
+    current_implementation_status: partially_implemented
     positive_fixture:
+      - tests/test_static_apk_analysis.py::test_secret_callsite_retains_app_owned_network_credential_with_safe_evidence
+      - tests/test_static_apk_analysis.py::test_secret_callsite_tracks_bounded_same_method_string_construction
+      - tests/test_static_apk_analysis.py::test_secret_callsite_scopes_constructed_serialized_network_body
       - tests/test_static_apk_analysis.py::test_quoted_config_keys_are_detected_without_retaining_values
+      - tests/test_static_apk_analysis.py::test_app_owned_callsite_in_split_precedes_base_inventory_quota
+      - tests/test_static_apk_analysis.py::test_build_config_namespace_from_base_applies_to_split_callsite
     negative_fixture:
       - tests/test_static_apk_analysis.py::test_placeholder_values_do_not_become_secret_candidates
+      - tests/test_static_apk_analysis.py::test_secret_callsite_rejects_url_and_identifier_values
+      - tests/test_static_apk_analysis.py::test_secret_callsite_rejects_dependency_only_candidate
+      - tests/test_static_apk_analysis.py::test_unverified_application_namespace_mismatch_stays_unknown
+      - tests/test_static_apk_analysis.py::test_secret_callsite_respects_dex_invocation_bound
     lab_result:
-      outcome: not_exercised
-      session_id: 20260718-213857-8de6f9
-      tested_scope: bounded_static_inventory_only
+      outcome: pass
+      session_id: 20260720-075621-2cac3b
+      tested_scope: bounded_static_contextual_inventory_no_matched_candidate
       evidence_reference: docs/validation/class-coverage-lab.yaml
-      evidence_case: hardcoded_secret_inventory
-    confirmation_threshold: The redacted candidate is used by an attributed crypto, network, or authentication sink, or is validated only against a fixture-owned local endpoint.
-    rejection_requirement: The exact candidate is classified as a public identifier, test/example value, or dependency-only value with no relevant application use-site.
-    known_gap: Candidates lack application-versus-dependency ownership, DEX use-sites, and runtime sink correlation.
-    false_positive_controls: [placeholder_filtering, typed_candidate_kind, value_hash_only, no_external_secret_validation]
-    next_action: Add const-string use-site provenance and dependency-noise fixtures before any confirmation path.
+      evidence_case: hardcoded_secret_contextual_inventory
+    confirmation_threshold: Static contextual candidates are potential only. Confirmation would require an attributed crypto, network, or authentication use, or validation only against a fixture-owned local endpoint.
+    rejection_requirement: The exact contextual value is excluded when it is a URL or endpoint, class or public identifier, resource identifier, placeholder or test value, has no application namespace, has unresolved application ownership, or is reached only from packaged dependency code with verified app namespace coverage.
+    known_gap: Bounded linear same-method propagation does not follow fields, arrays, interprocedural calls, path merges, or dynamic values. A caller outside the installed applicationId remains unknown unless a matching BuildConfig-defined source namespace is found across the collected base/split APKs; no runtime execution, credential validity, or server-side scope is established.
+    false_positive_controls: [placeholder_filtering, url_identifier_rejection, application_namespace_ownership, verified_build_config_namespace, unresolved_namespace_rejection, base_split_candidate_prioritization, exact_sensitive_sink_context, bounded_same_method_dataflow, dependency_rejection, value_hash_only, no_entropy_only_promotion, no_external_secret_validation]
+    next_action: Add package-attributed runtime sink correlation only when a generic bounded observer can preserve the static candidate identity; static evidence remains potential.
 
   - class: cleartext_and_tls_trust_behavior
     rule_ids: [ASL-NETWORK-CLEARTEXT, ASL-NETWORK-TLS-TRUST]

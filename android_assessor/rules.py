@@ -1037,25 +1037,71 @@ class RuleEngine:
                 if isinstance(raw_candidates, list)
                 else []
             )
+            raw_rejections = static_analysis.get("secret_candidate_rejections", [])
+            rejections = (
+                [item for item in raw_rejections if isinstance(item, dict)]
+                if isinstance(raw_rejections, list)
+                else []
+            )
+            app_owned_count = sum(
+                item.get("code_ownership") == "app_code" for item in candidates
+            )
+            contextual_candidates = [
+                item
+                for item in candidates
+                if item.get("kind") == "callsite_contextual_secret"
+                and item.get("code_ownership") == "app_code"
+                and item.get("usage_context") not in {None, "", "packaged_content"}
+                and isinstance(item.get("sink_class_descriptor"), str)
+                and isinstance(item.get("sink_method_name"), str)
+            ]
+            unattributed_count = sum(
+                item.get("code_ownership") == "unattributed_packaged_content"
+                for item in candidates
+            )
+            dependency_count = sum(
+                item.get("code_ownership") == "packaged_dependency"
+                for item in (*candidates, *rejections)
+            )
             inventory_status = str(static_analysis.get("status", "partial"))
-            if candidates:
+            if contextual_candidates:
                 status = FindingStatus.POTENTIAL
                 reason = (
-                    "Contextual secret material is present in packaged application "
-                    "content; runtime use and credential validity were not assumed."
+                    "An app-owned literal reached an allow-listed sensitive sink in "
+                    "bounded same-method DEX analysis; runtime use and credential "
+                    "validity were not assumed."
                 )
                 missing = [
                     "runtime use or reachable trust boundary",
                     "credential validity and server-side scope",
                 ]
-            elif inventory_status == "completed":
-                status = FindingStatus.PASS
-                reason = "No contextual secret candidate matched the bounded inventory."
-                missing = []
-            else:
+            elif inventory_status != "completed":
                 status = FindingStatus.INCONCLUSIVE
                 reason = "The bounded static inventory did not complete all planned input."
                 missing = ["complete bounded APK input coverage"]
+            elif candidates:
+                status = FindingStatus.INCONCLUSIVE
+                reason = (
+                    "Secret-like material was retained only as unattributed packaged "
+                    "content inventory; no app-owned call-site reached an allow-listed "
+                    "sensitive sink."
+                )
+                missing = [
+                    "application-owned same-method sensitive-sink correlation",
+                    "runtime use or reachable trust boundary",
+                ]
+            elif inventory_status == "completed":
+                status = FindingStatus.PASS
+                reason = (
+                    "No app-owned contextual secret candidate matched the bounded inventory."
+                    if not rejections
+                    else (
+                        "No app-owned contextual secret candidate survived the bounded "
+                        f"inventory; {len(rejections)} value(s) were rejected by "
+                        "source, ownership, or value controls."
+                    )
+                )
+                missing = []
             return (
                 status,
                 "static",
@@ -1068,7 +1114,13 @@ class RuleEngine:
                     "missing_evidence": missing,
                     "reason": reason,
                     "candidate_count": len(candidates),
-                    "candidates": candidates,
+                    "app_owned_candidate_count": app_owned_count,
+                    "contextual_app_owned_candidate_count": len(contextual_candidates),
+                    "unattributed_packaged_content_candidate_count": unattributed_count,
+                    "dependency_candidate_count": dependency_count,
+                    "rejected_candidate_count": len(rejections),
+                    "candidates": candidates[:50],
+                    "rejected_candidates": rejections[:50],
                     "inventory_status": inventory_status,
                     "limitations": list(static_analysis.get("limitations", []))[:20],
                     "redaction": "Candidate values are represented only by length and SHA-256.",

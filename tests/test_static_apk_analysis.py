@@ -902,6 +902,912 @@ def test_static_behavior_does_not_emit_loading_or_deserialization_for_uninvoked_
     assert "ASL-STATIC-DESERIALIZATION" not in emitted
 
 
+def test_secret_callsite_retains_app_owned_network_credential_with_safe_evidence(
+    tmp_path: Path,
+) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/SecretFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        *_invoke(1, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "app-owned-callsite.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("api_key", owned_value),
+            methods=methods,
+            method_bodies=((0, 3, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.kind == "callsite_contextual_secret"
+    assert candidate.code_ownership == "app_code"
+    assert candidate.caller_class_descriptor == "Lcom/example/app/SecretFlow;"
+    assert candidate.caller_method_name == "send"
+    assert candidate.sink_class_descriptor == (
+        "Lorg/apache/http/message/BasicNameValuePair;"
+    )
+    assert candidate.sink_method_name == "<init>"
+    assert candidate.sink_prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
+    assert candidate.usage_context == "network_form_parameter"
+    assert candidate.secret_type == "api_credential"
+    assert candidate.location.startswith("classes.dex:code_item:")
+    assert candidate.sink_location and candidate.sink_location.startswith(
+        "classes.dex:code_item:"
+    )
+    assert candidate.value_length == len(owned_value)
+    assert candidate.retention_reason == "bounded_same_method_sink_correlation"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_secret_callsite_tracks_bounded_same_method_string_construction(
+    tmp_path: Path,
+) -> None:
+    first_fragment = "owned-crypto-"
+    second_fragment = "material-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/CryptoFlow;", "create", (), "V"),
+        (
+            "Ljava/lang/String;",
+            "concat",
+            ("Ljava/lang/String;",),
+            "Ljava/lang/String;",
+        ),
+        ("Ljava/lang/String;", "getBytes", (), "[B"),
+        (
+            "Ljavax/crypto/spec/SecretKeySpec;",
+            "<init>",
+            ("[B", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(0, 0),
+        *_const_string(1, 1),
+        *_invoke(1, (0, 1)),
+        0x0C | (2 << 8),
+        *_invoke(2, (2,)),
+        0x0C | (3 << 8),
+        *_const_string(4, 2),
+        *_invoke(3, (5, 3, 4), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "constructed-crypto.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(first_fragment, second_fragment, "AES"),
+            methods=methods,
+            method_bodies=((0, 6, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.usage_context == "crypto_key_constructor"
+    assert candidate.secret_type == "crypto_key"
+    assert candidate.construction == "string_concat_bytes"
+    assert candidate.value_length == len(first_fragment + second_fragment)
+    serialized = json.dumps(result.to_dict())
+    assert first_fragment not in serialized
+    assert second_fragment not in serialized
+
+
+def test_secret_callsite_scopes_constructed_serialized_network_body(
+    tmp_path: Path,
+) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/NetworkFlow;", "send", (), "V"),
+        (
+            "Ljava/lang/String;",
+            "concat",
+            ("Ljava/lang/String;",),
+            "Ljava/lang/String;",
+        ),
+        (
+            "Lorg/apache/http/entity/StringEntity;",
+            "<init>",
+            ("Ljava/lang/String;",),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(0, 0),
+        *_const_string(1, 1),
+        *_invoke(1, (0, 1)),
+        0x0C | (2 << 8),
+        *_invoke(2, (3, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "serialized-network-body.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("password=", owned_value),
+            methods=methods,
+            method_bodies=((0, 4, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.secret_type == "password"
+    assert candidate.usage_context == "network_serialized_body"
+    assert candidate.construction == "string_concat"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_secret_callsite_replaces_matching_unattributed_string_alias(
+    tmp_path: Path,
+) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/NetworkFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/entity/StringEntity;",
+            "<init>",
+            ("Ljava/lang/String;",),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_invoke(1, (0, 1), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "context-replaces-alias.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(f"password={owned_value}",),
+            methods=methods,
+            method_bodies=((0, 2, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.kind == "callsite_contextual_secret"
+    assert candidate.code_ownership == "app_code"
+    assert candidate.usage_context == "network_serialized_body"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_secret_callsite_rejects_url_and_identifier_values(tmp_path: Path) -> None:
+    methods = (
+        ("Lcom/example/app/NegativeFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        *_invoke(1, (0, 1, 2), direct=True),
+        *_const_string(3, 0),
+        *_const_string(4, 2),
+        *_invoke(1, (0, 3, 4), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "negative-callsite.apk"
+    url_value = "https://api.example.test/credential"
+    identifier_value = "com.example.Identifier"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("api_key", url_value, identifier_value),
+            methods=methods,
+            method_bodies=((0, 5, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert result.secret_candidates == ()
+    assert {item.reason for item in result.secret_candidate_rejections} == {
+        "url_or_endpoint",
+        "class_name_or_identifier",
+    }
+    serialized = json.dumps(result.to_dict())
+    assert url_value not in serialized
+    assert identifier_value not in serialized
+
+
+def test_secret_callsite_keeps_dotted_credential_value(tmp_path: Path) -> None:
+    owned_value = "correct.horse.battery"
+    methods = (
+        ("Lcom/example/app/PositiveFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        *_invoke(1, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "dotted-credential.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("api_key", owned_value),
+            methods=methods,
+            method_bodies=((0, 3, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    assert result.secret_candidates[0].usage_context == "network_form_parameter"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_secret_callsite_rejects_dependency_only_candidate(tmp_path: Path) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/BuildConfig;", "marker", (), "V"),
+        ("Lcom/vendor/sdk/Client;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        *_invoke(2, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "dependency-callsite.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("api_key", owned_value),
+            methods=methods,
+            method_bodies=((0, 1, (0x0E,)), (1, 3, insns)),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert result.secret_candidates == ()
+    assert len(result.secret_candidate_rejections) == 1
+    rejected = result.secret_candidate_rejections[0]
+    assert rejected.code_ownership == "packaged_dependency"
+    assert rejected.reason == "caller_outside_application_namespace"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_dependency_callsite_does_not_remove_unattributed_string_inventory(
+    tmp_path: Path,
+) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/BuildConfig;", "marker", (), "V"),
+        ("Lcom/vendor/sdk/Client;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 1),
+        *_const_string(2, 2),
+        *_invoke(2, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "dependency-does-not-remove-inventory.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(f"client_secret={owned_value}", "api_key", owned_value),
+            methods=methods,
+            method_bodies=((0, 1, (0x0E,)), (1, 3, insns)),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    assert result.secret_candidates[0].code_ownership == "unattributed_packaged_content"
+    assert len(result.secret_candidate_rejections) == 1
+    assert result.secret_candidate_rejections[0].reason == (
+        "caller_outside_application_namespace"
+    )
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_app_owned_callsite_precedes_generic_string_quota(tmp_path: Path) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/SecretFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 1),
+        *_const_string(2, 2),
+        *_invoke(1, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "callsite-before-string-quota.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(
+                "client_secret=unattributed-value-Q7v2N9p4K8s5",
+                "api_key",
+                owned_value,
+            ),
+            methods=methods,
+            method_bodies=((0, 3, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),),
+        policy=replace(StaticApkPolicy(), max_secret_candidates=1),
+    )
+
+    assert len(result.secret_candidates) == 1
+    assert result.secret_candidates[0].kind == "callsite_contextual_secret"
+    assert result.secret_candidates[0].code_ownership == "app_code"
+    assert "limit:secret_candidates" in result.limitations
+
+
+def test_app_owned_callsite_in_later_dex_precedes_generic_string_quota(
+    tmp_path: Path,
+) -> None:
+    """Process contextual call-sites across the whole APK before raw inventory."""
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/SecretFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        *_invoke(1, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "multidex-callsite-before-string-quota.apk"
+    write_apk(
+        apk,
+        build_dex(extra_strings=("client_secret=unattributed-Q7v2N9p4K8s5",)),
+        entries={
+            "classes2.dex": build_dex(
+                extra_strings=("api_key", owned_value),
+                methods=methods,
+                method_bodies=((0, 3, insns),),
+            )
+        },
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),),
+        policy=replace(StaticApkPolicy(), max_secret_candidates=1),
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.kind == "callsite_contextual_secret"
+    assert candidate.code_ownership == "app_code"
+    assert candidate.dex_entry == "classes2.dex"
+    assert "limit:secret_candidates" in result.limitations
+
+
+def test_app_owned_callsite_in_split_precedes_base_inventory_quota(
+    tmp_path: Path,
+) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/SecretFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        *_invoke(1, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    base = tmp_path / "base.apk"
+    split = tmp_path / "split.apk"
+    write_apk(
+        base,
+        build_dex(extra_strings=("client_secret=unattributed-Q7v2N9p4K8s5",)),
+    )
+    write_apk(
+        split,
+        build_dex(
+            extra_strings=("api_key", owned_value),
+            methods=methods,
+            method_bodies=((0, 3, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (
+            StaticApkInput(base, "base:0", application_id="com.example.app"),
+            StaticApkInput(split, "split:1", application_id="com.example.app"),
+        ),
+        policy=replace(StaticApkPolicy(), max_secret_candidates=1),
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.kind == "callsite_contextual_secret"
+    assert candidate.code_ownership == "app_code"
+    assert candidate.source_id == "split:1"
+    assert "limit:secret_candidates" in result.limitations
+
+
+def test_build_config_namespace_from_base_applies_to_split_callsite(
+    tmp_path: Path,
+) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    base = tmp_path / "base.apk"
+    split = tmp_path / "split.apk"
+    write_apk(
+        base,
+        build_dex(
+            methods=(("Lcom/example/app/BuildConfig;", "marker", (), "V"),),
+            method_bodies=((0, 1, (0x0E,)),),
+        ),
+    )
+    methods = (
+        ("Lcom/example/app/SecretFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        *_invoke(1, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    write_apk(
+        split,
+        build_dex(
+            extra_strings=("api_key", owned_value),
+            methods=methods,
+            method_bodies=((0, 3, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (
+            StaticApkInput(
+                base,
+                "base:0",
+                application_id="com.example.app.debug",
+            ),
+            StaticApkInput(
+                split,
+                "split:1",
+                application_id="com.example.app.debug",
+            ),
+        )
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.code_ownership == "app_code"
+    assert candidate.source_id == "split:1"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_unverified_application_namespace_mismatch_stays_unknown(
+    tmp_path: Path,
+) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/SecretFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        *_invoke(1, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "unverified-namespace.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("api_key", owned_value),
+            methods=methods,
+            method_bodies=((0, 3, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (
+            StaticApkInput(
+                apk,
+                "base:0",
+                application_id="com.example.app.debug",
+            ),
+        )
+    )
+
+    assert result.secret_candidates == ()
+    assert len(result.secret_candidate_rejections) == 1
+    rejection = result.secret_candidate_rejections[0]
+    assert rejection.code_ownership == "unknown"
+    assert rejection.reason == "caller_ownership_unresolved"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_secret_callsite_rejects_unknown_application_namespace(tmp_path: Path) -> None:
+    owned_value = "ownedCredential-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/SecretFlow;", "send", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        *_invoke(1, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "unknown-namespace-callsite.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("api_key", owned_value),
+            methods=methods,
+            method_bodies=((0, 3, insns),),
+        ),
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "base:0"),))
+
+    assert result.secret_candidates == ()
+    assert len(result.secret_candidate_rejections) == 1
+    assert result.secret_candidate_rejections[0].code_ownership == "unknown"
+    assert (
+        result.secret_candidate_rejections[0].reason
+        == "application_namespace_unavailable"
+    )
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_extensionless_raw_resource_is_scanned_with_existing_redaction(
+    tmp_path: Path,
+) -> None:
+    owned_value = "ownedRawResource-Q7v2N9p4K8s5"
+    apk = tmp_path / "raw-resource.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={"res/raw/config": f"client_secret={owned_value}".encode()},
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "base:0"),))
+
+    assert len(result.secret_candidates) == 1
+    assert result.secret_candidates[0].location == "res/raw/config:line:1"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_extensionless_asset_is_scanned_with_existing_redaction(tmp_path: Path) -> None:
+    owned_value = "ownedAssetValue-Q7v2N9p4K8s5"
+    apk = tmp_path / "extensionless-asset.apk"
+    write_apk(
+        apk,
+        build_dex(),
+        entries={"assets/config": f"client_secret={owned_value}".encode()},
+    )
+
+    result = analyze_apks((StaticApkInput(apk, "base:0"),))
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.location == "assets/config:line:1"
+    assert candidate.code_ownership == "unattributed_packaged_content"
+    assert candidate.retention_reason == "sensitive_assignment_in_packaged_content"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_raw_secret_text_rejects_urls_identifiers_and_resource_references(
+    tmp_path: Path,
+) -> None:
+    url_value = "https://api.example.test/credential"
+    identifier_value = "com.example.Identifier"
+    resource_value = "R.string.default_token"
+    apk = tmp_path / "raw-false-positive-controls.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(
+                f"api_key={url_value}",
+                f"client_secret={identifier_value}",
+            )
+        ),
+        entries={"assets/config": f"password={resource_value}".encode()},
+    )
+
+    result = analyze_apks(
+        (
+            StaticApkInput(
+                apk,
+                "base:0",
+                resource_strings=("token=@string/default_token",),
+            ),
+        )
+    )
+
+    assert result.secret_candidates == ()
+    assert {item.reason for item in result.secret_candidate_rejections} == {
+        "url_or_endpoint",
+        "class_name_or_identifier",
+        "resource_identifier",
+    }
+    assert result.metrics["text_entries_scanned"] == 1
+    serialized = json.dumps(result.to_dict())
+    assert url_value not in serialized
+    assert identifier_value not in serialized
+    assert resource_value not in serialized
+
+
+def test_extensionless_binary_raw_resource_is_skipped_without_false_partial(
+    tmp_path: Path,
+) -> None:
+    apk = tmp_path / "binary-raw-resource.apk"
+    write_apk(apk, build_dex(), entries={"res/raw/blob": b"\x00" * 128})
+
+    result = analyze_apks((StaticApkInput(apk, "base:0"),))
+
+    assert result.status == "completed"
+    assert result.metrics["binary_raw_entries_skipped"] == 1
+    assert result.secret_candidates == ()
+
+
+def test_extensionless_binary_asset_is_skipped_without_false_partial(tmp_path: Path) -> None:
+    apk = tmp_path / "binary-asset.apk"
+    write_apk(apk, build_dex(), entries={"assets/blob": b"\x00" * 128})
+
+    result = analyze_apks((StaticApkInput(apk, "base:0"),))
+
+    assert result.status == "completed"
+    assert result.metrics["binary_untyped_entries_skipped"] == 1
+    assert result.secret_candidates == ()
+
+
+def test_secret_callsite_respects_dex_invocation_bound(tmp_path: Path) -> None:
+    methods = (
+        ("Lcom/example/app/BoundedFlow;", "send", (), "V"),
+        (
+            "Ljava/lang/String;",
+            "concat",
+            ("Ljava/lang/String;",),
+            "Ljava/lang/String;",
+        ),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    insns = (
+        *_invoke(1, (0, 1)),
+        *_const_string(2, 0),
+        *_const_string(3, 1),
+        *_invoke(2, (0, 2, 3), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "bounded-callsite.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("api_key", "ownedCredential-Q7v2N9p4K8s5"),
+            methods=methods,
+            method_bodies=((0, 4, insns),),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),),
+        policy=replace(StaticApkPolicy(), max_dex_invocations=1),
+    )
+
+    assert result.status == "partial"
+    assert "limit:dex_invocations" in result.limitations
+    assert result.secret_candidates == ()
+
+
+def test_secret_callsite_does_not_cross_return_or_handler_boundaries(
+    tmp_path: Path,
+) -> None:
+    methods = (
+        ("Lcom/example/app/ControlFlow;", "afterReturn", (), "V"),
+        ("Lcom/example/app/ControlFlow;", "handler", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    after_return = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        0x0E,
+        *_invoke(2, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    handler_entry = (
+        *_const_string(1, 0),
+        *_const_string(2, 1),
+        0x0D,
+        *_invoke(2, (0, 1, 2), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "control-flow-boundaries.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("api_key", "ownedCredential-Q7v2N9p4K8s5"),
+            methods=methods,
+            method_bodies=((0, 3, after_return), (1, 3, handler_entry)),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert result.status == "completed"
+    assert result.secret_candidates == ()
+
+
+def test_secret_callsite_invalidates_mutable_values_after_unmodeled_call(
+    tmp_path: Path,
+) -> None:
+    methods = (
+        ("Lcom/example/app/MutableFlow;", "crypto", (), "V"),
+        ("Lcom/example/app/MutableFlow;", "network", (), "V"),
+        ("Ljava/lang/String;", "getBytes", (), "[B"),
+        ("Lfixture/Mutator;", "mutateBytes", ("[B",), "V"),
+        ("Ljavax/crypto/spec/SecretKeySpec;", "<init>", ("[B", "Ljava/lang/String;"), "V"),
+        ("Ljava/lang/StringBuilder;", "<init>", ("Ljava/lang/String;",), "V"),
+        ("Lfixture/Mutator;", "mutateBuilder", ("Ljava/lang/StringBuilder;",), "V"),
+        (
+            "Ljava/lang/StringBuilder;",
+            "append",
+            ("Ljava/lang/String;",),
+            "Ljava/lang/StringBuilder;",
+        ),
+        ("Ljava/lang/StringBuilder;", "toString", (), "Ljava/lang/String;"),
+        (
+            "Lorg/apache/http/entity/StringEntity;",
+            "<init>",
+            ("Ljava/lang/String;",),
+            "V",
+        ),
+    )
+    crypto = (
+        *_const_string(0, 0),
+        *_invoke(2, (0,)),
+        0x0C | (1 << 8),
+        *_invoke(3, (1,)),
+        *_const_string(2, 1),
+        *_invoke(4, (3, 1, 2), direct=True),
+        0x0E,
+    )
+    network = (
+        *_const_string(1, 2),
+        *_invoke(5, (0, 1), direct=True),
+        *_invoke(6, (0,)),
+        *_const_string(2, 3),
+        *_invoke(7, (0, 2)),
+        *_invoke(8, (0,)),
+        0x0C | (3 << 8),
+        *_invoke(9, (4, 3), direct=True),
+        0x0E,
+    )
+    apk = tmp_path / "mutable-flow.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(
+                "owned-crypto-material-Q7v2N9p4K8s5",
+                "AES",
+                "password=",
+                "ownedCredential-Q7v2N9p4K8s5",
+            ),
+            methods=methods,
+            method_bodies=((0, 4, crypto), (1, 5, network)),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert result.status == "completed"
+    assert result.secret_candidates == ()
+
+
 def test_static_behavior_is_bounded_and_rejects_malformed_code(tmp_path: Path) -> None:
     methods = (
         ("Lfixture/BoundedFlow;", "run", (), "V"),

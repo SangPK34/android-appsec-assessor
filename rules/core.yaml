@@ -184,7 +184,7 @@ rules:
     evaluator: static_secret_candidate
     title: Hardcoded secret candidate in packaged application content
     category: secrets
-    description: Evaluates bounded APK, DEX, resource, and asset strings for contextual secret candidates.
+    description: Evaluates bounded base/split APK, resource, asset, and literal-only same-method DEX flows to allow-listed sensitive sinks. It retains only app-owned contextual candidates with verified namespace evidence as potential findings; static evidence never confirms exposure or credential validity.
     severity: high
     confidence: medium
     validation_type: none

@@ -626,6 +626,7 @@ class AppInspectionService:
                                 artifact.relative_path,
                                 (),
                             ),
+                            application_id=target,
                         )
                         for index, artifact in enumerate(artifacts)
                     )

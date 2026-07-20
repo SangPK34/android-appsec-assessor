@@ -8,6 +8,15 @@ redaction:
   package_identifiers_included: false
 
 sessions:
+  - session_id: 20260720-075621-2cac3b
+    report_sha256: 23e9d7708289762f62773a49e8ed19355e8825f3469b830c534164a24dc5802c
+    security_rules_evaluated: 29
+    confirmed: 1
+    potential: 10
+    pass: 5
+    inconclusive: 4
+    skipped: 9
+    error: 0
   - session_id: 20260720-015502-9b1dca
     report_sha256: 1ba064e7c56341b4b4227035e7498e3c23795fed3eb06b764285b20940d2d0d8
     security_rules_evaluated: 30
@@ -135,6 +144,12 @@ cases:
     outcome: not_exercised
     tested_scope: bounded_static_inventory_only
     evidence: Static inventory completed with ASL-STATIC-HARDCODED-SECRET pass, but no candidate existed for sink correlation or controlled validation.
+
+  - case_id: hardcoded_secret_contextual_inventory
+    session_id: 20260720-075621-2cac3b
+    outcome: pass
+    tested_scope: bounded_static_contextual_inventory_no_matched_candidate
+    evidence: The completed bounded APK, resource, asset, and same-method DEX contextual scan produced zero retained candidates and zero rejected contextual values. This pass covers only the analyzed bounded inputs; it does not prove absence of secrets, runtime use, credential validity, or server-side scope.
 
   - case_id: cleartext_canary_route
     session_id: 20260718-213857-8de6f9

@@ -213,14 +213,31 @@ def test_root_and_secret_class_thresholds_do_not_overstate_impact() -> None:
     assert "hook_presence_not_impact" in root_detection["false_positive_controls"]
 
     assert hardcoded_secret["current_implementation_status"] == (
-        "static_inventory_only"
+        "partially_implemented"
     )
+    assert hardcoded_secret["detection_mode"] == ["static"]
     assert hardcoded_secret["runtime_observer"] == []
     assert hardcoded_secret["controlled_validator"] == []
-    assert "application-versus-dependency" in hardcoded_secret["known_gap"]
-    assert "crypto, network, or authentication sink" in (
+    assert "Static contextual candidates are potential only" in (
         hardcoded_secret["confirmation_threshold"]
     )
+    assert "Bounded linear same-method" in hardcoded_secret["known_gap"]
+    assert "runtime execution" in hardcoded_secret["known_gap"]
+    assert {
+        "application_namespace_ownership",
+        "verified_build_config_namespace",
+        "unresolved_namespace_rejection",
+        "base_split_candidate_prioritization",
+        "exact_sensitive_sink_context",
+        "no_entropy_only_promotion",
+    } <= set(hardcoded_secret["false_positive_controls"])
+    assert hardcoded_secret["lab_result"] == {
+        "outcome": "pass",
+        "session_id": "20260720-075621-2cac3b",
+        "tested_scope": "bounded_static_contextual_inventory_no_matched_candidate",
+        "evidence_reference": "docs/validation/class-coverage-lab.yaml",
+        "evidence_case": "hardcoded_secret_contextual_inventory",
+    }
 
 
 def test_explorer_resilience_lab_evidence_preserves_partial_outcome() -> None:

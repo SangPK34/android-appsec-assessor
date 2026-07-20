@@ -62,9 +62,11 @@ _PRIVATE_KEY_HEADER_PATTERN = re.compile(
 )
 _ASSIGNED_SECRET_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
-    r"(?P<key>[A-Za-z][A-Za-z0-9_.-]{0,80}"
+    r"(?P<key>(?:[A-Za-z][A-Za-z0-9_.-]{0,80}"
     r"(?:authorization|auth|bearer|token|key|secret|credential|password|passwd|"
-    r"cookie|session)[A-Za-z0-9_.-]{0,80})"
+    r"cookie|session)[A-Za-z0-9_.-]{0,80}|"
+    r"authorization|auth|bearer|token|key|secret|credential|password|passwd|"
+    r"cookie|session))"
     r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']?)"
     r"(?P<value>[^\s\"',;&#}\]]{6,512})(?P=value_quote)"
 )
@@ -243,6 +245,7 @@ class StaticApkPolicy:
     max_dex_encoded_methods: int = 200_000
     max_dex_code_units: int = 8_000_000
     max_dex_invocations: int = 500_000
+    max_dex_secret_signals: int = 1_000
     min_pbe_iterations: int = 10_000
     max_static_behavior_candidates: int = 500
 
@@ -271,12 +274,19 @@ class StaticApkInput:
     path: Path
     source_id: str
     resource_strings: tuple[str, ...] = ()
+    application_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.source_id or len(self.source_id) > 240:
             raise ValueError("Static APK source identifier is invalid.")
         if any(value in self.source_id for value in ("\x00", "\r", "\n")):
             raise ValueError("Static APK source identifier contains control characters.")
+        if self.application_id is not None and (
+            not self.application_id
+            or len(self.application_id) > 255
+            or any(value in self.application_id for value in ("\x00", "\r", "\n"))
+        ):
+            raise ValueError("Static APK application identifier is invalid.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,10 +370,12 @@ class DexInventory:
     strings: tuple[str | None, ...]
     method_references: tuple[DexMethodReference, ...]
     oversized_strings: int
+    defined_class_descriptors: tuple[str, ...] = ()
     oversized_string_regions: tuple[tuple[int, int], ...] = ()
     behavior_signals: tuple[_DexBehaviorSignal, ...] = ()
     behavior_limitations: tuple[str, ...] = ()
     behavior_metrics: tuple[tuple[str, int], ...] = ()
+    secret_signals: tuple[_DexSecretSignal, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +386,53 @@ class _DexBehaviorSignal:
     caller_method_name: str
     caller_prototype: str
     indicators: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DexSecretSignal:
+    """In-memory same-method secret-to-sink correlation, never serialized raw."""
+
+    caller_class_descriptor: str
+    caller_method_name: str
+    caller_prototype: str
+    code_item_offset: int
+    source_code_unit_offset: int
+    code_unit_offset: int
+    sink_class_descriptor: str
+    sink_method_name: str
+    sink_prototype: str
+    key_name: str | None
+    secret_type: str
+    usage_context: str
+    construction: str
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingDexScan:
+    dex_entry: str
+    data: bytes
+    inventory: DexInventory
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingTextScan:
+    entry: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingArchiveScan:
+    item: StaticApkInput
+    dex_entries: tuple[_PendingDexScan, ...]
+    text_entries: tuple[_PendingTextScan, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CodeOwnershipContext:
+    application_id: str | None
+    app_namespaces: tuple[str, ...]
+    non_app_classification_supported: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +461,46 @@ class SecretCandidate:
     key_name: str | None
     value_sha256: str
     value_length: int
+    secret_type: str = "unknown"
+    usage_context: str = "packaged_content"
+    code_ownership: str = "unattributed_packaged_content"
+    caller_class_descriptor: str | None = None
+    caller_method_name: str | None = None
+    caller_prototype: str | None = None
+    dex_entry: str | None = None
+    sink_class_descriptor: str | None = None
+    sink_method_name: str | None = None
+    sink_prototype: str | None = None
+    sink_location: str | None = None
+    construction: str = "direct_literal"
+    retention_reason: str = "contextual_secret_material"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class SecretCandidateRejection:
+    """Safe summary of a contextual value that did not meet retention controls."""
+
+    source_id: str
+    location: str
+    key_name: str | None
+    value_sha256: str
+    value_length: int
+    secret_type: str
+    usage_context: str
+    code_ownership: str
+    reason: str
+    caller_class_descriptor: str | None = None
+    caller_method_name: str | None = None
+    caller_prototype: str | None = None
+    dex_entry: str | None = None
+    sink_class_descriptor: str | None = None
+    sink_method_name: str | None = None
+    sink_prototype: str | None = None
+    sink_location: str | None = None
+    construction: str = "direct_literal"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -476,6 +575,7 @@ class StaticApkAnalysisResult:
     metrics: dict[str, int]
     security_api_candidates: tuple[ApiInventoryMatch, ...] = ()
     static_behavior_candidates: tuple[StaticBehaviorCandidate, ...] = ()
+    secret_candidate_rejections: tuple[SecretCandidateRejection, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -483,6 +583,9 @@ class StaticApkAnalysisResult:
             "status": self.status,
             "sources": list(self.sources),
             "secret_candidates": [item.to_dict() for item in self.secret_candidates],
+            "secret_candidate_rejections": [
+                item.to_dict() for item in self.secret_candidate_rejections
+            ],
             "endpoints": [item.to_dict() for item in self.endpoints],
             "dynamic_loading_apis": [
                 item.to_dict() for item in self.dynamic_loading_apis
@@ -505,6 +608,7 @@ class _Collector:
     policy: StaticApkPolicy
     api_policy: tuple[ApiPolicyEntry, ...]
     secrets: list[SecretCandidate] = field(default_factory=list)
+    secret_rejections: list[SecretCandidateRejection] = field(default_factory=list)
     endpoints: list[EndpointCandidate] = field(default_factory=list)
     dynamic: list[ApiInventoryMatch] = field(default_factory=list)
     security: list[ApiInventoryMatch] = field(default_factory=list)
@@ -534,9 +638,14 @@ class _Collector:
             "string_scan_chunks": 0,
             "string_scan_timeouts": 0,
             "oversized_dex_strings_scanned": 0,
+            "binary_raw_entries_skipped": 0,
+            "binary_untyped_entries_skipped": 0,
         }
     )
-    secret_keys: set[tuple[str, str, str]] = field(default_factory=set)
+    secret_keys: set[tuple[str, str, str, str, str]] = field(default_factory=set)
+    secret_rejection_keys: set[tuple[str, str, str, str, str]] = field(
+        default_factory=set
+    )
     endpoint_keys: set[tuple[str, str]] = field(default_factory=set)
     dynamic_keys: set[tuple[str, str, str, str, str]] = field(default_factory=set)
     security_keys: set[tuple[str, str, str, str, str]] = field(default_factory=set)
@@ -1074,6 +1183,8 @@ def _read_dex_string(
 @dataclass(frozen=True, slots=True)
 class _DexConstant:
     value: str | int | tuple[str, int]
+    origin_offsets: tuple[int, ...] = ()
+    construction: str = "direct_literal"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1081,7 +1192,10 @@ class _DexInvocation:
     reference: DexMethodReference
     arguments: tuple[_DexConstant | None, ...]
     argument_generations: tuple[int, ...]
+    argument_registers: tuple[int, ...]
     invoke_kind: str
+    code_item_offset: int
+    code_unit_offset: int
 
 
 def _sign_extend(value: int, bits: int) -> int:
@@ -1203,9 +1317,10 @@ def _scan_dex_invocations(
     *,
     code_offset: int,
     method_table: Sequence[DexMethodReference | None],
-    string_count: int,
+    strings: Sequence[str | None],
     invocation_budget: int,
-) -> tuple[tuple[_DexInvocation, ...], int, bool, bool]:
+    max_constructed_bytes: int,
+) -> tuple[tuple[_DexInvocation, ...], int, bool, bool, bool]:
     if code_offset < _DEX_HEADER_SIZE or code_offset % 4 or code_offset + 16 > len(data):
         raise DexFormatError("DEX code item is outside the file bounds.")
     registers_size, _ins_size, _outs_size, tries_size = struct.unpack_from(
@@ -1222,9 +1337,12 @@ def _scan_dex_invocations(
             raise DexFormatError("DEX code exception table is truncated.")
     insns = memoryview(data)[insns_offset:insns_end].cast("H")
     constants: dict[int, _DexConstant] = {}
+    builders: dict[int, _DexConstant] = {}
     register_generations: dict[int, int] = {}
     next_generation = 1
     flow_epoch = 0
+    pending_result: _DexConstant | None = None
+    pending_builder: _DexConstant | None = None
 
     def validate_register(register: int, *, width: int = 1) -> None:
         if register < 0 or register + width > registers_size:
@@ -1242,6 +1360,7 @@ def _scan_dex_invocations(
         validate_register(register, width=width)
         for item in range(register, register + width):
             constants.pop(item, None)
+            builders.pop(item, None)
             register_generations[item] = next_generation
             next_generation += 1
 
@@ -1252,18 +1371,87 @@ def _scan_dex_invocations(
             constants[destination] = constants[source]
         else:
             constants.pop(destination, None)
+        if source in builders:
+            builders[destination] = builders[source]
+        else:
+            builders.pop(destination, None)
         register_generations[destination] = register_generation(source)
 
     def clear_flow_state() -> None:
-        nonlocal flow_epoch
+        nonlocal flow_epoch, pending_result, pending_builder
         constants.clear()
+        builders.clear()
         register_generations.clear()
+        pending_result = None
+        pending_builder = None
         flow_epoch += 1
+
+    def text_value(value: _DexConstant | None) -> str | None:
+        resolved = _constant_value(value, strings)
+        return resolved if isinstance(resolved, str) else None
+
+    def bounded_constant(
+        value: str,
+        *,
+        origin_offsets: tuple[int, ...],
+        construction: str,
+    ) -> _DexConstant | None:
+        nonlocal dataflow_limited
+        if len(value.encode("utf-8", errors="surrogatepass")) > max_constructed_bytes:
+            dataflow_limited = True
+            return None
+        return _DexConstant(
+            value=value,
+            origin_offsets=origin_offsets,
+            construction=construction,
+        )
+
+    def append_constants(
+        first: _DexConstant | None,
+        second: _DexConstant | None,
+        *,
+        construction: str,
+    ) -> _DexConstant | None:
+        first_value = text_value(first)
+        second_value = text_value(second)
+        if first_value is None or second_value is None:
+            return None
+        return bounded_constant(
+            first_value + second_value,
+            origin_offsets=tuple(
+                dict.fromkeys(
+                    (*first.origin_offsets, *second.origin_offsets)
+                )
+            ),
+            construction=construction,
+        )
+
+    def invalidate_mutable_arguments(registers: Sequence[int]) -> None:
+        mutable_builders = {
+            builders[register]
+            for register in registers
+            if register in builders
+        }
+        mutable_bytes = {
+            constants[register]
+            for register in registers
+            if register in constants
+            and constants[register].construction.endswith("_bytes")
+        }
+        if mutable_builders:
+            for register, value in tuple(builders.items()):
+                if value in mutable_builders:
+                    builders.pop(register, None)
+        if mutable_bytes:
+            for register, value in tuple(constants.items()):
+                if value in mutable_bytes:
+                    constants.pop(register, None)
 
     invocations: list[_DexInvocation] = []
     offset = 0
     unsupported = False
     limited = False
+    dataflow_limited = False
     while offset < len(insns):
         first = int(insns[offset])
         opcode = first & 0xFF
@@ -1273,6 +1461,24 @@ def _scan_dex_invocations(
             break
         if width < 1 or offset + width > len(insns):
             raise DexFormatError("DEX instruction is truncated.")
+
+        if opcode not in {
+            0x0A,
+            0x0B,
+            0x0C,
+            0x6E,
+            0x6F,
+            0x70,
+            0x71,
+            0x72,
+            0x74,
+            0x75,
+            0x76,
+            0x77,
+            0x78,
+        }:
+            pending_result = None
+            pending_builder = None
 
         if opcode == 0x12:
             register = (first >> 8) & 0x0F
@@ -1300,15 +1506,18 @@ def _scan_dex_invocations(
             string_index = int(insns[offset + 1])
             if opcode == 0x1B:
                 string_index |= int(insns[offset + 2]) << 16
-            if string_index >= string_count:
+            if string_index >= len(strings):
                 raise DexFormatError(
                     "DEX const-string references an invalid string index."
                 )
-            # String values are looked up by the caller because method-id parsing
-            # deliberately does not retain a second unbounded string table here.
             destination = first >> 8
             define_register(destination)
-            constants[destination] = _DexConstant(("string-index", string_index))
+            string_value = strings[string_index]
+            if string_value is not None:
+                constants[destination] = _DexConstant(
+                    string_value,
+                    origin_offsets=(offset,),
+                )
         elif opcode in {0x01, 0x07}:
             destination = (first >> 8) & 0x0F
             source = (first >> 12) & 0x0F
@@ -1339,35 +1548,121 @@ def _scan_dex_invocations(
             if method_index >= len(method_table):
                 raise DexFormatError("DEX invoke references an invalid method index.")
             reference = method_table[method_index]
+            pending_result = None
+            pending_builder = None
             if reference is not None:
                 if len(invocations) >= invocation_budget:
                     limited = True
                     break
-                invocations.append(
-                    _DexInvocation(
-                        reference=reference,
-                        arguments=tuple(constants.get(register) for register in registers),
-                        argument_generations=tuple(
-                            register_generation(register) for register in registers
-                        ),
-                        invoke_kind={
-                            0x6E: "virtual",
-                            0x6F: "super",
-                            0x70: "direct",
-                            0x71: "static",
-                            0x72: "interface",
-                            0x74: "virtual",
-                            0x75: "super",
-                            0x76: "direct",
-                            0x77: "static",
-                            0x78: "interface",
-                        }[opcode],
-                    )
+                arguments = tuple(constants.get(register) for register in registers)
+                invocation = _DexInvocation(
+                    reference=reference,
+                    arguments=arguments,
+                    argument_generations=tuple(
+                        register_generation(register) for register in registers
+                    ),
+                    argument_registers=registers,
+                    invoke_kind={
+                        0x6E: "virtual",
+                        0x6F: "super",
+                        0x70: "direct",
+                        0x71: "static",
+                        0x72: "interface",
+                        0x74: "virtual",
+                        0x75: "super",
+                        0x76: "direct",
+                        0x77: "static",
+                        0x78: "interface",
+                    }[opcode],
+                    code_item_offset=code_offset,
+                    code_unit_offset=offset,
                 )
+                invocations.append(invocation)
+                class_name = reference.class_descriptor
+                method_name = reference.method_name
+                modeled = False
+                if class_name == "Ljava/lang/StringBuilder;":
+                    receiver = registers[0] if registers else None
+                    if receiver is not None and method_name == "<init>":
+                        modeled = True
+                        initial = (
+                            arguments[1]
+                            if len(arguments) >= 2
+                            else _DexConstant("", origin_offsets=(offset,))
+                        )
+                        initial_value = text_value(initial)
+                        if initial_value is not None:
+                            builder = bounded_constant(
+                                initial_value,
+                                origin_offsets=initial.origin_offsets,
+                                construction="string_builder",
+                            )
+                            if builder is not None:
+                                builders[receiver] = builder
+                        else:
+                            builders.pop(receiver, None)
+                    elif receiver is not None and method_name == "append":
+                        modeled = True
+                        builder = append_constants(
+                            builders.get(receiver),
+                            arguments[1] if len(arguments) >= 2 else None,
+                            construction="string_builder",
+                        )
+                        if builder is None:
+                            builders.pop(receiver, None)
+                        else:
+                            builders[receiver] = builder
+                            pending_builder = builder
+                    elif receiver is not None and method_name == "toString":
+                        modeled = True
+                        pending_result = builders.get(receiver)
+                elif (
+                    class_name == "Ljava/lang/String;"
+                    and method_name == "concat"
+                    and len(arguments) >= 2
+                ):
+                    modeled = True
+                    pending_result = append_constants(
+                        arguments[0],
+                        arguments[1],
+                        construction="string_concat",
+                    )
+                elif (
+                    class_name == "Ljava/lang/String;"
+                    and method_name == "getBytes"
+                    and arguments
+                ):
+                    modeled = True
+                    source = arguments[0]
+                    source_value = text_value(source)
+                    if source_value is not None:
+                        pending_result = bounded_constant(
+                            source_value,
+                            origin_offsets=source.origin_offsets,
+                            construction=f"{source.construction}_bytes",
+                        )
+                if not modeled:
+                    invalidate_mutable_arguments(registers)
+            else:
+                invalidate_mutable_arguments(registers)
         elif opcode in {0x0A, 0x0C, 0x0D}:
-            define_register(first >> 8)
+            destination = first >> 8
+            if opcode == 0x0D:
+                # A catch handler begins with move-exception.  Never carry normal
+                # path literals into that handler's independent control-flow edge.
+                clear_flow_state()
+            define_register(destination)
+            if opcode == 0x0C:
+                if pending_result is not None:
+                    constants[destination] = pending_result
+                if pending_builder is not None:
+                    builders[destination] = pending_builder
+            pending_result = None
+            pending_builder = None
         elif opcode == 0x0B:
             define_register(first >> 8, width=2)
+        elif 0x0E <= opcode <= 0x11:
+            clear_flow_state()
         elif opcode in {0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C} or 0x32 <= opcode <= 0x3D:
             clear_flow_state()
         elif opcode in {0x21, 0x23, 0x20}:
@@ -1410,7 +1705,7 @@ def _scan_dex_invocations(
         elif 0xD8 <= opcode <= 0xE2:
             define_register(first >> 8)
         offset += width
-    return tuple(invocations), offset, unsupported, limited
+    return tuple(invocations), offset, unsupported, limited, dataflow_limited
 
 
 def _constant_value(
@@ -1784,6 +2079,296 @@ def _behavior_signals_for_method(
     )
 
 
+def _secret_type_for_key_name(value: str | None, *, fallback: str) -> str:
+    if value is None:
+        return fallback
+    normalized = re.sub(r"[^a-z0-9]+", "", value.casefold())
+    if "password" in normalized or "passwd" in normalized:
+        return "password"
+    if "token" in normalized or "bearer" in normalized or "session" in normalized:
+        return "token"
+    if "apikey" in normalized or "api" in normalized:
+        return "api_credential"
+    if "iv" == normalized or normalized.endswith("iv"):
+        return "initialization_vector"
+    if "key" in normalized or "secret" in normalized:
+        return "crypto_key" if fallback == "crypto_key" else "credential"
+    if "auth" in normalized or "credential" in normalized:
+        return "credential"
+    return fallback
+
+
+def _secret_signals_for_method(
+    caller: DexMethodReference,
+    invocations: Sequence[_DexInvocation],
+    strings: Sequence[str | None],
+    *,
+    signal_budget: int,
+) -> tuple[tuple[_DexSecretSignal, ...], bool]:
+    """Find literal-only values passed to exact sensitive sinks in one method.
+
+    The invocation scanner deliberately clears state at branch, return, and
+    exception-handler boundaries. This helper therefore makes no
+    interprocedural, field, array, or path-merge claims; it only preserves a
+    bounded linear same-method construction.
+    """
+
+    signals: list[_DexSecretSignal] = []
+    keys: set[tuple[int, int, str, str]] = set()
+    limited = False
+
+    def value_at(
+        invocation: _DexInvocation,
+        index: int,
+    ) -> tuple[str, _DexConstant] | None:
+        if index >= len(invocation.arguments):
+            return None
+        constant = invocation.arguments[index]
+        value = _constant_value(constant, strings)
+        if not isinstance(value, str) or not value:
+            return None
+        if constant is None:
+            return None
+        return value, constant
+
+    def text_at(invocation: _DexInvocation, index: int) -> str | None:
+        found = value_at(invocation, index)
+        return found[0] if found is not None else None
+
+    def record_value(
+        invocation: _DexInvocation,
+        *,
+        constant: _DexConstant,
+        value: str,
+        key_name: str | None,
+        secret_type: str,
+        usage_context: str,
+    ) -> None:
+        nonlocal limited
+        source_offset = (
+            min(constant.origin_offsets)
+            if constant.origin_offsets
+            else invocation.code_unit_offset
+        )
+        identity = (
+            source_offset,
+            invocation.code_unit_offset,
+            usage_context,
+            _hash_value(value),
+        )
+        if identity in keys:
+            return
+        if len(signals) >= signal_budget:
+            limited = True
+            return
+        keys.add(identity)
+        signals.append(
+            _DexSecretSignal(
+                caller_class_descriptor=caller.class_descriptor,
+                caller_method_name=caller.method_name,
+                caller_prototype=caller.prototype,
+                code_item_offset=invocation.code_item_offset,
+                source_code_unit_offset=source_offset,
+                code_unit_offset=invocation.code_unit_offset,
+                sink_class_descriptor=invocation.reference.class_descriptor,
+                sink_method_name=invocation.reference.method_name,
+                sink_prototype=invocation.reference.prototype,
+                key_name=key_name,
+                secret_type=_secret_type_for_key_name(
+                    key_name,
+                    fallback=secret_type,
+                ),
+                usage_context=usage_context,
+                construction=constant.construction,
+                value=value,
+            )
+        )
+
+    def record(
+        invocation: _DexInvocation,
+        *,
+        value_index: int,
+        key_name: str | None,
+        secret_type: str,
+        usage_context: str,
+    ) -> None:
+        found = value_at(invocation, value_index)
+        if found is None:
+            return
+        value, constant = found
+        record_value(
+            invocation,
+            constant=constant,
+            value=value,
+            key_name=key_name,
+            secret_type=secret_type,
+            usage_context=usage_context,
+        )
+
+    def record_named_body_values(
+        invocation: _DexInvocation,
+        *,
+        value_index: int,
+    ) -> None:
+        found = value_at(invocation, value_index)
+        if found is None:
+            return
+        body, constant = found
+        for match in _ASSIGNED_SECRET_PATTERN.finditer(body):
+            key_name = match.group("key")
+            if not _is_sensitive_assignment_key(key_name):
+                continue
+            record_value(
+                invocation,
+                constant=constant,
+                value=match.group("value"),
+                key_name=key_name,
+                secret_type="credential",
+                usage_context="network_serialized_body",
+            )
+
+    for invocation in invocations:
+        reference = invocation.reference
+        class_name = reference.class_descriptor
+        method_name = reference.method_name
+        prototype = reference.prototype
+
+        if (
+            class_name == "Ljavax/crypto/spec/SecretKeySpec;"
+            and method_name == "<init>"
+            and invocation.invoke_kind == "direct"
+            and prototype.startswith("([B")
+        ):
+            record(
+                invocation,
+                value_index=1,
+                key_name="crypto_key_material",
+                secret_type="crypto_key",
+                usage_context="crypto_key_constructor",
+            )
+            continue
+        if (
+            class_name == "Ljavax/crypto/spec/IvParameterSpec;"
+            and method_name == "<init>"
+            and invocation.invoke_kind == "direct"
+            and prototype.startswith("([B")
+        ):
+            record(
+                invocation,
+                value_index=1,
+                key_name="initialization_vector",
+                secret_type="initialization_vector",
+                usage_context="crypto_iv_constructor",
+            )
+            continue
+
+        if (
+            class_name == "Lorg/apache/http/auth/UsernamePasswordCredentials;"
+            and method_name == "<init>"
+            and invocation.invoke_kind == "direct"
+            and prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
+        ):
+            record(
+                invocation,
+                value_index=2,
+                key_name="password",
+                secret_type="password",
+                usage_context="authentication_credentials",
+            )
+            continue
+        if (
+            class_name == "Lokhttp3/Credentials;"
+            and method_name == "basic"
+            and invocation.invoke_kind == "static"
+            and prototype.startswith("(Ljava/lang/String;Ljava/lang/String;")
+        ):
+            record(
+                invocation,
+                value_index=1,
+                key_name="password",
+                secret_type="password",
+                usage_context="authentication_credentials",
+            )
+            continue
+
+        if (
+            class_name == "Lorg/apache/http/entity/StringEntity;"
+            and method_name == "<init>"
+            and invocation.invoke_kind == "direct"
+            and prototype.startswith("(Ljava/lang/String;")
+        ):
+            record_named_body_values(invocation, value_index=1)
+            continue
+        if (
+            class_name in {"Lokhttp3/RequestBody;", "Lokhttp3/RequestBody$Companion;"}
+            and method_name == "create"
+            and invocation.invoke_kind == "static"
+            and prototype.startswith("(Lokhttp3/MediaType;Ljava/lang/String;")
+        ):
+            record_named_body_values(invocation, value_index=1)
+            continue
+
+        keyed_context: str | None = None
+        if (
+            class_name == "Lorg/apache/http/message/BasicNameValuePair;"
+            and method_name == "<init>"
+            and invocation.invoke_kind == "direct"
+            and prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
+        ):
+            keyed_context = "network_form_parameter"
+        elif (
+            class_name in {"Ljava/net/URLConnection;", "Ljava/net/HttpURLConnection;"}
+            and method_name == "setRequestProperty"
+            and prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
+        ):
+            keyed_context = "network_request_header"
+        elif (
+            class_name == "Lokhttp3/Request$Builder;"
+            and method_name in {"header", "addHeader"}
+            and prototype == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Request$Builder;"
+        ):
+            keyed_context = "network_request_header"
+        elif (
+            class_name == "Lokhttp3/Headers$Builder;"
+            and method_name in {"add", "set"}
+            and prototype == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Headers$Builder;"
+        ):
+            keyed_context = "network_request_header"
+        elif (
+            class_name == "Lokhttp3/FormBody$Builder;"
+            and method_name in {"add", "addEncoded"}
+            and prototype == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/FormBody$Builder;"
+        ):
+            keyed_context = "network_form_parameter"
+        elif (
+            class_name == "Landroid/net/Uri$Builder;"
+            and method_name == "appendQueryParameter"
+            and prototype == "(Ljava/lang/String;Ljava/lang/String;)Landroid/net/Uri$Builder;"
+        ):
+            keyed_context = "network_query_parameter"
+        elif (
+            class_name == "Landroid/content/SharedPreferences$Editor;"
+            and method_name == "putString"
+            and prototype
+            == "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;"
+        ):
+            keyed_context = "sensitive_storage_write"
+        if keyed_context is None:
+            continue
+        key_name = text_at(invocation, 1)
+        if key_name is None or not _is_sensitive_assignment_key(key_name):
+            continue
+        record(
+            invocation,
+            value_index=2,
+            key_name=key_name,
+            secret_type="credential",
+            usage_context=keyed_context,
+        )
+
+    return tuple(signals), limited
+
+
 def _parse_dex_behavior(
     data: bytes,
     *,
@@ -1792,7 +2377,9 @@ def _parse_dex_behavior(
     types: Sequence[str | None],
     method_table: Sequence[DexMethodReference | None],
 ) -> tuple[
+    tuple[str, ...],
     tuple[_DexBehaviorSignal, ...],
+    tuple[_DexSecretSignal, ...],
     tuple[str, ...],
     tuple[tuple[str, int], ...],
 ]:
@@ -1822,8 +2409,11 @@ def _parse_dex_behavior(
         limit("dex_class_defs")
     encoded_methods_seen = 0
     encoded_members_seen = 0
+    defined_class_descriptors: list[str] = []
     signals: list[_DexBehaviorSignal] = []
     signal_keys: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
+    secret_signals: list[_DexSecretSignal] = []
+    secret_signal_keys: set[tuple[str, str, str, int, int, str, str]] = set()
 
     for class_position in range(class_scan_count):
         class_base = class_offset + class_position * 32
@@ -1834,6 +2424,8 @@ def _parse_dex_behavior(
         class_descriptor = types[class_index]
         if class_descriptor is not None and not _is_class_descriptor(class_descriptor):
             raise DexFormatError("DEX class definition descriptor is malformed.")
+        if class_descriptor is not None:
+            defined_class_descriptors.append(class_descriptor)
         if class_data_offset == 0:
             continue
         if class_data_offset < _DEX_HEADER_SIZE or class_data_offset >= len(data):
@@ -1899,13 +2491,20 @@ def _parse_dex_behavior(
                 if remaining_invocations <= 0:
                     limit("dex_invocations")
                     continue
-                invocations, code_units, unsupported, invocation_limited = (
+                (
+                    invocations,
+                    code_units,
+                    unsupported,
+                    invocation_limited,
+                    dataflow_limited,
+                ) = (
                     _scan_dex_invocations(
                         data,
                         code_offset=code_offset,
                         method_table=method_table,
-                        string_count=len(strings),
+                        strings=strings,
                         invocation_budget=remaining_invocations,
+                        max_constructed_bytes=limits.max_string_bytes,
                     )
                 )
                 metrics["dex_behavior_methods_scanned"] += 1
@@ -1915,6 +2514,8 @@ def _parse_dex_behavior(
                     limit("dex_behavior_unsupported_opcode")
                 if invocation_limited:
                     limit("dex_invocations")
+                if dataflow_limited:
+                    limit("dex_secret_dataflow_bytes")
                 for signal in _behavior_signals_for_method(
                     caller,
                     invocations,
@@ -1936,8 +2537,39 @@ def _parse_dex_behavior(
                     signal_keys.add(key)
                     signals.append(signal)
 
+                remaining_secret_signals = (
+                    limits.max_dex_secret_signals - len(secret_signals)
+                )
+                if remaining_secret_signals <= 0:
+                    limit("dex_secret_signals")
+                    continue
+                method_secret_signals, secret_signal_limited = _secret_signals_for_method(
+                    caller,
+                    invocations,
+                    strings,
+                    signal_budget=remaining_secret_signals,
+                )
+                if secret_signal_limited:
+                    limit("dex_secret_signals")
+                for secret_signal in method_secret_signals:
+                    secret_key = (
+                        secret_signal.caller_class_descriptor,
+                        secret_signal.caller_method_name,
+                        secret_signal.caller_prototype,
+                        secret_signal.source_code_unit_offset,
+                        secret_signal.code_unit_offset,
+                        secret_signal.usage_context,
+                        _hash_value(secret_signal.value),
+                    )
+                    if secret_key in secret_signal_keys:
+                        continue
+                    secret_signal_keys.add(secret_key)
+                    secret_signals.append(secret_signal)
+
     return (
+        tuple(defined_class_descriptors),
         tuple(signals),
+        tuple(secret_signals),
         tuple(limitations),
         tuple(sorted(metrics.items())),
     )
@@ -2135,7 +2767,13 @@ def parse_dex_inventory(
                 prototype=prototype,
             )
         )
-    behavior_signals, behavior_limitations, behavior_metrics = _parse_dex_behavior(
+    (
+        defined_class_descriptors,
+        behavior_signals,
+        secret_signals,
+        behavior_limitations,
+        behavior_metrics,
+    ) = _parse_dex_behavior(
         data,
         limits=limits,
         strings=strings,
@@ -2148,10 +2786,12 @@ def parse_dex_inventory(
             reference for reference in method_table if reference is not None
         ),
         oversized_strings=oversized,
+        defined_class_descriptors=defined_class_descriptors,
         oversized_string_regions=tuple(oversized_regions),
         behavior_signals=behavior_signals,
         behavior_limitations=behavior_limitations,
         behavior_metrics=behavior_metrics,
+        secret_signals=secret_signals,
     )
 
 
@@ -2373,9 +3013,43 @@ def _record_secret(
     location: str,
     key_name: str | None,
     value: str,
+    secret_type: str = "unknown",
+    usage_context: str = "packaged_content",
+    code_ownership: str = "unattributed_packaged_content",
+    caller_class_descriptor: str | None = None,
+    caller_method_name: str | None = None,
+    caller_prototype: str | None = None,
+    dex_entry: str | None = None,
+    sink_class_descriptor: str | None = None,
+    sink_method_name: str | None = None,
+    sink_prototype: str | None = None,
+    sink_location: str | None = None,
+    construction: str = "direct_literal",
+    retention_reason: str = "contextual_secret_material",
 ) -> None:
     candidate = _clean_secret_value(value)
-    if _is_placeholder(candidate):
+    rejection = _contextual_secret_rejection_reason(candidate)
+    if rejection is not None:
+        _record_secret_rejection(
+            collector,
+            source_id=source_id,
+            location=location,
+            key_name=key_name,
+            value=candidate,
+            secret_type=secret_type,
+            usage_context=usage_context,
+            code_ownership=code_ownership,
+            reason=rejection,
+            caller_class_descriptor=caller_class_descriptor,
+            caller_method_name=caller_method_name,
+            caller_prototype=caller_prototype,
+            dex_entry=dex_entry,
+            sink_class_descriptor=sink_class_descriptor,
+            sink_method_name=sink_method_name,
+            sink_prototype=sink_prototype,
+            sink_location=sink_location,
+            construction=construction,
+        )
         return
     if len(candidate.encode("utf-8", errors="surrogatepass")) > (
         collector.policy.max_string_bytes
@@ -2383,7 +3057,25 @@ def _record_secret(
         collector.limit("string_candidate_bytes")
         return
     digest = _hash_value(candidate)
-    identity = (kind, source_id, digest)
+    if usage_context == "packaged_content" and _has_contextual_secret_alias(
+        collector,
+        source_id=source_id,
+        digest=digest,
+    ):
+        return
+    if usage_context != "packaged_content":
+        _remove_unattributed_secret_aliases(
+            collector,
+            source_id=source_id,
+            digest=digest,
+        )
+    identity = (
+        kind,
+        source_id,
+        digest,
+        usage_context,
+        sink_location or "",
+    )
     if identity in collector.secret_keys:
         return
     if (
@@ -2408,7 +3100,297 @@ def _record_secret(
             key_name=key_name,
             value_sha256=digest,
             value_length=len(candidate),
+            secret_type=secret_type,
+            usage_context=usage_context,
+            code_ownership=code_ownership,
+            caller_class_descriptor=caller_class_descriptor,
+            caller_method_name=caller_method_name,
+            caller_prototype=caller_prototype,
+            dex_entry=dex_entry,
+            sink_class_descriptor=sink_class_descriptor,
+            sink_method_name=sink_method_name,
+            sink_prototype=sink_prototype,
+            sink_location=sink_location,
+            construction=construction,
+            retention_reason=retention_reason,
         )
+    )
+
+
+def _has_contextual_secret_alias(
+    collector: _Collector,
+    *,
+    source_id: str,
+    digest: str,
+) -> bool:
+    return any(
+        item.source_id == source_id
+        and item.value_sha256 == digest
+        and item.usage_context != "packaged_content"
+        for item in collector.secrets
+    )
+
+
+def _remove_unattributed_secret_aliases(
+    collector: _Collector,
+    *,
+    source_id: str,
+    digest: str,
+) -> None:
+    collector.secrets[:] = [
+        item
+        for item in collector.secrets
+        if not (
+            item.source_id == source_id
+            and item.value_sha256 == digest
+            and item.usage_context == "packaged_content"
+            and item.code_ownership == "unattributed_packaged_content"
+        )
+    ]
+
+
+def _descriptor_namespace(value: str) -> str | None:
+    if not _is_class_descriptor(value):
+        return None
+    namespace, separator, _class_name = value[1:-1].rpartition("/")
+    if not separator or not namespace:
+        return None
+    return namespace.replace("/", ".")
+
+
+def _ownership_contexts(
+    scans: Sequence[_PendingArchiveScan],
+) -> dict[str, _CodeOwnershipContext]:
+    """Build conservative ownership evidence across all base/split APKs."""
+    defined_classes: dict[str, set[str]] = {}
+    for scan in scans:
+        application_id = scan.item.application_id
+        if application_id is None:
+            continue
+        class_set = defined_classes.setdefault(application_id, set())
+        for dex in scan.dex_entries:
+            class_set.update(dex.inventory.defined_class_descriptors)
+
+    by_application: dict[str, _CodeOwnershipContext] = {}
+    for application_id, descriptors in defined_classes.items():
+        build_config_namespaces = {
+            namespace
+            for descriptor in descriptors
+            if descriptor.endswith("/BuildConfig;")
+            and (namespace := _descriptor_namespace(descriptor)) is not None
+            and (
+                application_id == namespace
+                or application_id.startswith(f"{namespace}.")
+            )
+        }
+        app_namespaces = tuple(
+            dict.fromkeys(
+                (
+                    application_id,
+                    *sorted(build_config_namespaces, key=lambda value: (-len(value), value)),
+                )
+            )
+        )
+        by_application[application_id] = _CodeOwnershipContext(
+            application_id=application_id,
+            app_namespaces=app_namespaces,
+            non_app_classification_supported=bool(build_config_namespaces),
+        )
+
+    return {
+        scan.item.source_id: (
+            by_application.get(
+                scan.item.application_id,
+                _CodeOwnershipContext(
+                    application_id=None,
+                    app_namespaces=(),
+                    non_app_classification_supported=False,
+                ),
+            )
+            if scan.item.application_id is not None
+            else _CodeOwnershipContext(
+                application_id=None,
+                app_namespaces=(),
+                non_app_classification_supported=False,
+            )
+        )
+        for scan in scans
+    }
+
+
+def _code_ownership(
+    caller_class_descriptor: str,
+    context: _CodeOwnershipContext,
+) -> str:
+    if context.application_id is None:
+        return "unknown"
+    if any(
+        caller_class_descriptor.startswith(f"L{namespace.replace('.', '/')}/")
+        for namespace in context.app_namespaces
+    ):
+        return "app_code"
+    if context.non_app_classification_supported:
+        return "packaged_dependency"
+    return "unknown"
+
+
+def _contextual_secret_rejection_reason(value: str) -> str | None:
+    candidate = _clean_secret_value(value)
+    if _is_class_descriptor(candidate) or re.fullmatch(
+        r"(?:[A-Za-z_$][A-Za-z0-9_$]*\.)+[A-Z_$][A-Za-z0-9_$]*",
+        candidate,
+    ):
+        return "class_name_or_identifier"
+    if re.fullmatch(
+        r"(?:@(?:string|raw|id)/[A-Za-z0-9_.-]+|R\.(?:string|raw|id)\."
+        r"[A-Za-z0-9_]+|0x[0-9a-fA-F]{8})",
+        candidate,
+    ):
+        return "resource_identifier"
+    try:
+        if urlsplit(candidate).scheme.casefold() in {"http", "https", "ws", "wss"}:
+            return "url_or_endpoint"
+    except ValueError:
+        return "malformed_url_like_value"
+    if _is_placeholder(candidate):
+        return "placeholder_or_test_value"
+    return None
+
+
+def _record_secret_rejection(
+    collector: _Collector,
+    *,
+    source_id: str,
+    location: str,
+    key_name: str | None,
+    value: str,
+    secret_type: str,
+    usage_context: str,
+    code_ownership: str,
+    reason: str,
+    caller_class_descriptor: str | None,
+    caller_method_name: str | None,
+    caller_prototype: str | None,
+    dex_entry: str | None,
+    sink_class_descriptor: str | None,
+    sink_method_name: str | None,
+    sink_prototype: str | None,
+    sink_location: str | None,
+    construction: str,
+) -> None:
+    candidate = _clean_secret_value(value)
+    if not candidate:
+        return
+    if len(candidate.encode("utf-8", errors="surrogatepass")) > (
+        collector.policy.max_string_bytes
+    ):
+        collector.limit("string_candidate_bytes")
+        return
+    digest = _hash_value(candidate)
+    identity = (source_id, digest, location, usage_context, reason)
+    if identity in collector.secret_rejection_keys:
+        return
+    if len(collector.secret_rejections) >= collector.policy.max_secret_candidates:
+        collector.limit("secret_candidate_rejections")
+        return
+    collector.secret_rejection_keys.add(identity)
+    source_values = collector.source_sensitive_values.setdefault(source_id, [])
+    if candidate not in source_values:
+        source_values.append(candidate)
+    collector.secret_rejections.append(
+        SecretCandidateRejection(
+            source_id=source_id,
+            location=location,
+            key_name=key_name,
+            value_sha256=digest,
+            value_length=len(candidate),
+            secret_type=secret_type,
+            usage_context=usage_context,
+            code_ownership=code_ownership,
+            reason=reason,
+            caller_class_descriptor=caller_class_descriptor,
+            caller_method_name=caller_method_name,
+            caller_prototype=caller_prototype,
+            dex_entry=dex_entry,
+            sink_class_descriptor=sink_class_descriptor,
+            sink_method_name=sink_method_name,
+            sink_prototype=sink_prototype,
+            sink_location=sink_location,
+            construction=construction,
+        )
+    )
+
+
+def _record_dex_secret_signal(
+    collector: _Collector,
+    *,
+    source_id: str,
+    dex_entry: str,
+    ownership_context: _CodeOwnershipContext,
+    signal: _DexSecretSignal,
+) -> None:
+    location = (
+        f"{dex_entry}:code_item:{signal.code_item_offset}:"
+        f"code_unit:{signal.source_code_unit_offset}"
+    )
+    sink_location = (
+        f"{dex_entry}:code_item:{signal.code_item_offset}:"
+        f"code_unit:{signal.code_unit_offset}"
+    )
+    ownership = _code_ownership(signal.caller_class_descriptor, ownership_context)
+    key_name = redact_text(signal.key_name)[:100] if signal.key_name else None
+    rejection = _contextual_secret_rejection_reason(signal.value)
+    if rejection is None and ownership == "unknown":
+        rejection = (
+            "application_namespace_unavailable"
+            if ownership_context.application_id is None
+            else "caller_ownership_unresolved"
+        )
+    elif rejection is None and ownership != "app_code":
+        rejection = "caller_outside_application_namespace"
+    if rejection is not None:
+        _record_secret_rejection(
+            collector,
+            source_id=source_id,
+            location=location,
+            key_name=key_name,
+            value=signal.value,
+            secret_type=signal.secret_type,
+            usage_context=signal.usage_context,
+            code_ownership=ownership,
+            reason=rejection,
+            caller_class_descriptor=signal.caller_class_descriptor,
+            caller_method_name=signal.caller_method_name,
+            caller_prototype=signal.caller_prototype,
+            dex_entry=dex_entry,
+            sink_class_descriptor=signal.sink_class_descriptor,
+            sink_method_name=signal.sink_method_name,
+            sink_prototype=signal.sink_prototype,
+            sink_location=sink_location,
+            construction=signal.construction,
+        )
+        return
+    _record_secret(
+        collector,
+        kind="callsite_contextual_secret",
+        confidence="medium",
+        source_id=source_id,
+        location=location,
+        key_name=key_name,
+        value=signal.value,
+        secret_type=signal.secret_type,
+        usage_context=signal.usage_context,
+        code_ownership=ownership,
+        caller_class_descriptor=signal.caller_class_descriptor,
+        caller_method_name=signal.caller_method_name,
+        caller_prototype=signal.caller_prototype,
+        dex_entry=dex_entry,
+        sink_class_descriptor=signal.sink_class_descriptor,
+        sink_method_name=signal.sink_method_name,
+        sink_prototype=signal.sink_prototype,
+        sink_location=sink_location,
+        construction=signal.construction,
+        retention_reason="bounded_same_method_sink_correlation",
     )
 
 
@@ -2579,6 +3561,7 @@ def _scan_text_window(
             location=location,
             key_name=None,
             value=match.group(0),
+            retention_reason="private_key_header_in_packaged_content",
         )
     for pattern_name, pattern, confidence in _KNOWN_SECRET_PATTERNS:
         for match in pattern.finditer(bounded):
@@ -2597,6 +3580,7 @@ def _scan_text_window(
                 location=location,
                 key_name=None,
                 value=secret,
+                retention_reason="signature_pattern_in_packaged_content",
             )
     for match in _ASSIGNED_SECRET_PATTERN.finditer(bounded):
         if not _accepted_scan_match(
@@ -2616,6 +3600,7 @@ def _scan_text_window(
             location=location,
             key_name=redact_text(key)[:100],
             value=match.group("value"),
+            retention_reason="sensitive_assignment_in_packaged_content",
         )
     for match in _URL_PATTERN.finditer(bounded):
         if not _accepted_scan_match(
@@ -2638,6 +3623,8 @@ def _scan_text_window(
                 location=location,
                 key_name="url_password",
                 value=password,
+                usage_context="network_endpoint_basic_auth",
+                retention_reason="basic_auth_password_in_network_endpoint",
             )
         _record_endpoint(
             collector,
@@ -2963,20 +3950,23 @@ def _record_embedded(
 
 def _is_text_entry(name: str) -> bool:
     path = PurePosixPath(name)
-    return path.suffix.casefold() in _TEXT_SUFFIXES and (
-        name.startswith("assets/") or name.startswith("res/raw/")
-    )
+    if not (name.startswith("assets/") or name.startswith("res/raw/")):
+        return False
+    return path.suffix.casefold() in _TEXT_SUFFIXES or not path.suffix
 
 
-def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
+def _scan_archive(
+    item: StaticApkInput,
+    collector: _Collector,
+) -> _PendingArchiveScan | None:
     try:
         apk_size = item.path.stat().st_size
     except OSError:
         collector.problem(item.source_id, "invalid_apk_archive")
-        return
+        return None
     if apk_size < 1 or apk_size > collector.policy.max_apk_file_bytes:
         collector.limit("apk_file_bytes")
-        return
+        return None
     try:
         entry_count, central_size = _preflight_zip_archive(item.path, collector.policy)
     except _ArchivePreflightError as exc:
@@ -2988,7 +3978,7 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
                 collector.metrics["central_directory_bytes"] += exc.observed
         else:
             collector.problem(item.source_id, exc.category)
-        return
+        return None
     collector.metrics["archive_entries_seen"] += entry_count
     collector.metrics["central_directory_bytes"] += central_size
     try:
@@ -3003,8 +3993,10 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
             )
             if len(infos) != entry_count:
                 collector.problem(item.source_id, "central_directory_count_mismatch")
-                return
+                return None
             seen_names: set[str] = set()
+            pending_dex: list[_PendingDexScan] = []
+            pending_text: list[_PendingTextScan] = []
             for info in infos:
                 if info.filename in seen_names:
                     collector.problem(item.source_id, "duplicate_archive_entry")
@@ -3053,24 +4045,6 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
                         collector.metrics[metric_name] += metric_value
                     for limitation in inventory.behavior_limitations:
                         collector.limit(limitation)
-                    for index, value in enumerate(inventory.strings):
-                        if value is not None:
-                            _scan_text(
-                                collector,
-                                source_id=item.source_id,
-                                location=f"{info.filename}:string:{index}",
-                                value=value,
-                                file_key=info.filename,
-                            )
-                    for index, data_start in inventory.oversized_string_regions:
-                        _scan_dex_oversized_region(
-                            collector,
-                            source_id=item.source_id,
-                            dex_entry=info.filename,
-                            string_index=index,
-                            data=data,
-                            data_start=data_start,
-                        )
                     for reference in inventory.method_references:
                         _record_method_reference(
                             collector,
@@ -3085,6 +4059,13 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
                             dex_entry=info.filename,
                             signal=signal,
                         )
+                    pending_dex.append(
+                        _PendingDexScan(
+                            dex_entry=info.filename,
+                            data=data,
+                            inventory=inventory,
+                        )
+                    )
                 elif _is_text_entry(info.filename):
                     data = _read_zip_entry(
                         archive,
@@ -3096,24 +4077,28 @@ def _scan_archive(item: StaticApkInput, collector: _Collector) -> None:
                         collector.problem(item.source_id, "text_entry_read_failed")
                         continue
                     if data and data.count(b"\x00") * 100 > len(data):
+                        if not PurePosixPath(info.filename).suffix:
+                            collector.metrics["binary_raw_entries_skipped"] += 1
+                            collector.metrics["binary_untyped_entries_skipped"] += 1
+                            continue
                         collector.problem(item.source_id, "text_entry_binary_content")
                         continue
                     collector.metrics["text_entries_scanned"] += 1
                     text = data.decode("utf-8", errors="replace")
                     if "\ufffd" in text:
                         collector.problem(item.source_id, "text_entry_decode_replacement")
-                    for index, line in enumerate(text.splitlines() or [text]):
-                        _scan_text(
-                            collector,
-                            source_id=item.source_id,
-                            location=f"{info.filename}:line:{index + 1}",
-                            value=line,
-                            file_key=info.filename,
-                        )
+                    pending_text.append(
+                        _PendingTextScan(entry=info.filename, text=text)
+                    )
     except (BadZipFile, LargeZipFile, OSError, ValueError):
         collector.problem(item.source_id, "invalid_apk_archive")
-        return
+        return None
     collector.metrics["apks_scanned"] += 1
+    return _PendingArchiveScan(
+        item=item,
+        dex_entries=tuple(pending_dex),
+        text_entries=tuple(pending_text),
+    )
 
 
 def analyze_apks(
@@ -3146,8 +4131,61 @@ def analyze_apks(
     if len(ordered) > limits.max_apks:
         collector.limit("apks")
         ordered = ordered[: limits.max_apks]
+
+    pending_scans = tuple(
+        scan
+        for item in ordered
+        if (scan := _scan_archive(item, collector)) is not None
+    )
+    ownership_contexts = _ownership_contexts(pending_scans)
+
+    # Establish call-site evidence across every base/split APK before lower-
+    # confidence DEX, resource, and asset inventory consumes the shared quota.
+    for scan in pending_scans:
+        ownership_context = ownership_contexts[scan.item.source_id]
+        for dex in scan.dex_entries:
+            for signal in dex.inventory.secret_signals:
+                _record_dex_secret_signal(
+                    collector,
+                    source_id=scan.item.source_id,
+                    dex_entry=dex.dex_entry,
+                    ownership_context=ownership_context,
+                    signal=signal,
+                )
+
+    for scan in pending_scans:
+        for dex in scan.dex_entries:
+            for index, value in enumerate(dex.inventory.strings):
+                if value is not None:
+                    _scan_text(
+                        collector,
+                        source_id=scan.item.source_id,
+                        location=f"{dex.dex_entry}:string:{index}",
+                        value=value,
+                        file_key=dex.dex_entry,
+                    )
+            for index, data_start in dex.inventory.oversized_string_regions:
+                _scan_dex_oversized_region(
+                    collector,
+                    source_id=scan.item.source_id,
+                    dex_entry=dex.dex_entry,
+                    string_index=index,
+                    data=dex.data,
+                    data_start=data_start,
+                )
+        for text_entry in scan.text_entries:
+            for index, line in enumerate(
+                text_entry.text.splitlines() or [text_entry.text]
+            ):
+                _scan_text(
+                    collector,
+                    source_id=scan.item.source_id,
+                    location=f"{text_entry.entry}:line:{index + 1}",
+                    value=line,
+                    file_key=text_entry.entry,
+                )
+
     for item in ordered:
-        _scan_archive(item, collector)
         for index, value in enumerate(item.resource_strings[: limits.max_resource_strings]):
             collector.metrics["resource_strings_scanned"] += 1
             _scan_text(
@@ -3198,8 +4236,158 @@ def analyze_apks(
                     if item.key_name is not None
                     else None
                 ),
+                caller_class_descriptor=(
+                    _safe_metadata_text(
+                        item.caller_class_descriptor,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.caller_class_descriptor is not None
+                    else None
+                ),
+                caller_method_name=(
+                    _safe_metadata_text(
+                        item.caller_method_name,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.caller_method_name is not None
+                    else None
+                ),
+                caller_prototype=(
+                    _safe_metadata_text(
+                        item.caller_prototype,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.caller_prototype is not None
+                    else None
+                ),
+                dex_entry=(
+                    _safe_metadata_text(
+                        item.dex_entry,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.dex_entry is not None
+                    else None
+                ),
+                sink_class_descriptor=(
+                    _safe_metadata_text(
+                        item.sink_class_descriptor,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.sink_class_descriptor is not None
+                    else None
+                ),
+                sink_method_name=(
+                    _safe_metadata_text(
+                        item.sink_method_name,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.sink_method_name is not None
+                    else None
+                ),
+                sink_prototype=(
+                    _safe_metadata_text(
+                        item.sink_prototype,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.sink_prototype is not None
+                    else None
+                ),
+                sink_location=(
+                    _safe_metadata_text(
+                        item.sink_location,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.sink_location is not None
+                    else None
+                ),
             )
             for item in collector.secrets
+        ),
+        secret_candidate_rejections=tuple(
+            replace(
+                item,
+                source_id=_safe_source_id(
+                    item.source_id,
+                    sensitive_values=sensitive_values,
+                ),
+                location=_safe_metadata_text(
+                    item.location,
+                    sensitive_values=sensitive_values,
+                ),
+                key_name=(
+                    _safe_metadata_text(
+                        item.key_name,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.key_name is not None
+                    else None
+                ),
+                caller_class_descriptor=(
+                    _safe_metadata_text(
+                        item.caller_class_descriptor,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.caller_class_descriptor is not None
+                    else None
+                ),
+                caller_method_name=(
+                    _safe_metadata_text(
+                        item.caller_method_name,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.caller_method_name is not None
+                    else None
+                ),
+                caller_prototype=(
+                    _safe_metadata_text(
+                        item.caller_prototype,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.caller_prototype is not None
+                    else None
+                ),
+                dex_entry=(
+                    _safe_metadata_text(
+                        item.dex_entry,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.dex_entry is not None
+                    else None
+                ),
+                sink_class_descriptor=(
+                    _safe_metadata_text(
+                        item.sink_class_descriptor,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.sink_class_descriptor is not None
+                    else None
+                ),
+                sink_method_name=(
+                    _safe_metadata_text(
+                        item.sink_method_name,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.sink_method_name is not None
+                    else None
+                ),
+                sink_prototype=(
+                    _safe_metadata_text(
+                        item.sink_prototype,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.sink_prototype is not None
+                    else None
+                ),
+                sink_location=(
+                    _safe_metadata_text(
+                        item.sink_location,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.sink_location is not None
+                    else None
+                ),
+            )
+            for item in collector.secret_rejections
         ),
         endpoints=tuple(
             replace(
