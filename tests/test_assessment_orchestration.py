@@ -1066,7 +1066,16 @@ def test_rule_results_include_reasoning_contract(tmp_path: Path) -> None:
                     "sink_prototype": "(Ljava/lang/String;Ljava/lang/String;)V",
                     "sink_location": "classes.dex:code_item:64:code_unit:12",
                     "construction": "direct_literal",
-                    "retention_reason": "bounded_same_method_sink_correlation",
+                    "retention_reason": "bounded_field_and_helper_sink_correlation",
+                    "source_field_descriptor": (
+                        "Lcom/example/app/LoginFlow;->apiKey [Ljava/lang/String;]"
+                    ),
+                    "correlation_path": [
+                        "field_initializer",
+                        "field_read",
+                        "exact_helper_depth:1",
+                        "sensitive_sink",
+                    ],
                 }
             ],
             FindingStatus.POTENTIAL,
@@ -1122,6 +1131,10 @@ def test_static_secret_inventory_is_consumed_without_confirming_presence_only(
         assert reported["caller_method_name"] == "send"
         assert reported["sink_method_name"] == "<init>"
         assert reported["code_ownership"] == "app_code"
+        assert reported["source_field_descriptor"] == (
+            "Lcom/example/app/LoginFlow;->apiKey [Ljava/lang/String;]"
+        )
+        assert reported["correlation_path"][-1] == "sensitive_sink"
         assert finding.details["contextual_app_owned_candidate_count"] == 1
 
 

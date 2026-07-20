@@ -1068,7 +1068,7 @@ class RuleEngine:
                 status = FindingStatus.POTENTIAL
                 reason = (
                     "An app-owned literal reached an allow-listed sensitive sink in "
-                    "bounded same-method DEX analysis; runtime use and credential "
+                    "bounded DEX correlation; runtime use and credential "
                     "validity were not assumed."
                 )
                 missing = [
@@ -1087,7 +1087,7 @@ class RuleEngine:
                     "sensitive sink."
                 )
                 missing = [
-                    "application-owned same-method sensitive-sink correlation",
+                    "application-owned sensitive-sink correlation",
                     "runtime use or reachable trust boundary",
                 ]
             elif inventory_status == "completed":

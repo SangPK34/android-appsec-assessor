@@ -248,6 +248,9 @@ class StaticApkPolicy:
     max_dex_secret_signals: int = 1_000
     min_pbe_iterations: int = 10_000
     max_static_behavior_candidates: int = 500
+    max_dex_fields: int = 200_000
+    max_dex_field_writes: int = 10_000
+    max_secret_interprocedural_depth: int = 3
 
     def __post_init__(self) -> None:
         numeric_values = asdict(self)
@@ -366,6 +369,13 @@ class DexMethodReference:
 
 
 @dataclass(frozen=True, slots=True)
+class DexFieldReference:
+    class_descriptor: str
+    field_name: str
+    type_descriptor: str
+
+
+@dataclass(frozen=True, slots=True)
 class DexInventory:
     strings: tuple[str | None, ...]
     method_references: tuple[DexMethodReference, ...]
@@ -390,7 +400,7 @@ class _DexBehaviorSignal:
 
 @dataclass(frozen=True, slots=True)
 class _DexSecretSignal:
-    """In-memory same-method secret-to-sink correlation, never serialized raw."""
+    """In-memory bounded secret-to-sink correlation, never serialized raw."""
 
     caller_class_descriptor: str
     caller_method_name: str
@@ -406,6 +416,10 @@ class _DexSecretSignal:
     usage_context: str
     construction: str
     value: str
+    source_field_descriptor: str | None = None
+    correlation_path: tuple[str, ...] = ()
+    sink_code_item_offset: int | None = None
+    sink_code_unit_offset: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +488,8 @@ class SecretCandidate:
     sink_location: str | None = None
     construction: str = "direct_literal"
     retention_reason: str = "contextual_secret_material"
+    source_field_descriptor: str | None = None
+    correlation_path: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -501,6 +517,8 @@ class SecretCandidateRejection:
     sink_prototype: str | None = None
     sink_location: str | None = None
     construction: str = "direct_literal"
+    source_field_descriptor: str | None = None
+    correlation_path: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -631,6 +649,8 @@ class _Collector:
             "dex_behavior_methods_scanned": 0,
             "dex_behavior_code_units_scanned": 0,
             "dex_behavior_invocations_scanned": 0,
+            "dex_secret_field_writes_seen": 0,
+            "dex_secret_field_signals": 0,
             "static_behavior_candidates": 0,
             "resource_strings_scanned": 0,
             "text_entries_scanned": 0,
@@ -1191,11 +1211,43 @@ class _DexConstant:
 class _DexInvocation:
     reference: DexMethodReference
     arguments: tuple[_DexConstant | None, ...]
+    argument_fields: tuple[DexFieldReference | None, ...]
+    argument_parameters: tuple[int | None, ...]
     argument_generations: tuple[int, ...]
     argument_registers: tuple[int, ...]
     invoke_kind: str
     code_item_offset: int
     code_unit_offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DexFieldWrite:
+    caller: DexMethodReference
+    reference: DexFieldReference
+    constant: _DexConstant
+    code_item_offset: int
+    code_unit_offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DexMethodTrace:
+    caller: DexMethodReference
+    invocations: tuple[_DexInvocation, ...]
+    field_writes: tuple[_DexFieldWrite, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DexSecretParameterRequirement:
+    parameter_index: int
+    sink_class_descriptor: str
+    sink_method_name: str
+    sink_prototype: str
+    key_name: str | None
+    secret_type: str
+    usage_context: str
+    sink_code_item_offset: int
+    sink_code_unit_offset: int
+    depth: int = 0
 
 
 def _sign_extend(value: int, bits: int) -> int:
@@ -1312,18 +1364,80 @@ def _invoke_registers(insns: memoryview, offset: int, opcode: int) -> tuple[int,
     return tuple(range(start, start + count))
 
 
+def _prototype_parameter_descriptors(prototype: str) -> tuple[str, ...]:
+    """Return a validated prototype's parameter descriptors without widening scope."""
+
+    if not prototype.startswith("("):
+        return ()
+    end = prototype.find(")")
+    if end < 0:
+        return ()
+    parameters: list[str] = []
+    position = 1
+    while position < end:
+        start = position
+        while position < end and prototype[position] == "[":
+            position += 1
+        if position >= end:
+            return ()
+        if prototype[position] == "L":
+            terminator = prototype.find(";", position + 1, end + 1)
+            if terminator < 0 or terminator >= end:
+                return ()
+            position = terminator + 1
+        elif prototype[position] in "ZBSCIJFD":
+            position += 1
+        else:
+            return ()
+        parameters.append(prototype[start:position])
+    return tuple(parameters)
+
+
+def _formal_parameter_registers(
+    caller: DexMethodReference,
+    *,
+    registers_size: int,
+    ins_size: int,
+) -> dict[int, int]:
+    """Map incoming DEX parameter registers to formal positions conservatively."""
+
+    parameters = _prototype_parameter_descriptors(caller.prototype)
+    if not parameters:
+        return {}
+    parameter_words = sum(2 if item in {"J", "D"} else 1 for item in parameters)
+    if ins_size == parameter_words:
+        receiver_words = 0
+    elif ins_size == parameter_words + 1:
+        receiver_words = 1
+    else:
+        return {}
+    start = registers_size - ins_size + receiver_words
+    if start < 0:
+        return {}
+    registers: dict[int, int] = {}
+    for index, descriptor in enumerate(parameters):
+        width = 2 if descriptor in {"J", "D"} else 1
+        for _word in range(width):
+            registers[start] = index
+            start += 1
+    return registers
+
+
 def _scan_dex_invocations(
     data: bytes,
     *,
     code_offset: int,
+    caller: DexMethodReference,
     method_table: Sequence[DexMethodReference | None],
+    field_table: Sequence[DexFieldReference | None],
     strings: Sequence[str | None],
     invocation_budget: int,
+    field_write_budget: int,
     max_constructed_bytes: int,
-) -> tuple[tuple[_DexInvocation, ...], int, bool, bool, bool]:
+) -> tuple[tuple[_DexInvocation, ...], tuple[_DexFieldWrite, ...], int, bool, bool, bool, bool]:
     if code_offset < _DEX_HEADER_SIZE or code_offset % 4 or code_offset + 16 > len(data):
         raise DexFormatError("DEX code item is outside the file bounds.")
-    registers_size, _ins_size, _outs_size, tries_size = struct.unpack_from(
+    registers_size, ins_size, _outs_size, tries_size = struct.unpack_from(
         "<4H", data, code_offset
     )
     insns_size = _uint32(data, code_offset + 12)
@@ -1338,11 +1452,19 @@ def _scan_dex_invocations(
     insns = memoryview(data)[insns_offset:insns_end].cast("H")
     constants: dict[int, _DexConstant] = {}
     builders: dict[int, _DexConstant] = {}
+    fields: dict[int, DexFieldReference] = {}
+    parameters = _formal_parameter_registers(
+        caller,
+        registers_size=registers_size,
+        ins_size=ins_size,
+    )
     register_generations: dict[int, int] = {}
     next_generation = 1
     flow_epoch = 0
     pending_result: _DexConstant | None = None
     pending_builder: _DexConstant | None = None
+    pending_field: DexFieldReference | None = None
+    pending_parameter: int | None = None
 
     def validate_register(register: int, *, width: int = 1) -> None:
         if register < 0 or register + width > registers_size:
@@ -1361,6 +1483,8 @@ def _scan_dex_invocations(
         for item in range(register, register + width):
             constants.pop(item, None)
             builders.pop(item, None)
+            fields.pop(item, None)
+            parameters.pop(item, None)
             register_generations[item] = next_generation
             next_generation += 1
 
@@ -1375,15 +1499,27 @@ def _scan_dex_invocations(
             builders[destination] = builders[source]
         else:
             builders.pop(destination, None)
+        if source in fields:
+            fields[destination] = fields[source]
+        else:
+            fields.pop(destination, None)
+        if source in parameters:
+            parameters[destination] = parameters[source]
+        else:
+            parameters.pop(destination, None)
         register_generations[destination] = register_generation(source)
 
     def clear_flow_state() -> None:
-        nonlocal flow_epoch, pending_result, pending_builder
+        nonlocal flow_epoch, pending_result, pending_builder, pending_field, pending_parameter
         constants.clear()
         builders.clear()
+        fields.clear()
+        parameters.clear()
         register_generations.clear()
         pending_result = None
         pending_builder = None
+        pending_field = None
+        pending_parameter = None
         flow_epoch += 1
 
     def text_value(value: _DexConstant | None) -> str | None:
@@ -1448,9 +1584,11 @@ def _scan_dex_invocations(
                     constants.pop(register, None)
 
     invocations: list[_DexInvocation] = []
+    field_writes: list[_DexFieldWrite] = []
     offset = 0
     unsupported = False
     limited = False
+    field_write_limited = False
     dataflow_limited = False
     while offset < len(insns):
         first = int(insns[offset])
@@ -1479,6 +1617,8 @@ def _scan_dex_invocations(
         }:
             pending_result = None
             pending_builder = None
+            pending_field = None
+            pending_parameter = None
 
         if opcode == 0x12:
             register = (first >> 8) & 0x0F
@@ -1540,6 +1680,82 @@ def _scan_dex_invocations(
         elif opcode == 0x06:
             validate_register(int(insns[offset + 2]), width=2)
             define_register(int(insns[offset + 1]), width=2)
+        elif opcode == 0x54:  # iget-object
+            destination = (first >> 8) & 0x0F
+            instance = (first >> 12) & 0x0F
+            validate_register(destination)
+            validate_register(instance)
+            field_index = int(insns[offset + 1])
+            if field_index >= len(field_table):
+                raise DexFormatError("DEX instance field access has an invalid field index.")
+            define_register(destination)
+            reference = field_table[field_index]
+            if reference is not None:
+                fields[destination] = reference
+        elif opcode == 0x62:  # sget-object
+            destination = first >> 8
+            validate_register(destination)
+            field_index = int(insns[offset + 1])
+            if field_index >= len(field_table):
+                raise DexFormatError("DEX static field access has an invalid field index.")
+            define_register(destination)
+            reference = field_table[field_index]
+            if reference is not None:
+                fields[destination] = reference
+        elif opcode == 0x5B:  # iput-object
+            source = (first >> 8) & 0x0F
+            instance = (first >> 12) & 0x0F
+            validate_register(source)
+            validate_register(instance)
+            field_index = int(insns[offset + 1])
+            if field_index >= len(field_table):
+                raise DexFormatError("DEX instance field write has an invalid field index.")
+            reference = field_table[field_index]
+            constant = constants.get(source)
+            if (
+                reference is not None
+                and reference.class_descriptor == caller.class_descriptor
+                and caller.method_name in {"<init>", "<clinit>"}
+                and isinstance(_constant_value(constant, strings), str)
+            ):
+                if len(field_writes) >= field_write_budget:
+                    field_write_limited = True
+                else:
+                    field_writes.append(
+                        _DexFieldWrite(
+                            caller=caller,
+                            reference=reference,
+                            constant=constant,
+                            code_item_offset=code_offset,
+                            code_unit_offset=offset,
+                        )
+                    )
+        elif opcode == 0x69:  # sput-object
+            source = first >> 8
+            validate_register(source)
+            field_index = int(insns[offset + 1])
+            if field_index >= len(field_table):
+                raise DexFormatError("DEX static field write has an invalid field index.")
+            reference = field_table[field_index]
+            constant = constants.get(source)
+            if (
+                reference is not None
+                and reference.class_descriptor == caller.class_descriptor
+                and caller.method_name in {"<init>", "<clinit>"}
+                and isinstance(_constant_value(constant, strings), str)
+            ):
+                if len(field_writes) >= field_write_budget:
+                    field_write_limited = True
+                else:
+                    field_writes.append(
+                        _DexFieldWrite(
+                            caller=caller,
+                            reference=reference,
+                            constant=constant,
+                            code_item_offset=code_offset,
+                            code_unit_offset=offset,
+                        )
+                    )
         elif 0x6E <= opcode <= 0x72 or 0x74 <= opcode <= 0x78:
             registers = _invoke_registers(insns, offset, opcode)
             if any(register >= registers_size for register in registers):
@@ -1550,6 +1766,8 @@ def _scan_dex_invocations(
             reference = method_table[method_index]
             pending_result = None
             pending_builder = None
+            pending_field = None
+            pending_parameter = None
             if reference is not None:
                 if len(invocations) >= invocation_budget:
                     limited = True
@@ -1558,6 +1776,10 @@ def _scan_dex_invocations(
                 invocation = _DexInvocation(
                     reference=reference,
                     arguments=arguments,
+                    argument_fields=tuple(fields.get(register) for register in registers),
+                    argument_parameters=tuple(
+                        parameters.get(register) for register in registers
+                    ),
                     argument_generations=tuple(
                         register_generation(register) for register in registers
                     ),
@@ -1634,6 +1856,10 @@ def _scan_dex_invocations(
                 ):
                     modeled = True
                     source = arguments[0]
+                    pending_field = fields.get(registers[0]) if registers else None
+                    pending_parameter = (
+                        parameters.get(registers[0]) if registers else None
+                    )
                     source_value = text_value(source)
                     if source_value is not None:
                         pending_result = bounded_constant(
@@ -1657,8 +1883,14 @@ def _scan_dex_invocations(
                     constants[destination] = pending_result
                 if pending_builder is not None:
                     builders[destination] = pending_builder
+                if pending_field is not None:
+                    fields[destination] = pending_field
+                if pending_parameter is not None:
+                    parameters[destination] = pending_parameter
             pending_result = None
             pending_builder = None
+            pending_field = None
+            pending_parameter = None
         elif opcode == 0x0B:
             define_register(first >> 8, width=2)
         elif 0x0E <= opcode <= 0x11:
@@ -1705,7 +1937,15 @@ def _scan_dex_invocations(
         elif 0xD8 <= opcode <= 0xE2:
             define_register(first >> 8)
         offset += width
-    return tuple(invocations), offset, unsupported, limited, dataflow_limited
+    return (
+        tuple(invocations),
+        tuple(field_writes),
+        offset,
+        unsupported,
+        limited,
+        dataflow_limited,
+        field_write_limited,
+    )
 
 
 def _constant_value(
@@ -2131,10 +2371,6 @@ def _secret_signals_for_method(
             return None
         return value, constant
 
-    def text_at(invocation: _DexInvocation, index: int) -> str | None:
-        found = value_at(invocation, index)
-        return found[0] if found is not None else None
-
     def record_value(
         invocation: _DexInvocation,
         *,
@@ -2234,64 +2470,6 @@ def _secret_signals_for_method(
         prototype = reference.prototype
 
         if (
-            class_name == "Ljavax/crypto/spec/SecretKeySpec;"
-            and method_name == "<init>"
-            and invocation.invoke_kind == "direct"
-            and prototype.startswith("([B")
-        ):
-            record(
-                invocation,
-                value_index=1,
-                key_name="crypto_key_material",
-                secret_type="crypto_key",
-                usage_context="crypto_key_constructor",
-            )
-            continue
-        if (
-            class_name == "Ljavax/crypto/spec/IvParameterSpec;"
-            and method_name == "<init>"
-            and invocation.invoke_kind == "direct"
-            and prototype.startswith("([B")
-        ):
-            record(
-                invocation,
-                value_index=1,
-                key_name="initialization_vector",
-                secret_type="initialization_vector",
-                usage_context="crypto_iv_constructor",
-            )
-            continue
-
-        if (
-            class_name == "Lorg/apache/http/auth/UsernamePasswordCredentials;"
-            and method_name == "<init>"
-            and invocation.invoke_kind == "direct"
-            and prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
-        ):
-            record(
-                invocation,
-                value_index=2,
-                key_name="password",
-                secret_type="password",
-                usage_context="authentication_credentials",
-            )
-            continue
-        if (
-            class_name == "Lokhttp3/Credentials;"
-            and method_name == "basic"
-            and invocation.invoke_kind == "static"
-            and prototype.startswith("(Ljava/lang/String;Ljava/lang/String;")
-        ):
-            record(
-                invocation,
-                value_index=1,
-                key_name="password",
-                secret_type="password",
-                usage_context="authentication_credentials",
-            )
-            continue
-
-        if (
             class_name == "Lorg/apache/http/entity/StringEntity;"
             and method_name == "<init>"
             and invocation.invoke_kind == "direct"
@@ -2307,66 +2485,401 @@ def _secret_signals_for_method(
         ):
             record_named_body_values(invocation, value_index=1)
             continue
+        for sink_input in _secret_sink_inputs(invocation, strings):
+            record(
+                invocation,
+                value_index=sink_input.value_index,
+                key_name=sink_input.key_name,
+                secret_type=sink_input.secret_type,
+                usage_context=sink_input.usage_context,
+            )
 
-        keyed_context: str | None = None
-        if (
-            class_name == "Lorg/apache/http/message/BasicNameValuePair;"
-            and method_name == "<init>"
-            and invocation.invoke_kind == "direct"
-            and prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
-        ):
-            keyed_context = "network_form_parameter"
-        elif (
-            class_name in {"Ljava/net/URLConnection;", "Ljava/net/HttpURLConnection;"}
-            and method_name == "setRequestProperty"
-            and prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
-        ):
-            keyed_context = "network_request_header"
-        elif (
-            class_name == "Lokhttp3/Request$Builder;"
-            and method_name in {"header", "addHeader"}
-            and prototype == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Request$Builder;"
-        ):
-            keyed_context = "network_request_header"
-        elif (
-            class_name == "Lokhttp3/Headers$Builder;"
-            and method_name in {"add", "set"}
-            and prototype == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Headers$Builder;"
-        ):
-            keyed_context = "network_request_header"
-        elif (
-            class_name == "Lokhttp3/FormBody$Builder;"
-            and method_name in {"add", "addEncoded"}
-            and prototype == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/FormBody$Builder;"
-        ):
-            keyed_context = "network_form_parameter"
-        elif (
-            class_name == "Landroid/net/Uri$Builder;"
-            and method_name == "appendQueryParameter"
-            and prototype == "(Ljava/lang/String;Ljava/lang/String;)Landroid/net/Uri$Builder;"
-        ):
-            keyed_context = "network_query_parameter"
-        elif (
-            class_name == "Landroid/content/SharedPreferences$Editor;"
-            and method_name == "putString"
-            and prototype
-            == "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;"
-        ):
-            keyed_context = "sensitive_storage_write"
-        if keyed_context is None:
-            continue
-        key_name = text_at(invocation, 1)
-        if key_name is None or not _is_sensitive_assignment_key(key_name):
-            continue
-        record(
-            invocation,
+    return tuple(signals), limited
+
+
+@dataclass(frozen=True, slots=True)
+class _DexSecretSinkInput:
+    value_index: int
+    key_name: str | None
+    secret_type: str
+    usage_context: str
+
+
+def _invocation_text_argument(
+    invocation: _DexInvocation,
+    index: int,
+    strings: Sequence[str | None],
+) -> str | None:
+    if index >= len(invocation.arguments):
+        return None
+    value = _constant_value(invocation.arguments[index], strings)
+    return value if isinstance(value, str) else None
+
+
+def _secret_sink_inputs(
+    invocation: _DexInvocation,
+    strings: Sequence[str | None],
+) -> tuple[_DexSecretSinkInput, ...]:
+    """Return exact argument positions for sinks suitable for bounded flow tracing."""
+
+    reference = invocation.reference
+    class_name = reference.class_descriptor
+    method_name = reference.method_name
+    prototype = reference.prototype
+    if (
+        class_name == "Ljavax/crypto/spec/SecretKeySpec;"
+        and method_name == "<init>"
+        and invocation.invoke_kind == "direct"
+        and prototype.startswith("([B")
+    ):
+        return (
+            _DexSecretSinkInput(
+                value_index=1,
+                key_name="crypto_key_material",
+                secret_type="crypto_key",
+                usage_context="crypto_key_constructor",
+            ),
+        )
+    if (
+        class_name == "Ljavax/crypto/spec/IvParameterSpec;"
+        and method_name == "<init>"
+        and invocation.invoke_kind == "direct"
+        and prototype.startswith("([B")
+    ):
+        return (
+            _DexSecretSinkInput(
+                value_index=1,
+                key_name="initialization_vector",
+                secret_type="initialization_vector",
+                usage_context="crypto_iv_constructor",
+            ),
+        )
+    if (
+        class_name == "Lorg/apache/http/auth/UsernamePasswordCredentials;"
+        and method_name == "<init>"
+        and invocation.invoke_kind == "direct"
+        and prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
+    ):
+        return (
+            _DexSecretSinkInput(
+                value_index=2,
+                key_name="password",
+                secret_type="password",
+                usage_context="authentication_credentials",
+            ),
+        )
+    if (
+        class_name == "Lokhttp3/Credentials;"
+        and method_name == "basic"
+        and invocation.invoke_kind == "static"
+        and prototype.startswith("(Ljava/lang/String;Ljava/lang/String;")
+    ):
+        return (
+            _DexSecretSinkInput(
+                value_index=1,
+                key_name="password",
+                secret_type="password",
+                usage_context="authentication_credentials",
+            ),
+        )
+
+    keyed_context: str | None = None
+    if (
+        class_name == "Lorg/apache/http/message/BasicNameValuePair;"
+        and method_name == "<init>"
+        and invocation.invoke_kind == "direct"
+        and prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
+    ):
+        keyed_context = "network_form_parameter"
+    elif (
+        class_name in {"Ljava/net/URLConnection;", "Ljava/net/HttpURLConnection;"}
+        and method_name == "setRequestProperty"
+        and prototype == "(Ljava/lang/String;Ljava/lang/String;)V"
+    ):
+        keyed_context = "network_request_header"
+    elif (
+        class_name == "Lokhttp3/Request$Builder;"
+        and method_name in {"header", "addHeader"}
+        and prototype == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Request$Builder;"
+    ):
+        keyed_context = "network_request_header"
+    elif (
+        class_name == "Lokhttp3/Headers$Builder;"
+        and method_name in {"add", "set"}
+        and prototype == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Headers$Builder;"
+    ):
+        keyed_context = "network_request_header"
+    elif (
+        class_name == "Lokhttp3/FormBody$Builder;"
+        and method_name in {"add", "addEncoded"}
+        and prototype == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/FormBody$Builder;"
+    ):
+        keyed_context = "network_form_parameter"
+    elif (
+        class_name == "Landroid/net/Uri$Builder;"
+        and method_name == "appendQueryParameter"
+        and prototype == "(Ljava/lang/String;Ljava/lang/String;)Landroid/net/Uri$Builder;"
+    ):
+        keyed_context = "network_query_parameter"
+    elif (
+        class_name == "Landroid/content/SharedPreferences$Editor;"
+        and method_name == "putString"
+        and prototype
+        == "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;"
+    ):
+        keyed_context = "sensitive_storage_write"
+    if keyed_context is None:
+        return ()
+    key_name = _invocation_text_argument(invocation, 1, strings)
+    if key_name is None or not _is_sensitive_assignment_key(key_name):
+        return ()
+    return (
+        _DexSecretSinkInput(
             value_index=2,
             key_name=key_name,
             secret_type="credential",
             usage_context=keyed_context,
+        ),
+    )
+
+
+def _method_identity(reference: DexMethodReference) -> tuple[str, str, str]:
+    return (
+        reference.class_descriptor,
+        reference.method_name,
+        reference.prototype,
+    )
+
+
+def _field_descriptor(reference: DexFieldReference) -> str:
+    # Brackets avoid looking like a ``key: value`` assignment to the report
+    # redactor while retaining only non-secret structural metadata.
+    return f"{reference.class_descriptor}->{reference.field_name} [{reference.type_descriptor}]"
+
+
+def _field_secret_signals(
+    traces: Sequence[_DexMethodTrace],
+    strings: Sequence[str | None],
+    *,
+    signal_budget: int,
+    max_interprocedural_depth: int,
+) -> tuple[tuple[_DexSecretSignal, ...], bool, bool]:
+    """Trace constructor/static-field literals through exact direct helpers only.
+
+    The model intentionally covers only field initializers, exact ``direct`` or
+    ``static`` calls, and bounded parameter propagation. It makes no object
+    alias, virtual-dispatch, reflection, array, or branch-merge claim.
+    """
+
+    field_sources: dict[DexFieldReference, list[_DexFieldWrite]] = {}
+    for trace in traces:
+        for write in trace.field_writes:
+            value = _constant_value(write.constant, strings)
+            if isinstance(value, str) and value:
+                field_sources.setdefault(write.reference, []).append(write)
+    if not field_sources:
+        return (), False, False
+
+    requirements: dict[
+        tuple[str, str, str], list[_DexSecretParameterRequirement]
+    ] = {}
+    requirement_keys: set[tuple[object, ...]] = set()
+
+    def add_requirement(
+        method: DexMethodReference,
+        requirement: _DexSecretParameterRequirement,
+    ) -> bool:
+        key = (
+            *_method_identity(method),
+            requirement.parameter_index,
+            requirement.sink_class_descriptor,
+            requirement.sink_method_name,
+            requirement.sink_prototype,
+            requirement.key_name,
+            requirement.secret_type,
+            requirement.usage_context,
+            requirement.sink_code_item_offset,
+            requirement.sink_code_unit_offset,
+        )
+        if key in requirement_keys:
+            return False
+        requirement_keys.add(key)
+        requirements.setdefault(_method_identity(method), []).append(requirement)
+        return True
+
+    for trace in traces:
+        for invocation in trace.invocations:
+            for sink_input in _secret_sink_inputs(invocation, strings):
+                if sink_input.value_index >= len(invocation.argument_parameters):
+                    continue
+                parameter_index = invocation.argument_parameters[sink_input.value_index]
+                if parameter_index is None:
+                    continue
+                add_requirement(
+                    trace.caller,
+                    _DexSecretParameterRequirement(
+                        parameter_index=parameter_index,
+                        sink_class_descriptor=invocation.reference.class_descriptor,
+                        sink_method_name=invocation.reference.method_name,
+                        sink_prototype=invocation.reference.prototype,
+                        key_name=sink_input.key_name,
+                        secret_type=sink_input.secret_type,
+                        usage_context=sink_input.usage_context,
+                        sink_code_item_offset=invocation.code_item_offset,
+                        sink_code_unit_offset=invocation.code_unit_offset,
+                    ),
+                )
+
+    depth_limited = False
+    for _depth in range(max_interprocedural_depth):
+        additions = False
+        for trace in traces:
+            for invocation in trace.invocations:
+                if invocation.invoke_kind not in {"direct", "static"}:
+                    continue
+                for requirement in tuple(
+                    requirements.get(_method_identity(invocation.reference), ())
+                ):
+                    if requirement.parameter_index >= len(invocation.argument_parameters):
+                        continue
+                    parameter_index = invocation.argument_parameters[
+                        requirement.parameter_index
+                    ]
+                    if parameter_index is None:
+                        continue
+                    if requirement.depth + 1 >= max_interprocedural_depth:
+                        depth_limited = True
+                        continue
+                    additions = add_requirement(
+                        trace.caller,
+                        replace(
+                            requirement,
+                            parameter_index=parameter_index,
+                            depth=requirement.depth + 1,
+                        ),
+                    ) or additions
+        if not additions:
+            break
+
+    signals: list[_DexSecretSignal] = []
+    signal_keys: set[tuple[object, ...]] = set()
+    limited = False
+
+    def record(
+        *,
+        source: _DexFieldWrite,
+        invocation: _DexInvocation,
+        sink_class_descriptor: str,
+        sink_method_name: str,
+        sink_prototype: str,
+        key_name: str | None,
+        secret_type: str,
+        usage_context: str,
+        sink_code_item_offset: int,
+        sink_code_unit_offset: int,
+        helper_depth: int,
+    ) -> None:
+        nonlocal limited
+        value = _constant_value(source.constant, strings)
+        if not isinstance(value, str) or not value:
+            return
+        identity = (
+            _field_descriptor(source.reference),
+            source.code_item_offset,
+            source.code_unit_offset,
+            sink_code_item_offset,
+            sink_code_unit_offset,
+            usage_context,
+            _hash_value(value),
+        )
+        if identity in signal_keys:
+            return
+        if len(signals) >= signal_budget:
+            limited = True
+            return
+        signal_keys.add(identity)
+        signals.append(
+            _DexSecretSignal(
+                caller_class_descriptor=source.caller.class_descriptor,
+                caller_method_name=source.caller.method_name,
+                caller_prototype=source.caller.prototype,
+                code_item_offset=source.code_item_offset,
+                source_code_unit_offset=source.code_unit_offset,
+                code_unit_offset=invocation.code_unit_offset,
+                sink_class_descriptor=sink_class_descriptor,
+                sink_method_name=sink_method_name,
+                sink_prototype=sink_prototype,
+                key_name=key_name,
+                secret_type=_secret_type_for_key_name(
+                    key_name,
+                    fallback=secret_type,
+                ),
+                usage_context=usage_context,
+                construction=source.constant.construction,
+                value=value,
+                source_field_descriptor=_field_descriptor(source.reference),
+                correlation_path=(
+                    "field_initializer",
+                    "field_read",
+                    (
+                        "exact_sensitive_sink"
+                        if helper_depth == 0
+                        else f"exact_helper_depth:{helper_depth}"
+                    ),
+                    "sensitive_sink",
+                ),
+                sink_code_item_offset=sink_code_item_offset,
+                sink_code_unit_offset=sink_code_unit_offset,
+            )
         )
 
-    return tuple(signals), limited
+    for trace in traces:
+        for invocation in trace.invocations:
+            for sink_input in _secret_sink_inputs(invocation, strings):
+                if sink_input.value_index >= len(invocation.argument_fields):
+                    continue
+                reference = invocation.argument_fields[sink_input.value_index]
+                if reference is None:
+                    continue
+                for source in field_sources.get(reference, ()):
+                    record(
+                        source=source,
+                        invocation=invocation,
+                        sink_class_descriptor=invocation.reference.class_descriptor,
+                        sink_method_name=invocation.reference.method_name,
+                        sink_prototype=invocation.reference.prototype,
+                        key_name=sink_input.key_name,
+                        secret_type=sink_input.secret_type,
+                        usage_context=sink_input.usage_context,
+                        sink_code_item_offset=invocation.code_item_offset,
+                        sink_code_unit_offset=invocation.code_unit_offset,
+                        helper_depth=0,
+                    )
+
+            if invocation.invoke_kind not in {"direct", "static"}:
+                continue
+            for requirement in requirements.get(_method_identity(invocation.reference), ()):
+                if requirement.parameter_index >= len(invocation.argument_fields):
+                    continue
+                reference = invocation.argument_fields[requirement.parameter_index]
+                if reference is None:
+                    continue
+                for source in field_sources.get(reference, ()):
+                    record(
+                        source=source,
+                        invocation=invocation,
+                        sink_class_descriptor=requirement.sink_class_descriptor,
+                        sink_method_name=requirement.sink_method_name,
+                        sink_prototype=requirement.sink_prototype,
+                        key_name=requirement.key_name,
+                        secret_type=requirement.secret_type,
+                        usage_context=requirement.usage_context,
+                        sink_code_item_offset=requirement.sink_code_item_offset,
+                        sink_code_unit_offset=requirement.sink_code_unit_offset,
+                        helper_depth=requirement.depth + 1,
+                    )
+
+    return tuple(signals), limited, depth_limited
 
 
 def _parse_dex_behavior(
@@ -2376,6 +2889,7 @@ def _parse_dex_behavior(
     strings: Sequence[str | None],
     types: Sequence[str | None],
     method_table: Sequence[DexMethodReference | None],
+    field_table: Sequence[DexFieldReference | None],
 ) -> tuple[
     tuple[str, ...],
     tuple[_DexBehaviorSignal, ...],
@@ -2397,6 +2911,8 @@ def _parse_dex_behavior(
         "dex_behavior_methods_scanned": 0,
         "dex_behavior_code_units_scanned": 0,
         "dex_behavior_invocations_scanned": 0,
+        "dex_secret_field_writes_seen": 0,
+        "dex_secret_field_signals": 0,
     }
     limitations: list[str] = []
 
@@ -2414,6 +2930,7 @@ def _parse_dex_behavior(
     signal_keys: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
     secret_signals: list[_DexSecretSignal] = []
     secret_signal_keys: set[tuple[str, str, str, int, int, str, str]] = set()
+    method_traces: list[_DexMethodTrace] = []
 
     for class_position in range(class_scan_count):
         class_base = class_offset + class_position * 32
@@ -2491,31 +3008,53 @@ def _parse_dex_behavior(
                 if remaining_invocations <= 0:
                     limit("dex_invocations")
                     continue
+                remaining_field_writes = (
+                    limits.max_dex_field_writes
+                    - metrics["dex_secret_field_writes_seen"]
+                )
+                if remaining_field_writes <= 0:
+                    limit("dex_field_writes")
+                    remaining_field_writes = 0
                 (
                     invocations,
+                    field_writes,
                     code_units,
                     unsupported,
                     invocation_limited,
                     dataflow_limited,
+                    field_write_limited,
                 ) = (
                     _scan_dex_invocations(
                         data,
                         code_offset=code_offset,
+                        caller=caller,
                         method_table=method_table,
+                        field_table=field_table,
                         strings=strings,
                         invocation_budget=remaining_invocations,
+                        field_write_budget=remaining_field_writes,
                         max_constructed_bytes=limits.max_string_bytes,
                     )
                 )
                 metrics["dex_behavior_methods_scanned"] += 1
                 metrics["dex_behavior_code_units_scanned"] += code_units
                 metrics["dex_behavior_invocations_scanned"] += len(invocations)
+                metrics["dex_secret_field_writes_seen"] += len(field_writes)
                 if unsupported:
                     limit("dex_behavior_unsupported_opcode")
                 if invocation_limited:
                     limit("dex_invocations")
                 if dataflow_limited:
                     limit("dex_secret_dataflow_bytes")
+                if field_write_limited:
+                    limit("dex_field_writes")
+                method_traces.append(
+                    _DexMethodTrace(
+                        caller=caller,
+                        invocations=invocations,
+                        field_writes=field_writes,
+                    )
+                )
                 for signal in _behavior_signals_for_method(
                     caller,
                     invocations,
@@ -2566,6 +3105,40 @@ def _parse_dex_behavior(
                     secret_signal_keys.add(secret_key)
                     secret_signals.append(secret_signal)
 
+    remaining_secret_signals = limits.max_dex_secret_signals - len(secret_signals)
+    if remaining_secret_signals <= 0 and method_traces:
+        limit("dex_secret_signals")
+    elif method_traces:
+        (
+            field_signals,
+            field_signal_limited,
+            interprocedural_depth_limited,
+        ) = _field_secret_signals(
+            method_traces,
+            strings,
+            signal_budget=remaining_secret_signals,
+            max_interprocedural_depth=limits.max_secret_interprocedural_depth,
+        )
+        metrics["dex_secret_field_signals"] = len(field_signals)
+        if field_signal_limited:
+            limit("dex_secret_signals")
+        if interprocedural_depth_limited:
+            limit("dex_secret_interprocedural_depth")
+        for secret_signal in field_signals:
+            secret_key = (
+                secret_signal.caller_class_descriptor,
+                secret_signal.caller_method_name,
+                secret_signal.caller_prototype,
+                secret_signal.source_code_unit_offset,
+                secret_signal.code_unit_offset,
+                secret_signal.usage_context,
+                _hash_value(secret_signal.value),
+            )
+            if secret_key in secret_signal_keys:
+                continue
+            secret_signal_keys.add(secret_key)
+            secret_signals.append(secret_signal)
+
     return (
         tuple(defined_class_descriptors),
         tuple(signals),
@@ -2600,6 +3173,7 @@ def parse_dex_inventory(
     string_count, string_offset = _uint32(data, 0x38), _uint32(data, 0x3C)
     type_count, type_offset = _uint32(data, 0x40), _uint32(data, 0x44)
     proto_count, proto_offset = _uint32(data, 0x48), _uint32(data, 0x4C)
+    field_count, field_offset = _uint32(data, 0x50), _uint32(data, 0x54)
     method_count, method_offset = _uint32(data, 0x58), _uint32(data, 0x5C)
     _validate_table(
         data,
@@ -2624,6 +3198,14 @@ def parse_dex_inventory(
         offset=proto_offset,
         item_size=12,
         maximum=limits.max_method_references,
+    )
+    _validate_table(
+        data,
+        name="field-id",
+        size=field_count,
+        offset=field_offset,
+        item_size=8,
+        maximum=limits.max_dex_fields,
     )
     _validate_table(
         data,
@@ -2669,6 +3251,40 @@ def parse_dex_inventory(
         if descriptor is not None and not _is_type_descriptor(descriptor):
             raise DexFormatError("DEX type-id descriptor is malformed.")
         types.append(descriptor)
+
+    field_table: list[DexFieldReference | None] = []
+    for index in range(field_count):
+        base = field_offset + index * 8
+        class_index, type_index, name_index = struct.unpack_from("<HHI", data, base)
+        if (
+            class_index >= type_count
+            or type_index >= type_count
+            or name_index >= string_count
+        ):
+            raise DexFormatError("DEX field-id references an invalid table index.")
+        class_descriptor = types[class_index]
+        type_descriptor = types[type_index]
+        field_name = strings[name_index]
+        if (
+            class_descriptor is None
+            or type_descriptor is None
+            or field_name is None
+        ):
+            field_table.append(None)
+            continue
+        if not _is_class_descriptor(class_descriptor):
+            raise DexFormatError("DEX field class descriptor is malformed.")
+        if not _is_type_descriptor(type_descriptor, allow_void=False):
+            raise DexFormatError("DEX field type descriptor is malformed.")
+        if not field_name or len(field_name) > 200:
+            raise DexFormatError("DEX field name is malformed.")
+        field_table.append(
+            DexFieldReference(
+                class_descriptor=class_descriptor,
+                field_name=field_name,
+                type_descriptor=type_descriptor,
+            )
+        )
 
     prototypes: list[str | None] = []
     parameter_cache: dict[int, tuple[tuple[str, ...], bool]] = {0: ((), False)}
@@ -2779,6 +3395,7 @@ def parse_dex_inventory(
         strings=strings,
         types=types,
         method_table=method_table,
+        field_table=field_table,
     )
     return DexInventory(
         strings=tuple(strings),
@@ -2936,9 +3553,9 @@ def _read_zip_entry(
     return value
 
 
-def _is_placeholder(value: str) -> bool:
+def _is_placeholder(value: str, *, allow_short: bool = False) -> bool:
     normalized = value.strip().strip("'\"").casefold()
-    if len(normalized) < 6:
+    if len(normalized) < 6 and not allow_short:
         return True
     tokens = set(re.findall(r"[a-z0-9]+", normalized))
     if normalized in _PLACEHOLDER_EXACT or tokens & _PLACEHOLDER_TOKENS:
@@ -2947,7 +3564,7 @@ def _is_placeholder(value: str) -> bool:
         return True
     if normalized.startswith(_PLACEHOLDER_PREFIXES) or normalized.endswith(("}", ">")):
         return True
-    return len(set(normalized)) <= 2
+    return not allow_short and len(set(normalized)) <= 2
 
 
 def _is_sensitive_assignment_key(value: str) -> bool:
@@ -3026,9 +3643,14 @@ def _record_secret(
     sink_location: str | None = None,
     construction: str = "direct_literal",
     retention_reason: str = "contextual_secret_material",
+    source_field_descriptor: str | None = None,
+    correlation_path: tuple[str, ...] = (),
 ) -> None:
     candidate = _clean_secret_value(value)
-    rejection = _contextual_secret_rejection_reason(candidate)
+    rejection = _contextual_secret_rejection_reason(
+        candidate,
+        allow_short=usage_context != "packaged_content",
+    )
     if rejection is not None:
         _record_secret_rejection(
             collector,
@@ -3049,6 +3671,8 @@ def _record_secret(
             sink_prototype=sink_prototype,
             sink_location=sink_location,
             construction=construction,
+            source_field_descriptor=source_field_descriptor,
+            correlation_path=correlation_path,
         )
         return
     if len(candidate.encode("utf-8", errors="surrogatepass")) > (
@@ -3113,6 +3737,8 @@ def _record_secret(
             sink_location=sink_location,
             construction=construction,
             retention_reason=retention_reason,
+            source_field_descriptor=source_field_descriptor,
+            correlation_path=correlation_path,
         )
     )
 
@@ -3234,7 +3860,11 @@ def _code_ownership(
     return "unknown"
 
 
-def _contextual_secret_rejection_reason(value: str) -> str | None:
+def _contextual_secret_rejection_reason(
+    value: str,
+    *,
+    allow_short: bool = False,
+) -> str | None:
     candidate = _clean_secret_value(value)
     if _is_class_descriptor(candidate) or re.fullmatch(
         r"(?:[A-Za-z_$][A-Za-z0-9_$]*\.)+[A-Z_$][A-Za-z0-9_$]*",
@@ -3252,7 +3882,7 @@ def _contextual_secret_rejection_reason(value: str) -> str | None:
             return "url_or_endpoint"
     except ValueError:
         return "malformed_url_like_value"
-    if _is_placeholder(candidate):
+    if _is_placeholder(candidate, allow_short=allow_short):
         return "placeholder_or_test_value"
     return None
 
@@ -3277,6 +3907,8 @@ def _record_secret_rejection(
     sink_prototype: str | None,
     sink_location: str | None,
     construction: str,
+    source_field_descriptor: str | None = None,
+    correlation_path: tuple[str, ...] = (),
 ) -> None:
     candidate = _clean_secret_value(value)
     if not candidate:
@@ -3317,6 +3949,8 @@ def _record_secret_rejection(
             sink_prototype=sink_prototype,
             sink_location=sink_location,
             construction=construction,
+            source_field_descriptor=source_field_descriptor,
+            correlation_path=correlation_path,
         )
     )
 
@@ -3333,13 +3967,38 @@ def _record_dex_secret_signal(
         f"{dex_entry}:code_item:{signal.code_item_offset}:"
         f"code_unit:{signal.source_code_unit_offset}"
     )
+    sink_code_item_offset = (
+        signal.sink_code_item_offset
+        if signal.sink_code_item_offset is not None
+        else signal.code_item_offset
+    )
+    sink_code_unit_offset = (
+        signal.sink_code_unit_offset
+        if signal.sink_code_unit_offset is not None
+        else signal.code_unit_offset
+    )
     sink_location = (
-        f"{dex_entry}:code_item:{signal.code_item_offset}:"
-        f"code_unit:{signal.code_unit_offset}"
+        f"{dex_entry}:code_item:{sink_code_item_offset}:"
+        f"code_unit:{sink_code_unit_offset}"
     )
     ownership = _code_ownership(signal.caller_class_descriptor, ownership_context)
     key_name = redact_text(signal.key_name)[:100] if signal.key_name else None
-    rejection = _contextual_secret_rejection_reason(signal.value)
+    source_field_descriptor = (
+        _safe_metadata_text(
+            signal.source_field_descriptor,
+            sensitive_values=(signal.value,),
+        )
+        if signal.source_field_descriptor is not None
+        else None
+    )
+    correlation_path = tuple(
+        _safe_metadata_text(item, sensitive_values=(signal.value,))
+        for item in signal.correlation_path
+    )
+    rejection = _contextual_secret_rejection_reason(
+        signal.value,
+        allow_short=True,
+    )
     if rejection is None and ownership == "unknown":
         rejection = (
             "application_namespace_unavailable"
@@ -3368,6 +4027,8 @@ def _record_dex_secret_signal(
             sink_prototype=signal.sink_prototype,
             sink_location=sink_location,
             construction=signal.construction,
+            source_field_descriptor=source_field_descriptor,
+            correlation_path=correlation_path,
         )
         return
     _record_secret(
@@ -3390,7 +4051,13 @@ def _record_dex_secret_signal(
         sink_prototype=signal.sink_prototype,
         sink_location=sink_location,
         construction=signal.construction,
-        retention_reason="bounded_same_method_sink_correlation",
+        retention_reason=(
+            "bounded_field_and_helper_sink_correlation"
+            if signal.source_field_descriptor is not None
+            else "bounded_same_method_sink_correlation"
+        ),
+        source_field_descriptor=source_field_descriptor,
+        correlation_path=correlation_path,
     )
 
 
@@ -4300,6 +4967,21 @@ def analyze_apks(
                     if item.sink_location is not None
                     else None
                 ),
+                source_field_descriptor=(
+                    _safe_metadata_text(
+                        item.source_field_descriptor,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.source_field_descriptor is not None
+                    else None
+                ),
+                correlation_path=tuple(
+                    _safe_metadata_text(
+                        value,
+                        sensitive_values=sensitive_values,
+                    )
+                    for value in item.correlation_path
+                ),
             )
             for item in collector.secrets
         ),
@@ -4385,6 +5067,21 @@ def analyze_apks(
                     )
                     if item.sink_location is not None
                     else None
+                ),
+                source_field_descriptor=(
+                    _safe_metadata_text(
+                        item.source_field_descriptor,
+                        sensitive_values=sensitive_values,
+                    )
+                    if item.source_field_descriptor is not None
+                    else None
+                ),
+                correlation_path=tuple(
+                    _safe_metadata_text(
+                        value,
+                        sensitive_values=sensitive_values,
+                    )
+                    for value in item.correlation_path
                 ),
             )
             for item in collector.secret_rejections

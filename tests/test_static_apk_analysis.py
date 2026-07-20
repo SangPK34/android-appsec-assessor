@@ -63,6 +63,8 @@ def build_dex(
     extra_strings: tuple[str, ...] = (),
     methods: tuple[tuple[str, str, tuple[str, ...], str], ...] = (),
     method_bodies: tuple[tuple[int, int, tuple[int, ...]], ...] = (),
+    fields: tuple[tuple[str, str, str, bool], ...] = (),
+    method_ins_sizes: dict[int, int] | None = None,
 ) -> bytes:
     strings: list[str] = []
 
@@ -92,6 +94,10 @@ def build_dex(
         if prototype not in prototypes:
             prototypes.append(prototype)
         add_string(_shorty(return_type) + "".join(_shorty(item) for item in parameters))
+    for class_descriptor, field_name, type_descriptor, _is_static in fields:
+        add_type(class_descriptor)
+        add_string(field_name)
+        add_type(type_descriptor)
 
     cursor = 0x70
     string_ids_offset = cursor if strings else 0
@@ -100,10 +106,15 @@ def build_dex(
     cursor += len(types) * 4
     proto_ids_offset = cursor if prototypes else 0
     cursor += len(prototypes) * 12
+    field_ids_offset = cursor if fields else 0
+    cursor += len(fields) * 8
     method_ids_offset = cursor if methods else 0
     cursor += len(methods) * 8
     body_classes = sorted(
-        {methods[method_index][0] for method_index, _registers, _insns in method_bodies}
+        {
+            *(methods[method_index][0] for method_index, _registers, _insns in method_bodies),
+            *(class_descriptor for class_descriptor, _name, _type, _static in fields),
+        }
     )
     class_defs_offset = cursor if body_classes else 0
     cursor += len(body_classes) * 32
@@ -125,6 +136,7 @@ def build_dex(
 
     code_offsets: dict[int, int] = {}
     code_item_data = bytearray()
+    method_ins_sizes = method_ins_sizes or {}
     for method_index, registers_size, insns in sorted(method_bodies):
         assert 0 <= method_index < len(methods)
         assert method_index not in code_offsets
@@ -132,7 +144,15 @@ def build_dex(
             code_item_data.append(0)
         code_offsets[method_index] = cursor + len(code_item_data)
         code_item_data.extend(
-            struct.pack("<HHHHII", registers_size, 0, 5, 0, 0, len(insns))
+            struct.pack(
+                "<HHHHII",
+                registers_size,
+                method_ins_sizes.get(method_index, 0),
+                5,
+                0,
+                0,
+                len(insns),
+            )
         )
         code_item_data.extend(struct.pack(f"<{len(insns)}H", *insns))
     cursor += len(code_item_data)
@@ -141,15 +161,35 @@ def build_dex(
     class_data = bytearray()
     for class_descriptor in body_classes:
         class_data_offsets[class_descriptor] = cursor + len(class_data)
+        static_field_indexes = [
+            index
+            for index, (owner, _name, _type, is_static) in enumerate(fields)
+            if owner == class_descriptor and is_static
+        ]
+        instance_field_indexes = [
+            index
+            for index, (owner, _name, _type, is_static) in enumerate(fields)
+            if owner == class_descriptor and not is_static
+        ]
         method_indexes = sorted(
             method_index
             for method_index, _registers, _insns in method_bodies
             if methods[method_index][0] == class_descriptor
         )
-        class_data.extend(_uleb128(0))
-        class_data.extend(_uleb128(0))
+        class_data.extend(_uleb128(len(static_field_indexes)))
+        class_data.extend(_uleb128(len(instance_field_indexes)))
         class_data.extend(_uleb128(len(method_indexes)))
         class_data.extend(_uleb128(0))
+        for field_indexes in (static_field_indexes, instance_field_indexes):
+            previous_field = 0
+            for position, field_index in enumerate(field_indexes):
+                class_data.extend(
+                    _uleb128(
+                        field_index if position == 0 else field_index - previous_field
+                    )
+                )
+                class_data.extend(_uleb128(0x09))
+                previous_field = field_index
         previous = 0
         for position, method_index in enumerate(method_indexes):
             class_data.extend(
@@ -177,6 +217,7 @@ def build_dex(
     struct.pack_into("<II", value, 0x38, len(strings), string_ids_offset)
     struct.pack_into("<II", value, 0x40, len(types), type_ids_offset)
     struct.pack_into("<II", value, 0x48, len(prototypes), proto_ids_offset)
+    struct.pack_into("<II", value, 0x50, len(fields), field_ids_offset)
     struct.pack_into("<II", value, 0x58, len(methods), method_ids_offset)
     struct.pack_into("<II", value, 0x60, len(body_classes), class_defs_offset)
     if not (type_list_data or code_item_data or class_data or string_data):
@@ -197,6 +238,17 @@ def build_dex(
             strings.index(shorty),
             types.index(return_type),
             parameter_offsets.get(parameters, 0),
+        )
+    for index, (class_descriptor, field_name, type_descriptor, _is_static) in enumerate(
+        fields
+    ):
+        struct.pack_into(
+            "<HHI",
+            value,
+            field_ids_offset + index * 8,
+            types.index(class_descriptor),
+            types.index(type_descriptor),
+            strings.index(field_name),
         )
     for index, (class_descriptor, method_name, parameters, return_type) in enumerate(
         methods
@@ -243,6 +295,32 @@ def _const_int(register: int, value: int) -> tuple[int, ...]:
     assert 0 <= register <= 0xFF
     assert -0x8000 <= value <= 0x7FFF
     return (0x13 | (register << 8), value & 0xFFFF)
+
+
+def _iget_object(destination: int, instance: int, field_index: int) -> tuple[int, ...]:
+    assert 0 <= destination <= 0x0F
+    assert 0 <= instance <= 0x0F
+    assert 0 <= field_index <= 0xFFFF
+    return (0x54 | (destination << 8) | (instance << 12), field_index)
+
+
+def _iput_object(source: int, instance: int, field_index: int) -> tuple[int, ...]:
+    assert 0 <= source <= 0x0F
+    assert 0 <= instance <= 0x0F
+    assert 0 <= field_index <= 0xFFFF
+    return (0x5B | (source << 8) | (instance << 12), field_index)
+
+
+def _sget_object(destination: int, field_index: int) -> tuple[int, ...]:
+    assert 0 <= destination <= 0xFF
+    assert 0 <= field_index <= 0xFFFF
+    return (0x62 | (destination << 8), field_index)
+
+
+def _sput_object(source: int, field_index: int) -> tuple[int, ...]:
+    assert 0 <= source <= 0xFF
+    assert 0 <= field_index <= 0xFFFF
+    return (0x69 | (source << 8), field_index)
 
 
 def _invoke(
@@ -1012,6 +1090,483 @@ def test_secret_callsite_tracks_bounded_same_method_string_construction(
     serialized = json.dumps(result.to_dict())
     assert first_fragment not in serialized
     assert second_fragment not in serialized
+
+
+def test_secret_literal_reaches_exact_secret_key_spec_sink(tmp_path: Path) -> None:
+    owned_value = "literalCryptoMaterial-Q7v2N9p4K8s5"
+    methods = (
+        ("Lcom/example/app/CryptoFlow;", "create", (), "V"),
+        ("Ljava/lang/String;", "getBytes", (), "[B"),
+        ("Ljavax/crypto/spec/SecretKeySpec;", "<init>", ("[B",), "V"),
+    )
+    apk = tmp_path / "literal-secret-key-spec.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(owned_value,),
+            methods=methods,
+            method_bodies=(
+                (
+                    0,
+                    3,
+                    (
+                        *_const_string(0, 0),
+                        *_invoke(1, (0,)),
+                        0x0C | (1 << 8),
+                        *_invoke(2, (2, 1), direct=True),
+                        0x0E,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.construction == "direct_literal_bytes"
+    assert candidate.usage_context == "crypto_key_constructor"
+    assert candidate.source_field_descriptor is None
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_secret_field_flow_traces_instance_initializer_through_exact_helper(
+    tmp_path: Path,
+) -> None:
+    owned_value = "fieldCryptoMaterial-Q7v2N9p4K8s5"
+    holder = "Lcom/example/app/CryptoHolder;"
+    methods = (
+        (holder, "<init>", (), "V"),
+        (holder, "encrypt", (), "V"),
+        (holder, "helper", ("[B",), "V"),
+        ("Ljava/lang/String;", "getBytes", (), "[B"),
+        ("Ljavax/crypto/spec/SecretKeySpec;", "<init>", ("[B",), "V"),
+    )
+    apk = tmp_path / "field-helper-crypto.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(owned_value,),
+            methods=methods,
+            fields=((holder, "key", "Ljava/lang/String;", False),),
+            method_bodies=(
+                (
+                    0,
+                    3,
+                    (
+                        *_const_string(0, 0),
+                        *_iput_object(0, 2, 0),
+                        0x0E,
+                    ),
+                ),
+                (
+                    1,
+                    3,
+                    (
+                        *_iget_object(0, 2, 0),
+                        *_invoke(3, (0,)),
+                        0x0C,
+                        *_invoke(2, (0,), static=True),
+                        0x0E,
+                    ),
+                ),
+                (2, 2, (*_invoke(4, (0, 1), direct=True), 0x0E)),
+            ),
+            method_ins_sizes={0: 1, 1: 1, 2: 1},
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.code_ownership == "app_code"
+    assert candidate.usage_context == "crypto_key_constructor"
+    assert candidate.secret_type == "crypto_key"
+    assert candidate.source_field_descriptor == (
+        "Lcom/example/app/CryptoHolder;->key [Ljava/lang/String;]"
+    )
+    assert candidate.correlation_path == (
+        "field_initializer",
+        "field_read",
+        "exact_helper_depth:1",
+        "sensitive_sink",
+    )
+    assert candidate.retention_reason == "bounded_field_and_helper_sink_correlation"
+    assert candidate.sink_location != candidate.location
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_secret_field_flow_traces_static_field_and_constructed_crypto_material(
+    tmp_path: Path,
+) -> None:
+    first_fragment = "static-crypto-"
+    second_fragment = "material-Q7v2N9p4K8s5"
+    holder = "Lcom/example/app/StaticCryptoHolder;"
+    methods = (
+        (holder, "<clinit>", (), "V"),
+        (holder, "encrypt", (), "V"),
+        (holder, "helper", ("[B",), "V"),
+        ("Ljava/lang/String;", "concat", ("Ljava/lang/String;",), "Ljava/lang/String;"),
+        ("Ljava/lang/String;", "getBytes", (), "[B"),
+        ("Ljavax/crypto/spec/SecretKeySpec;", "<init>", ("[B",), "V"),
+    )
+    apk = tmp_path / "static-field-constructed-crypto.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(first_fragment, second_fragment),
+            methods=methods,
+            fields=((holder, "cryptoMaterial", "Ljava/lang/String;", True),),
+            method_bodies=(
+                (
+                    0,
+                    2,
+                    (
+                        *_const_string(0, 0),
+                        *_const_string(1, 1),
+                        *_invoke(3, (0, 1)),
+                        0x0C,
+                        *_sput_object(0, 0),
+                        0x0E,
+                    ),
+                ),
+                (
+                    1,
+                    1,
+                    (
+                        *_sget_object(0, 0),
+                        *_invoke(4, (0,)),
+                        0x0C,
+                        *_invoke(2, (0,), static=True),
+                        0x0E,
+                    ),
+                ),
+                (2, 2, (*_invoke(5, (0, 1), direct=True), 0x0E)),
+            ),
+            method_ins_sizes={2: 1},
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.construction == "string_concat"
+    assert candidate.usage_context == "crypto_key_constructor"
+    assert candidate.source_field_descriptor == (
+        "Lcom/example/app/StaticCryptoHolder;->cryptoMaterial [Ljava/lang/String;]"
+    )
+    serialized = json.dumps(result.to_dict())
+    assert first_fragment not in serialized
+    assert second_fragment not in serialized
+
+
+def test_secret_field_flow_retains_short_credential_only_at_exact_request_sink(
+    tmp_path: Path,
+) -> None:
+    short_value = "p4"
+    holder = "Lcom/example/app/CredentialHolder;"
+    methods = (
+        (holder, "<clinit>", (), "V"),
+        (holder, "submit", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    apk = tmp_path / "short-field-credential.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(short_value, "password"),
+            methods=methods,
+            fields=((holder, "password", "Ljava/lang/String;", True),),
+            method_bodies=(
+                (0, 1, (*_const_string(0, 0), *_sput_object(0, 0), 0x0E)),
+                (
+                    1,
+                    3,
+                    (
+                        *_const_string(1, 1),
+                        *_sget_object(2, 0),
+                        *_invoke(2, (0, 1, 2), direct=True),
+                        0x0E,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.value_length == len(short_value)
+    assert candidate.secret_type == "password"
+    assert candidate.usage_context == "network_form_parameter"
+    assert short_value not in json.dumps(result.to_dict())
+
+
+def test_secret_field_flow_rejects_packaged_dependency_source(
+    tmp_path: Path,
+) -> None:
+    owned_value = "dependencyCredential-Q7v2N9p4K8s5"
+    vendor = "Lcom/vendor/sdk/CredentialHolder;"
+    methods = (
+        ("Lcom/example/app/BuildConfig;", "marker", (), "V"),
+        (vendor, "<clinit>", (), "V"),
+        (vendor, "submit", (), "V"),
+        (
+            "Lorg/apache/http/message/BasicNameValuePair;",
+            "<init>",
+            ("Ljava/lang/String;", "Ljava/lang/String;"),
+            "V",
+        ),
+    )
+    apk = tmp_path / "dependency-field-credential.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(owned_value, "api_key"),
+            methods=methods,
+            fields=((vendor, "apiKey", "Ljava/lang/String;", True),),
+            method_bodies=(
+                (0, 1, (0x0E,)),
+                (1, 1, (*_const_string(0, 0), *_sput_object(0, 0), 0x0E)),
+                (
+                    2,
+                    3,
+                    (
+                        *_const_string(1, 1),
+                        *_sget_object(2, 0),
+                        *_invoke(3, (0, 1, 2), direct=True),
+                        0x0E,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert result.secret_candidates == ()
+    assert len(result.secret_candidate_rejections) == 1
+    rejection = result.secret_candidate_rejections[0]
+    assert rejection.code_ownership == "packaged_dependency"
+    assert rejection.reason == "caller_outside_application_namespace"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_secret_field_flow_ignores_ui_label_without_sensitive_sink(tmp_path: Path) -> None:
+    holder = "Lcom/example/app/LabelHolder;"
+    apk = tmp_path / "field-ui-label.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=("Password:",),
+            methods=((holder, "<clinit>", (), "V"),),
+            fields=((holder, "label", "Ljava/lang/String;", True),),
+            method_bodies=((0, 1, (*_const_string(0, 0), *_sput_object(0, 0), 0x0E)),),
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert result.secret_candidates == ()
+    assert result.secret_candidate_rejections == ()
+
+
+def test_secret_field_flow_respects_bounded_field_write_quota(tmp_path: Path) -> None:
+    first_value = "quotaCryptoOne-Q7v2N9p4K8s5"
+    second_value = "quotaCryptoTwo-Q7v2N9p4K8s5"
+    holder = "Lcom/example/app/QuotaHolder;"
+    methods = (
+        (holder, "<clinit>", (), "V"),
+        (holder, "use", (), "V"),
+        (holder, "helper", ("[B",), "V"),
+        ("Ljava/lang/String;", "getBytes", (), "[B"),
+        ("Ljavax/crypto/spec/SecretKeySpec;", "<init>", ("[B",), "V"),
+    )
+    apk = tmp_path / "field-write-quota.apk"
+    write_apk(
+        apk,
+        build_dex(
+            extra_strings=(first_value, second_value),
+            methods=methods,
+            fields=(
+                (holder, "firstKey", "Ljava/lang/String;", True),
+                (holder, "secondKey", "Ljava/lang/String;", True),
+            ),
+            method_bodies=(
+                (
+                    0,
+                    2,
+                    (
+                        *_const_string(0, 0),
+                        *_sput_object(0, 0),
+                        *_const_string(1, 1),
+                        *_sput_object(1, 1),
+                        0x0E,
+                    ),
+                ),
+                (
+                    1,
+                    1,
+                    (
+                        *_sget_object(0, 0),
+                        *_invoke(3, (0,)),
+                        0x0C,
+                        *_invoke(2, (0,), static=True),
+                        *_sget_object(0, 1),
+                        *_invoke(3, (0,)),
+                        0x0C,
+                        *_invoke(2, (0,), static=True),
+                        0x0E,
+                    ),
+                ),
+                (2, 2, (*_invoke(4, (0, 1), direct=True), 0x0E)),
+            ),
+            method_ins_sizes={2: 1},
+        ),
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),),
+        policy=replace(StaticApkPolicy(), max_dex_field_writes=1),
+    )
+
+    assert result.status == "partial"
+    assert "limit:dex_field_writes" in result.limitations
+    assert len(result.secret_candidates) == 1
+    assert first_value not in json.dumps(result.to_dict())
+    assert second_value not in json.dumps(result.to_dict())
+
+
+def test_secret_field_flow_uses_base_build_config_for_split_ownership(
+    tmp_path: Path,
+) -> None:
+    owned_value = "splitCredential-Q7v2N9p4K8s5"
+    holder = "Lcom/example/app/SplitHolder;"
+    base = tmp_path / "base.apk"
+    split = tmp_path / "split.apk"
+    write_apk(
+        base,
+        build_dex(
+            methods=(("Lcom/example/app/BuildConfig;", "marker", (), "V"),),
+            method_bodies=((0, 1, (0x0E,)),),
+        ),
+    )
+    write_apk(
+        split,
+        build_dex(
+            extra_strings=(owned_value, "api_key"),
+            methods=(
+                (holder, "<clinit>", (), "V"),
+                (holder, "submit", (), "V"),
+                (
+                    "Lorg/apache/http/message/BasicNameValuePair;",
+                    "<init>",
+                    ("Ljava/lang/String;", "Ljava/lang/String;"),
+                    "V",
+                ),
+            ),
+            fields=((holder, "apiKey", "Ljava/lang/String;", True),),
+            method_bodies=(
+                (0, 1, (*_const_string(0, 0), *_sput_object(0, 0), 0x0E)),
+                (
+                    1,
+                    3,
+                    (
+                        *_const_string(1, 1),
+                        *_sget_object(2, 0),
+                        *_invoke(2, (0, 1, 2), direct=True),
+                        0x0E,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    result = analyze_apks(
+        (
+            StaticApkInput(base, "base:0", application_id="com.example.app"),
+            StaticApkInput(split, "split:0", application_id="com.example.app"),
+        )
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.source_id == "split:0"
+    assert candidate.code_ownership == "app_code"
+    assert owned_value not in json.dumps(result.to_dict())
+
+
+def test_secret_field_flow_is_parsed_from_later_dex(tmp_path: Path) -> None:
+    owned_value = "secondaryDexCredential-Q7v2N9p4K8s5"
+    holder = "Lcom/example/app/SecondaryHolder;"
+    apk = tmp_path / "multidex-field-credential.apk"
+    write_apk(
+        apk,
+        build_dex(
+            methods=(("Lcom/example/app/BuildConfig;", "marker", (), "V"),),
+            method_bodies=((0, 1, (0x0E,)),),
+        ),
+        entries={
+            "classes2.dex": build_dex(
+                extra_strings=(owned_value, "api_key"),
+                methods=(
+                    (holder, "<clinit>", (), "V"),
+                    (holder, "submit", (), "V"),
+                    (
+                        "Lorg/apache/http/message/BasicNameValuePair;",
+                        "<init>",
+                        ("Ljava/lang/String;", "Ljava/lang/String;"),
+                        "V",
+                    ),
+                ),
+                fields=((holder, "apiKey", "Ljava/lang/String;", True),),
+                method_bodies=(
+                    (0, 1, (*_const_string(0, 0), *_sput_object(0, 0), 0x0E)),
+                    (
+                        1,
+                        3,
+                        (
+                            *_const_string(1, 1),
+                            *_sget_object(2, 0),
+                            *_invoke(2, (0, 1, 2), direct=True),
+                            0x0E,
+                        ),
+                    ),
+                ),
+            )
+        },
+    )
+
+    result = analyze_apks(
+        (StaticApkInput(apk, "base:0", application_id="com.example.app"),)
+    )
+
+    assert len(result.secret_candidates) == 1
+    candidate = result.secret_candidates[0]
+    assert candidate.dex_entry == "classes2.dex"
+    assert candidate.code_ownership == "app_code"
+    assert owned_value not in json.dumps(result.to_dict())
 
 
 def test_secret_callsite_scopes_constructed_serialized_network_body(
@@ -1948,7 +2503,7 @@ def test_behavior_limits_are_appended_for_positional_policy_compatibility() -> N
     names = [item.name for item in fields(StaticApkPolicy)]
 
     assert names.index("max_security_api_matches") < names.index("max_dex_class_defs")
-    assert names[-1] == "max_static_behavior_candidates"
+    assert names.index("max_static_behavior_candidates") < names.index("max_dex_fields")
 
 
 def test_security_api_inventory_is_deduplicated_ordered_and_bounded(
